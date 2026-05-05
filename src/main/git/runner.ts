@@ -205,7 +205,69 @@ export function gitSpawn(args: string[], options: SpawnOptions & { cwd: string }
 // resolveCommand routes the spawn through `wsl.exe -d <distro> -- gh ...`
 // even without a UNC cwd to parse a distro from. Repo-scoped callers should
 // keep using cwd — the distro derives from the path automatically there.
-type GhExecOptions = Omit<GitExecOptions, 'cwd'> & { cwd?: string; wslDistro?: string }
+// Why: `idempotent` gates the transient-error retry. When undefined we
+// auto-detect from argv (writes are detected by `-X POST/PATCH/PUT/DELETE`
+// or a `query=mutation …` arg); callers can also pass an explicit override.
+// A 5xx/socket reset after the request reaches GitHub but before the
+// response returns is the canonical case where the server-side write
+// succeeded; retrying would create a duplicate comment/issue/label addition.
+// See bug-scan finding 1.
+type GhExecOptions = Omit<GitExecOptions, 'cwd'> & {
+  cwd?: string
+  wslDistro?: string
+  idempotent?: boolean
+}
+
+const NON_IDEMPOTENT_METHODS = new Set(['POST', 'PATCH', 'PUT', 'DELETE'])
+// `gh <noun> <verb>` write subcommands. Reads (view/list/status/checks)
+// are absent on purpose so the default of "retry" stays for them.
+const NON_IDEMPOTENT_GH_VERBS = new Set([
+  'create',
+  'edit',
+  'delete',
+  'close',
+  'reopen',
+  'merge',
+  'comment',
+  'review',
+  'ready',
+  'lock',
+  'unlock',
+  'pin',
+  'unpin',
+  'transfer',
+  'develop'
+])
+
+function argsLookIdempotent(args: string[]): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]
+    if (a === '-X' || a === '--method') {
+      const next = args[i + 1]
+      if (typeof next === 'string' && NON_IDEMPOTENT_METHODS.has(next.toUpperCase())) {
+        return false
+      }
+    }
+    // `gh api graphql -f query=mutation(...){ ... }` — detect mutation queries
+    // so writes via the GraphQL endpoint also fail fast on transient errors.
+    if (a.startsWith('query=')) {
+      const trimmed = a.slice('query='.length).trimStart().toLowerCase()
+      if (trimmed.startsWith('mutation')) {
+        return false
+      }
+    }
+  }
+  // `gh issue close`, `gh pr edit`, `gh pr merge`, etc. The first arg is the
+  // noun (issue/pr/repo/label/...) and the second is the verb. Defaulting
+  // `gh api` calls without an explicit -X to GET-equivalent (idempotent) is
+  // intentional: callers that POST through `gh api` set `-X POST`.
+  if (args.length >= 2 && args[0] !== 'api') {
+    if (NON_IDEMPOTENT_GH_VERBS.has(args[1])) {
+      return false
+    }
+  }
+  return true
+}
 
 /**
  * Extract stderr from an execFile rejection.
@@ -344,7 +406,14 @@ export async function ghExecFileAsync(
       lastError = err
       const { stderr } = extractExecError(err)
       const isLastAttempt = attempt >= GH_RETRY_DELAYS_MS.length
-      if (!isLastAttempt && isTransientGhError(stderr)) {
+      // Why: only retry idempotent calls. A 5xx/socket reset can arrive
+      // after the server already applied a POST/PATCH/PUT/DELETE; retrying
+      // would duplicate the write (e.g. double-post a comment, double-add
+      // a label). When the caller doesn't say, we auto-detect from argv —
+      // explicit `-X <method>` and GraphQL `query=mutation …` are treated
+      // as non-idempotent. See bug-scan finding 1.
+      const idempotent = options.idempotent ?? argsLookIdempotent(args)
+      if (idempotent && !isLastAttempt && isTransientGhError(stderr)) {
         // Why: when the upstream surfaced a Retry-After (e.g. on a transient
         // 5xx that GitHub explicitly recommends backing off for), honor it
         // instead of using our default backoff — sleeping less than the

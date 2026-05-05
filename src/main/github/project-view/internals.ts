@@ -194,7 +194,11 @@ export function classifyProjectError(stderr: string, stdout: string): GitHubProj
   if (
     s.includes('http 404') ||
     errors.some((e) => (e.type ?? '').toUpperCase() === 'NOT_FOUND') ||
-    s.includes('could not resolve to a ')
+    // Why: GitHub uses "to an" for vowel-leading types ("to an Issue", "to
+    // an Organization") and "to a" otherwise. The previous singular-only
+    // check missed the "an" variants when gh emits only the stderr summary
+    // without a structured GraphQL error array. See bug-scan finding 3.
+    /could not resolve to an? /.test(s)
   ) {
     const firstNotFound = errors.find((e) => (e.type ?? '').toUpperCase() === 'NOT_FOUND')
     return {
