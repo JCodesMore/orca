@@ -699,6 +699,11 @@ const api = {
       ipcRenderer.invoke('agentHooks:cursorStatus')
   },
 
+  agentTrust: {
+    markTrusted: (args: { preset: 'cursor' | 'copilot'; workspacePath: string }): Promise<void> =>
+      ipcRenderer.invoke('agentTrust:markTrusted', args)
+  },
+
   preflight: {
     check: (args?: {
       force?: boolean

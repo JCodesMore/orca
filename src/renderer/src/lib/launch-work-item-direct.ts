@@ -2,7 +2,8 @@ import { toast } from 'sonner'
 import { useAppStore } from '@/store'
 import { AGENT_CATALOG } from '@/lib/agent-catalog'
 import { pasteDraftWhenAgentReady } from '@/lib/agent-paste-draft'
-import { buildAgentStartupPlan } from '@/lib/tui-agent-startup'
+import { buildAgentDraftLaunchPlan, buildAgentStartupPlan } from '@/lib/tui-agent-startup'
+import { TUI_AGENT_CONFIG } from '../../../shared/tui-agent-config'
 import { activateAndRevealWorktree } from '@/lib/worktree-activation'
 import {
   CLIENT_PLATFORM,
@@ -106,11 +107,6 @@ async function pasteWorkItemDraftWhenAgentReady(args: {
     expectedProcess: startupPlan.expectedProcess,
     content,
     agent: startupPlan.agent,
-    // Why: 12s budget covers slow-starting TUIs (OpenCode needs ~3s before
-    // its input box accepts pastes; the readiness logic in agent-paste-draft
-    // adds polling + grace on top). 5s was too tight and caused the toast to
-    // surface even when the agent went on to render correctly a second later.
-    timeoutMs: 12000,
     onTimeout: () =>
       toast.message(
         'Agent took too long to start. The workspace is ready — paste the issue URL when the agent is idle.'
@@ -165,25 +161,59 @@ export async function launchWorkItemDirect(args: LaunchWorkItemDirectArgs): Prom
   let worktreeId: string
   let primaryTabId: string | null
   let startupPlan: ReturnType<typeof buildAgentStartupPlan> = null
+  let draftLaunchedNatively = false
   try {
     const result = await store.createWorktree(repoId, workspaceName, baseBranch, finalSetupDecision)
     worktreeId = result.worktree.id
+    const worktreePath = result.worktree.path
 
     const detectedIds = new Set(await detectedAgentsPromise)
     const effectiveAgent = pickAgent(settings?.defaultTuiAgent, detectedIds)
-    // Why: launch the agent with no prompt so the first frame it draws is the
-    // empty input box. The URL paste below populates that input buffer, which
-    // gives the user a reviewable draft instead of a submitted request.
-    startupPlan =
+    const draftContent = item.pasteContent ?? item.url
+
+    // Why: agents that gate first-launch behind a "Do you trust this folder?"
+    // menu (cursor-agent, copilot) consume the bracketed paste as menu input.
+    // Pre-write the same trust artifact those CLIs write after the user
+    // accepts so the menu never fires. Best-effort — main swallows errors.
+    if (effectiveAgent && worktreePath) {
+      const preflight = TUI_AGENT_CONFIG[effectiveAgent].preflightTrust
+      if (preflight) {
+        await window.api.agentTrust.markTrusted({ preset: preflight, workspacePath: worktreePath })
+      }
+    }
+
+    // Why: prefer a native prefill flag (e.g. `claude --prefill <url>`) when
+    // the agent's CLI exposes one — the TUI mounts with the URL already in
+    // its input box, which sidesteps the readiness/paste race entirely. Fall
+    // back to launching with no prompt + bracketed-paste-after-ready for
+    // every other agent so the URL still lands as a draft (not auto-
+    // submitted as the first turn).
+    const draftLaunchPlan =
       effectiveAgent === null
         ? null
-        : buildAgentStartupPlan({
+        : buildAgentDraftLaunchPlan({
             agent: effectiveAgent,
-            prompt: '',
+            draft: draftContent,
             cmdOverrides: settings?.agentCmdOverrides ?? {},
-            platform: CLIENT_PLATFORM,
-            allowEmptyPromptLaunch: true
+            platform: CLIENT_PLATFORM
           })
+    if (draftLaunchPlan) {
+      startupPlan = {
+        agent: draftLaunchPlan.agent,
+        launchCommand: draftLaunchPlan.launchCommand,
+        expectedProcess: draftLaunchPlan.expectedProcess,
+        followupPrompt: null
+      }
+      draftLaunchedNatively = true
+    } else if (effectiveAgent !== null) {
+      startupPlan = buildAgentStartupPlan({
+        agent: effectiveAgent,
+        prompt: '',
+        cmdOverrides: settings?.agentCmdOverrides ?? {},
+        platform: CLIENT_PLATFORM,
+        allowEmptyPromptLaunch: true
+      })
+    }
 
     const activation = activateAndRevealWorktree(worktreeId, {
       setup: result.setup,
@@ -227,18 +257,20 @@ export async function launchWorkItemDirect(args: LaunchWorkItemDirectArgs): Prom
     store.setRightSidebarOpen(true)
   }
 
-  // Why: at this point the workspace is live and the agent (if any) has been
-  // queued on `primaryTabId`. The paste step below is the only remaining
-  // draft-specific work; bail out cleanly when either prerequisite is missing.
-  if (!primaryTabId || !startupPlan) {
+  // Why: at this point the workspace is live and the agent (if any) has
+  // been queued on `primaryTabId`. The post-launch paste step below only
+  // applies to agents that lacked a native prefill flag; for agents that
+  // were launched with the URL already on argv (Claude --prefill today),
+  // the URL is in the input box already — pasting again would duplicate it.
+  if (!primaryTabId || !startupPlan || draftLaunchedNatively) {
     return
   }
 
   const content = item.pasteContent ?? item.url
-  // Why: the workspace is already created and visible; waiting up to 5s for
-  // agent readiness here kept the Create-from modal in "Creating workspace…".
-  // Continue the draft paste in the background so selection latency ends when
-  // the worktree is ready, not when the TUI input buffer is ready.
+  // Why: the workspace is already created and visible; do not block selection
+  // latency on agent readiness. Run the paste in the background so the
+  // "Use" CTA's spinner ends when the worktree is ready, not when the TUI
+  // input buffer is ready.
   void pasteWorkItemDraftWhenAgentReady({ primaryTabId, startupPlan, content })
 }
 

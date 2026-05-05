@@ -99,4 +99,45 @@ export function buildAgentStartupPlan(args: {
   }
 }
 
+export type AgentDraftLaunchPlan = {
+  agent: TuiAgent
+  launchCommand: string
+  expectedProcess: string
+}
+
+/**
+ * Why: when the agent's CLI exposes a documented "prefill but don't submit"
+ * flag (currently only `claude --prefill <text>`), launch with that flag so
+ * the TUI mounts with the draft already in its input box. This is strictly
+ * better than the post-launch bracketed-paste fallback in agent-paste-draft.ts
+ * because it eliminates the empirical readiness wait entirely — the agent
+ * controls when its input is rendered.
+ *
+ * Returns `null` when the agent has no native prefill flag; callers fall
+ * back to the paste-after-ready path.
+ */
+export function buildAgentDraftLaunchPlan(args: {
+  agent: TuiAgent
+  draft: string
+  cmdOverrides: Partial<Record<TuiAgent, string>>
+  platform: NodeJS.Platform
+}): AgentDraftLaunchPlan | null {
+  const { agent, draft, cmdOverrides, platform } = args
+  const config = TUI_AGENT_CONFIG[agent]
+  if (!config.draftPromptFlag) {
+    return null
+  }
+  const trimmed = draft.trim()
+  if (!trimmed) {
+    return null
+  }
+  const baseCommand = cmdOverrides[agent] ?? config.launchCmd
+  const quoted = quoteStartupArg(trimmed, platform)
+  return {
+    agent,
+    launchCommand: `${baseCommand} ${config.draftPromptFlag} ${quoted}`,
+    expectedProcess: config.expectedProcess
+  }
+}
+
 export { isShellProcess } from '../../../shared/agent-detection'

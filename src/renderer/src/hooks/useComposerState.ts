@@ -9,7 +9,8 @@ import { useAppStore } from '@/store'
 import { AGENT_CATALOG } from '@/lib/agent-catalog'
 import { parseGitHubIssueOrPRNumber, normalizeGitHubLinkQuery } from '@/lib/github-links'
 import { activateAndRevealWorktree } from '@/lib/worktree-activation'
-import { buildAgentStartupPlan } from '@/lib/tui-agent-startup'
+import { buildAgentDraftLaunchPlan, buildAgentStartupPlan } from '@/lib/tui-agent-startup'
+import { TUI_AGENT_CONFIG } from '../../../shared/tui-agent-config'
 import { isGitRepoKind } from '../../../shared/repo-kind'
 import type {
   GitHubWorkItem,
@@ -1375,19 +1376,53 @@ export function useComposerState(options: UseComposerStateOptions): UseComposerS
         const quickPrompt = isLinearTypedOnly && trimmedNote ? trimmedNote : ''
         const quickDraftPrompt = linkedWorkItem && !isLinearTypedOnly ? linkedWorkItem.url : null
 
-        const startupPlan =
-          agent === null
+        // Why: agents that gate first-launch behind a "Do you trust this
+        // folder?" menu (cursor-agent, copilot) consume the bracketed paste
+        // as menu input. Pre-write the trust artifact so the menu is
+        // skipped — best-effort, errors swallowed by main.
+        if (agent && worktree.path) {
+          const preflight = TUI_AGENT_CONFIG[agent].preflightTrust
+          if (preflight) {
+            await window.api.agentTrust.markTrusted({
+              preset: preflight,
+              workspacePath: worktree.path
+            })
+          }
+        }
+
+        // Why: prefer the agent's native prefill flag (currently Claude's
+        // `--prefill`) when it has one — sidesteps the readiness/paste race
+        // entirely. Falls through to the type-after-ready path for every
+        // other agent.
+        const draftLaunchPlan =
+          agent === null || !quickDraftPrompt
             ? null
-            : buildAgentStartupPlan({
+            : buildAgentDraftLaunchPlan({
                 agent,
-                prompt: quickPrompt,
+                draft: quickDraftPrompt,
                 cmdOverrides: settings?.agentCmdOverrides ?? {},
-                platform: CLIENT_PLATFORM,
-                allowEmptyPromptLaunch: true
+                platform: CLIENT_PLATFORM
               })
 
-        if (startupPlan && quickDraftPrompt) {
-          startupPlan.draftPrompt = quickDraftPrompt
+        let startupPlan: ReturnType<typeof buildAgentStartupPlan> = null
+        if (draftLaunchPlan) {
+          startupPlan = {
+            agent: draftLaunchPlan.agent,
+            launchCommand: draftLaunchPlan.launchCommand,
+            expectedProcess: draftLaunchPlan.expectedProcess,
+            followupPrompt: null
+          }
+        } else if (agent !== null) {
+          startupPlan = buildAgentStartupPlan({
+            agent,
+            prompt: quickPrompt,
+            cmdOverrides: settings?.agentCmdOverrides ?? {},
+            platform: CLIENT_PLATFORM,
+            allowEmptyPromptLaunch: true
+          })
+          if (startupPlan && quickDraftPrompt) {
+            startupPlan.draftPrompt = quickDraftPrompt
+          }
         }
 
         activateAndRevealWorktree(worktree.id, {
