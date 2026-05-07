@@ -202,6 +202,8 @@ const AddRepoDialog = React.memo(function AddRepoDialog() {
   )
 
   const handleCreateWorktree = useCallback(() => {
+    // Why: Setup-step "Create" affordance — fires on click intent, not on IPC arrival, mirroring the other 4 actions in this dialog.
+    track('add_repo_setup_step_action', { action: 'create_worktree' })
     // Why: small delay so the Add Project dialog close animation finishes before
     // the composer modal takes focus; otherwise the dialog teardown can steal
     // the first focus frame from the composer's prompt textarea.
@@ -235,6 +237,13 @@ const AddRepoDialog = React.memo(function AddRepoDialog() {
       open={isOpen}
       onOpenChange={(open) => {
         if (!open) {
+          // Why: Radix only fires onOpenChange for internal triggers (X icon, ESC,
+          // outside-click), so this branch only runs for implicit closes — explicit
+          // Skip is handled on its own renderer-side click handler. Implicit closes
+          // on the Setup step are funnel-equivalent to Skip.
+          if (step === 'setup') {
+            track('add_repo_setup_step_action', { action: 'skip' })
+          }
           closeModal()
           resetState()
         }

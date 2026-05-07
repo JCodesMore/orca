@@ -25,7 +25,9 @@ export function classifyWorkspaceCreateError(error: unknown): WorkspaceCreateErr
     return 'base_ref_missing'
   }
   if (
-    text.includes('already exists') ||
+    text.includes('already exists locally') ||
+    text.includes('already exists on a remote') ||
+    text.includes('already exists. pick') ||
     text.includes('already has pr') ||
     text.includes('could not find an available worktree name')
   ) {
@@ -39,11 +41,13 @@ export function classifyWorkspaceCreateError(error: unknown): WorkspaceCreateErr
   // and sparse-checkout validation errors (which the design doc routes to
   // 'unknown'); 'created but not found in listing' covers the formerly
   // miscased 'Worktree created but not found in listing' throw.
+  // SSH-precondition failures (e.g. 'no git provider', 'SSH connection is
+  // not available') deliberately fall through to 'unknown' — they're not
+  // git failures and bucketing them here would mask connectivity issues.
   if (
     text.includes('fatal:') ||
     text.includes('git worktree') ||
-    text.includes('created but not found in listing') ||
-    text.includes('no git provider')
+    text.includes('created but not found in listing')
   ) {
     return 'git_failed'
   }

@@ -63,6 +63,11 @@ describe('classifyWorkspaceCreateError', () => {
     expect(classifyWorkspaceCreateError(err)).toBe('unknown')
   })
 
+  it('falls through to unknown for SSH-precondition errors', () => {
+    const err = new Error('SSH connection is not available. Please reconnect and try again.')
+    expect(classifyWorkspaceCreateError(err)).toBe('unknown')
+  })
+
   it('handles non-Error values without throwing', () => {
     expect(classifyWorkspaceCreateError('a bare string')).toBe('unknown')
     expect(classifyWorkspaceCreateError(undefined)).toBe('unknown')

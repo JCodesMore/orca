@@ -159,14 +159,6 @@ export function registerWorktreeHandlers(
         throw new Error('Folder mode does not support creating worktrees.')
       }
 
-      // Why: the only Setup-step affordance that has a main-process seam to
-      // ride. The other four (skip/configure/open_existing/back) are pure-UI
-      // transitions and emit from the renderer (see AddRepoDialog.tsx).
-      // Firing here covers the load-bearing case where the create request
-      // actually landed — a renderer-side emit on the SetupStep "Create"
-      // click would also count abandoned composer sessions.
-      track('add_repo_setup_step_action', { action: 'create_worktree' })
-
       const sourceParse = workspaceSourceSchema.safeParse(args.telemetrySource)
       const source: WorkspaceSource = sourceParse.success ? sourceParse.data : 'unknown'
 
