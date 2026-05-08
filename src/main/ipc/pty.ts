@@ -919,10 +919,16 @@ export function registerPtyHandlers(
       } catch (err) {
         const rawMessage = err instanceof Error ? err.message : String(err)
         const hintedMessage = addNodePtyRecoveryHint(rawMessage)
-        const spawnError =
-          hintedMessage === rawMessage && err instanceof Error ? err : new Error(hintedMessage)
-        if (err instanceof Error) {
-          spawnError.name = err.name
+        let spawnError: Error
+        if (hintedMessage === rawMessage && err instanceof Error) {
+          spawnError = err
+        } else if (err instanceof Error) {
+          // Why: rewrite the message in place so the original stack trace,
+          // name, and any custom fields survive into telemetry and logs.
+          err.message = hintedMessage
+          spawnError = err
+        } else {
+          spawnError = new Error(hintedMessage)
         }
         if (effectiveSessionId !== undefined) {
           ptySizes.delete(effectiveSessionId)
