@@ -9,8 +9,36 @@ export const MAX_MESSAGE_SIZE = 16 * 1024 * 1024
 
 export const MessageType = {
   Regular: 1,
+  Handshake: 2,
   KeepAlive: 9
 } as const
+
+// Why: a pre-dispatcher envelope on a freshly-accepted Unix socket. The daemon
+// reads exactly one Handshake frame before attaching the JSON-RPC dispatcher,
+// to refuse mismatched-version --connect bridges that would otherwise drive a
+// stale daemon.
+export type HandshakeMessage =
+  | { type: 'orca-relay-handshake'; version: string }
+  | { type: 'orca-relay-handshake-ok'; version: string }
+  | { type: 'orca-relay-handshake-mismatch'; expected: string; got: string }
+
+export function encodeHandshakeFrame(msg: HandshakeMessage): Buffer {
+  const payload = Buffer.from(JSON.stringify(msg), 'utf-8')
+  return encodeFrame(MessageType.Handshake, 0, 0, payload)
+}
+
+export function parseHandshakeMessage(payload: Buffer): HandshakeMessage {
+  const msg = JSON.parse(payload.toString('utf-8')) as HandshakeMessage
+  const t = (msg as { type?: string }).type
+  if (
+    t !== 'orca-relay-handshake' &&
+    t !== 'orca-relay-handshake-ok' &&
+    t !== 'orca-relay-handshake-mismatch'
+  ) {
+    throw new Error(`Unknown handshake type: ${t}`)
+  }
+  return msg
+}
 
 export const KEEPALIVE_SEND_MS = 5_000
 export const TIMEOUT_MS = 20_000

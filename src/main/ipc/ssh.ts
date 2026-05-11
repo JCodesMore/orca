@@ -388,6 +388,29 @@ export function registerSshHandlers(
       // triggers session.reconnect() using the live SSH connection.
       // Set before establish() so the callback is in place if the relay
       // dies during the deploy/connect sequence.
+      // Why: a wire-handshake mismatch (typed RelayVersionMismatchError) means
+      // the local client and remote daemon are at different code versions —
+      // no amount of backoff will reconcile them. Skip the relay-lost loop
+      // entirely and surface a terminal "please reconnect manually" error.
+      session.setOnTerminalRelayError((tid, err) => {
+        clearRelayLostBackoff(tid)
+        console.warn(
+          `[ssh] Terminal relay error for ${tid}: ${err.message}; skipping reconnect backoff.`
+        )
+        const win = getMainWindow()
+        if (win && !win.isDestroyed()) {
+          win.webContents.send('ssh:state-changed', {
+            targetId: tid,
+            state: {
+              targetId: tid,
+              status: 'error',
+              error: err.message,
+              reconnectAttempt: 0
+            }
+          })
+        }
+      })
+
       session.setOnRelayLost((tid) => {
         const s = activeSessions.get(tid)
         if (!s) {
