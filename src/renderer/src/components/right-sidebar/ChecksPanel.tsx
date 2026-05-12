@@ -104,13 +104,22 @@ export default function ChecksPanel(): React.JSX.Element {
   // differs from the PR's head ref) resolve via the number-based fallback.
   const linkedPR = activeWorktree?.linkedPR ?? null
   useEffect(() => {
-    if (repo && !isFolder && branch) {
-      void fetchPRForBranch(repo.path, branch, { linkedPRNumber: linkedPR })
+    if (isPanelVisible && repo && !isFolder && branch) {
+      if (activeWorktreeId) {
+        enqueueGitHubPRRefresh(activeWorktreeId, 'swr', 30)
+      }
     }
-  }, [repo, isFolder, branch, linkedPR, fetchPRForBranch])
+  }, [repo, isFolder, branch, activeWorktreeId, enqueueGitHubPRRefresh, isPanelVisible])
 
   useEffect(() => {
-    if (!repo || isFolder || !branch || !pr || pr.mergeable !== 'CONFLICTING') {
+    if (
+      !repo ||
+      isFolder ||
+      !branch ||
+      !pr ||
+      pr.mergeable !== 'CONFLICTING' ||
+      !activeWorktreeId
+    ) {
       conflictSummaryRefreshKeyRef.current = null
       setConflictDetailsRefreshing(false)
       return
