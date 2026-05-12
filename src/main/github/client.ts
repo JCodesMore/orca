@@ -51,8 +51,24 @@ import {
   deriveCheckStatus
 } from './mappers'
 import { mapGraphQLReactionGroups, type GitHubGraphQLReactionGroup } from './comment-reactions'
+import {
+  getRateLimit,
+  noteRateLimitSpend,
+  rateLimitGuard,
+  type RateLimitBucketKind
+} from './rate-limit'
 
 const ORCA_REPO = 'stablyai/orca'
+
+async function assertRateLimitBudget(bucket: RateLimitBucketKind): Promise<void> {
+  await getRateLimit()
+  const guard = rateLimitGuard(bucket)
+  if (guard.blocked) {
+    throw new Error(
+      `GitHub ${bucket} rate limit is low; retry after ${new Date(guard.resetAt * 1000).toLocaleTimeString()}`
+    )
+  }
+}
 
 type PRBranchData = {
   number: number
@@ -984,11 +1000,10 @@ export async function getWorkItemByOwnerRepo(
  * Get PR info for a given branch using gh CLI.
  * Returns null if gh is not installed, or no PR exists for the branch.
  *
- * When `linkedPRNumber` is provided and the branch lookup yields nothing,
- * falls back to looking up the PR by number. This handles "create from PR"
- * worktrees, whose branch is a fresh local branch (not the PR's head ref) —
- * the branch-keyed lookup misses, but the user still expects the linked PR
- * to surface on the worktree card.
+ * When `linkedPRNumber` is provided, it is the source of truth. This handles
+ * "create from PR" worktrees whose local branch differs from the PR head ref,
+ * and prevents a coalesced linked-PR refresh from fanning out an unrelated
+ * branch lookup result to sibling aliases.
  */
 export async function getPRForBranch(
   repoPath: string,
@@ -1012,10 +1027,45 @@ export async function getPRForBranchOutcome(
     const ownerRepo = await getOwnerRepo(repoPath)
     let data: PRBranchData | null = null
 
-    // During a rebase the worktree is in detached HEAD and branch is empty.
-    // An empty --head filter causes gh to return an arbitrary PR — skip the
-    // branch lookup and rely on the linkedPR fallback below if available.
-    if (branchName) {
+    if (typeof linkedPRNumber === 'number') {
+      const args = ownerRepo
+        ? [
+            'pr',
+            'view',
+            String(linkedPRNumber),
+            '--repo',
+            `${ownerRepo.owner}/${ownerRepo.repo}`,
+            '--json',
+            'number,title,state,url,statusCheckRollup,updatedAt,isDraft,mergeable,baseRefName,headRefName,baseRefOid,headRefOid'
+          ]
+        : [
+            'pr',
+            'view',
+            String(linkedPRNumber),
+            '--json',
+            'number,title,state,url,statusCheckRollup,updatedAt,isDraft,mergeable,baseRefName,headRefName,baseRefOid,headRefOid'
+          ]
+      try {
+        const { stdout } = await ghExecFileAsync(args, { cwd: repoPath })
+        data = JSON.parse(stdout)
+      } catch (err) {
+        if (!isNoPullRequestError(err)) {
+          return {
+            kind: 'upstream-error',
+            errorType: classifyPRRefreshError(err),
+            message: err instanceof Error ? err.message : String(err),
+            fetchedAt: Date.now()
+          }
+        }
+        // Why: a stale linkedPRNumber (PR deleted, wrong repo, …) makes
+        // `gh pr view <number>` reject. Treat that as the no-PR case so
+        // callers see the historical `null` semantics instead of a thrown
+        // error every poll cycle.
+        data = null
+      }
+    } else if (branchName) {
+      // During a rebase the worktree is in detached HEAD and branch is empty.
+      // An empty --head filter causes gh to return an arbitrary PR.
       if (ownerRepo) {
         const { stdout } = await ghExecFileAsync(
           [
@@ -1056,44 +1106,6 @@ export async function getPRForBranchOutcome(
             throw err
           }
         }
-      }
-    }
-
-    if (!data && typeof linkedPRNumber === 'number') {
-      const args = ownerRepo
-        ? [
-            'pr',
-            'view',
-            String(linkedPRNumber),
-            '--repo',
-            `${ownerRepo.owner}/${ownerRepo.repo}`,
-            '--json',
-            'number,title,state,url,statusCheckRollup,updatedAt,isDraft,mergeable,baseRefName,headRefName,baseRefOid,headRefOid'
-          ]
-        : [
-            'pr',
-            'view',
-            String(linkedPRNumber),
-            '--json',
-            'number,title,state,url,statusCheckRollup,updatedAt,isDraft,mergeable,baseRefName,headRefName,baseRefOid,headRefOid'
-          ]
-      try {
-        const { stdout } = await ghExecFileAsync(args, { cwd: repoPath })
-        data = JSON.parse(stdout)
-      } catch (err) {
-        if (!isNoPullRequestError(err)) {
-          return {
-            kind: 'upstream-error',
-            errorType: classifyPRRefreshError(err),
-            message: err instanceof Error ? err.message : String(err),
-            fetchedAt: Date.now()
-          }
-        }
-        // Why: a stale linkedPRNumber (PR deleted, wrong repo, …) makes
-        // `gh pr view <number>` reject. Treat that as the no-PR case so
-        // callers see the historical `null` semantics instead of a thrown
-        // error every poll cycle.
-        data = null
       }
     }
 
@@ -1145,6 +1157,12 @@ export async function getPRChecks(
   options?: { noCache?: boolean }
 ): Promise<PRCheckDetail[]> {
   const ownerRepo = headSha ? await getOwnerRepo(repoPath) : null
+  if (ownerRepo && headSha) {
+    await assertRateLimitBudget('core')
+  }
+  // Why: even the REST check-runs path can fall back to `gh pr checks`, so
+  // guard GraphQL before acquiring the global gh lock.
+  await assertRateLimitBudget('graphql')
   await acquire()
   try {
     if (ownerRepo && headSha) {
@@ -1160,6 +1178,7 @@ export async function getPRChecks(
           ],
           { cwd: repoPath }
         )
+        noteRateLimitSpend('core')
         const data = JSON.parse(stdout) as {
           check_runs: {
             name: string
@@ -1187,6 +1206,7 @@ export async function getPRChecks(
       ['pr', 'checks', String(prNumber), '--json', 'name,state,link'],
       { cwd: repoPath }
     )
+    noteRateLimitSpend('graphql')
     const data = JSON.parse(stdout) as { name: string; state: string; link: string }[]
     return data.map((d) => ({
       name: d.name,
@@ -1265,6 +1285,10 @@ export async function getPRComments(
   options?: { noCache?: boolean }
 ): Promise<PRComment[]> {
   const ownerRepo = await getOwnerRepo(repoPath)
+  if (ownerRepo) {
+    await assertRateLimitBudget('core')
+  }
+  await assertRateLimitBudget('graphql')
   await acquire()
   try {
     if (ownerRepo) {
@@ -1304,6 +1328,8 @@ export async function getPRComments(
           cwd: repoPath
         })
       ])
+      noteRateLimitSpend('core', 2)
+      noteRateLimitSpend('graphql')
 
       // Parse issue comments (REST)
       type RESTComment = {
@@ -1455,6 +1481,7 @@ export async function getPRComments(
         cwd: repoPath
       }
     )
+    noteRateLimitSpend('graphql')
     const data = JSON.parse(stdout) as {
       comments: {
         author: { login: string }
