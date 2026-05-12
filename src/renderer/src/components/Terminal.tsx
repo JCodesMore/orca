@@ -54,6 +54,10 @@ import {
 } from './terminal/split-group-mount'
 import { appendUniqueOpenFileIds } from './terminal/unsaved-close-queue'
 import CodexRestartChip from './CodexRestartChip'
+import {
+  useActivityTerminalPortalTarget,
+  type ActivityTerminalPortalTarget
+} from './activity/activity-terminal-portal'
 
 const EditorPanel = lazy(() => import('./editor/EditorPanel'))
 
@@ -102,6 +106,19 @@ function Terminal(): React.JSX.Element | null {
   const setTabBarOrder = useAppStore((s) => s.setTabBarOrder)
   const tabBarOrderByWorktree = useAppStore((s) => s.tabBarOrderByWorktree)
   const tabBarOrder = activeWorktreeId ? tabBarOrderByWorktree[activeWorktreeId] : undefined
+  const activityTerminalPortalTarget = useActivityTerminalPortalTarget(activeView === 'activity')
+  const activityTerminalPortal: ActivityTerminalPortalTarget | null =
+    activeView === 'activity' &&
+    activeTabType === 'terminal' &&
+    activeWorktreeId &&
+    activeTabId &&
+    activityTerminalPortalTarget
+      ? {
+          target: activityTerminalPortalTarget,
+          worktreeId: activeWorktreeId,
+          tabId: activeTabId
+        }
+      : null
 
   const tabs = useMemo(
     () => (activeWorktreeId ? (tabsByWorktree[activeWorktreeId] ?? []) : []),
@@ -1247,6 +1264,7 @@ function Terminal(): React.JSX.Element | null {
                   layout={layout}
                   focusedGroupId={activeGroupIdByWorktree[worktree.id]}
                   isVisible={isVisible}
+                  activityTerminalPortal={activityTerminalPortal}
                 />
               )
             })}
@@ -1299,27 +1317,37 @@ function Terminal(): React.JSX.Element | null {
                     aria-hidden={!isVisible}
                   >
                     <CodexRestartChip worktreeId={worktree.id} />
-                    {(tabsByWorktree[worktree.id] ?? []).map((tab) => (
-                      <TerminalPane
-                        key={`${tab.id}-${tab.generation ?? 0}`}
-                        tabId={tab.id}
-                        worktreeId={worktree.id}
-                        cwd={worktree.path}
-                        isActive={
-                          isVisible && tab.id === activeTabId && activeTabType === 'terminal'
-                        }
-                        // Why: the bootstrap fallback still uses the legacy
-                        // workspace-level terminal host, where only the active
-                        // tab should render. Keeping `isVisible` explicit avoids
-                        // multiple panes stacking during the short window before
-                        // the split-group root layout is ready.
-                        isVisible={
-                          isVisible && tab.id === activeTabId && activeTabType === 'terminal'
-                        }
-                        onPtyExit={(ptyId) => handlePtyExit(tab.id, ptyId)}
-                        onCloseTab={() => handleCloseTab(tab.id)}
-                      />
-                    ))}
+                    {(tabsByWorktree[worktree.id] ?? []).map((tab) => {
+                      const isActivityPortalTab =
+                        activityTerminalPortal?.worktreeId === worktree.id &&
+                        activityTerminalPortal.tabId === tab.id
+                      const isActiveTerminalTab =
+                        isVisible && tab.id === activeTabId && activeTabType === 'terminal'
+                      const terminalPane = (
+                        <TerminalPane
+                          key={`${tab.id}-${tab.generation ?? 0}`}
+                          tabId={tab.id}
+                          worktreeId={worktree.id}
+                          cwd={worktree.path}
+                          isActive={isActiveTerminalTab || isActivityPortalTab}
+                          // Why: the activity page hosts this existing pane via
+                          // portal while the workspace surface remains hidden.
+                          // Keeping `isVisible` true for the portaled tab lets
+                          // xterm fit and stream foreground output in-place.
+                          isVisible={isActiveTerminalTab || isActivityPortalTab}
+                          onPtyExit={(ptyId) => handlePtyExit(tab.id, ptyId)}
+                          onCloseTab={() => handleCloseTab(tab.id)}
+                        />
+                      )
+                      if (isActivityPortalTab && activityTerminalPortal) {
+                        return createPortal(
+                          terminalPane,
+                          activityTerminalPortal.target,
+                          `activity-terminal-${tab.id}`
+                        )
+                      }
+                      return terminalPane
+                    })}
                   </div>
                 )
               })}
@@ -1478,12 +1506,14 @@ const WorktreeSplitSurface = React.memo(function WorktreeSplitSurface({
   worktreeId,
   layout,
   focusedGroupId,
-  isVisible
+  isVisible,
+  activityTerminalPortal
 }: {
   worktreeId: string
   layout: TabGroupLayoutNode
   focusedGroupId?: string
   isVisible: boolean
+  activityTerminalPortal: ActivityTerminalPortalTarget | null
 }): React.JSX.Element {
   return (
     <div
@@ -1496,6 +1526,7 @@ const WorktreeSplitSurface = React.memo(function WorktreeSplitSurface({
         worktreeId={worktreeId}
         focusedGroupId={focusedGroupId}
         isWorktreeActive={isVisible}
+        activityTerminalPortal={activityTerminalPortal}
       />
       <BrowserPaneOverlayLayer worktreeId={worktreeId} isWorktreeActive={isVisible} />
     </div>
