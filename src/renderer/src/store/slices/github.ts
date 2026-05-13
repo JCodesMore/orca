@@ -478,6 +478,7 @@ export type GitHubSlice = {
   commentsCache: Record<string, CacheEntry<PRComment[]>>
   prRefreshSequences: Record<string, number>
   prRefreshStates: Record<string, PRRefreshState>
+  prVisibleRefreshGeneration: number
   // Why: keyed by repoPath + limit + query so the NewWorkspace page can render
   // from cache instantly on mount (and on hover-prefetch from sidebar buttons)
   // while a background refresh keeps the list fresh.
@@ -516,6 +517,7 @@ export type GitHubSlice = {
     priority?: number
   ) => void
   reportVisibleGitHubPRRefreshCandidates: (worktreeIds: string[], generation: number) => void
+  bumpGitHubPRVisibleRefreshGeneration: () => void
   applyGitHubPRRefreshEvent: (event: GitHubPRRefreshEvent) => void
   /**
    * Why: returns cached work items immediately (null if none) and fires a
@@ -663,6 +665,7 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
   commentsCache: {},
   prRefreshSequences: {},
   prRefreshStates: {},
+  prVisibleRefreshGeneration: 0,
   workItemsCache: {},
   workItemsInvalidationNonce: 0,
   projectViewCache: {},
@@ -1679,6 +1682,10 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
     }
   },
 
+  bumpGitHubPRVisibleRefreshGeneration: () => {
+    set((s) => ({ prVisibleRefreshGeneration: s.prVisibleRefreshGeneration + 1 }))
+  },
+
   applyGitHubPRRefreshEvent: (event) => {
     set((s) => {
       const nextSequences = { ...s.prRefreshSequences }
@@ -1771,7 +1778,9 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
     const now = Date.now()
     const stalePRCandidates: { candidate: GitHubPRRefreshCandidate; score: number }[] = []
     const shouldRefreshPRs =
-      state.worktreeCardProperties.includes('pr') || state.worktreeCardProperties.includes('ci')
+      state.groupBy === 'pr-status' ||
+      state.worktreeCardProperties.includes('pr') ||
+      state.worktreeCardProperties.includes('ci')
 
     for (const worktrees of Object.values(state.worktreesByRepo)) {
       for (const wt of worktrees) {

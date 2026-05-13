@@ -162,6 +162,7 @@ const VirtualizedWorktreeViewport = React.memo(function VirtualizedWorktreeViewp
   )
   const cardProps = useAppStore((s) => s.worktreeCardProperties)
   const sshConnectedGeneration = useAppStore((s) => s.sshConnectedGeneration)
+  const prVisibleRefreshGeneration = useAppStore((s) => s.prVisibleRefreshGeneration)
 
   // Drag is only meaningful when the user is grouping by repo. When inert
   // (groupBy !== 'repo'), the controller is still constructed for hook order
@@ -445,7 +446,7 @@ const VirtualizedWorktreeViewport = React.memo(function VirtualizedWorktreeViewp
     const visibleIdentity = visibleRows
       .map((row) => `${row.worktree.id}:${row.worktree.branch}:${row.worktree.linkedPR ?? ''}`)
       .join('|')
-    const key = `${visibleIdentity}:${sshConnectedGeneration}:${cardProps.join(',')}`
+    const key = `${visibleIdentity}:${sshConnectedGeneration}:${prVisibleRefreshGeneration}:${cardProps.join(',')}`
     if (!key || key === lastVisibleRefreshKeyRef.current) {
       return
     }
@@ -456,6 +457,7 @@ const VirtualizedWorktreeViewport = React.memo(function VirtualizedWorktreeViewp
     groupBy,
     reportVisibleGitHubPRRefreshCandidates,
     rows,
+    prVisibleRefreshGeneration,
     sshConnectedGeneration,
     virtualItems
   ])

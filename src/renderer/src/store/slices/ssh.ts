@@ -35,7 +35,6 @@ export type SshSlice = {
   setSshTargetLabels: (labels: Map<string, string>) => void
   enqueueSshCredentialRequest: (req: SshCredentialRequest) => void
   removeSshCredentialRequest: (requestId: string) => void
-  bumpSshConnectedGeneration: () => void
   setPortForwards: (targetId: string, forwards: PortForwardEntry[]) => void
   clearPortForwards: (targetId: string) => void
   setDetectedPorts: (targetId: string, ports: DetectedPort[]) => void
@@ -70,8 +69,6 @@ export const createSshSlice: StateCreator<AppState, [], [], SshSlice> = (set) =>
     set((s) => ({
       sshCredentialQueue: s.sshCredentialQueue.filter((req) => req.requestId !== requestId)
     })),
-  bumpSshConnectedGeneration: () =>
-    set((s) => ({ sshConnectedGeneration: s.sshConnectedGeneration + 1 })),
 
   setPortForwards: (targetId, forwards) =>
     set((s) => {
