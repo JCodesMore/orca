@@ -573,7 +573,7 @@ function ThreadRow({
         // ~3px of internal space above the cap-height that isn't present
         // below the secondary badge row. Symmetric py made the top read
         // heavier; pt-2 / pb-2.5 visually evens the row.
-        'group relative grid w-full grid-cols-[minmax(0,1fr)_auto] gap-2 border-b border-border px-3 pt-2 pb-2.5 text-left transition-colors',
+        'group relative flex w-full flex-col gap-1 border-b border-border px-3 pt-2 pb-2.5 text-left transition-colors',
         selected
           ? 'bg-black/[0.08] shadow-[0_1px_2px_rgba(0,0,0,0.04)] dark:bg-white/[0.10] dark:shadow-[0_1px_2px_rgba(0,0,0,0.03)]'
           : 'hover:bg-accent/40'
@@ -582,70 +582,64 @@ function ThreadRow({
       {thread.unread ? (
         <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-r-full bg-primary" />
       ) : null}
-      <span className="min-w-0">
-        <span className="flex min-w-0 items-start gap-2">
-          <span className="inline-flex shrink-0 pt-[3px]">
-            <AgentIcon agent={agentTypeToIconAgent(thread.agentType)} size={14} />
-          </span>
-          {/* Why (line-clamp-2 + smaller size): prompts can be long; clamping
-              to two lines lets users read more of the prompt while keeping
-              rows scannable. text-[13px] tightens the leading slightly so two
-              clamped lines don't dominate the row vertically. */}
-          <span
-            className={cn(
-              'line-clamp-2 break-words text-[13px] leading-snug',
-              thread.unread ? 'font-semibold text-foreground' : 'font-medium text-foreground'
-            )}
-          >
-            {thread.paneTitle}
+      {/* Why (right cluster aligned to title, not centered between rows):
+          parking time + count on the title row leaves the secondary row
+          full-width for the repo badge + branch name, which used to get
+          truncated when the right cluster ate horizontal space. */}
+      <div className="flex min-w-0 items-start gap-2">
+        <span className="inline-flex shrink-0 pt-[3px]">
+          <AgentIcon agent={agentTypeToIconAgent(thread.agentType)} size={14} />
+        </span>
+        <span
+          className={cn(
+            'line-clamp-2 min-w-0 flex-1 break-words text-[11px] leading-snug',
+            thread.unread ? 'font-semibold text-foreground' : 'font-medium text-foreground'
+          )}
+        >
+          {thread.paneTitle}
+        </span>
+        <span className="inline-flex shrink-0 items-center gap-1.5 pt-[3px]">
+          {thread.unread ? (
+            <span className="rounded-full bg-primary px-1.5 py-0.5 text-[9px] font-semibold leading-none text-primary-foreground">
+              New
+            </span>
+          ) : null}
+          <Badge variant="outline" className="h-5 px-1.5 text-[10px] font-normal">
+            {thread.events.length}
+          </Badge>
+          <span className="relative inline-flex h-5 min-w-16 items-center justify-end">
+            <span className="transition-opacity group-hover:opacity-0">
+              <EventTime timestamp={latest.timestamp} />
+            </span>
+            <span className="absolute right-0 top-1/2 -translate-y-1/2 opacity-0 transition-opacity group-hover:opacity-100">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon-xs"
+                    aria-label={toggleLabel}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      onToggleRead()
+                    }}
+                    onMouseDown={(event) => event.stopPropagation()}
+                  >
+                    {thread.unread ? <BellOff className="size-3" /> : <Bell className="size-3" />}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="left">{toggleLabel}</TooltipContent>
+              </Tooltip>
+            </span>
           </span>
         </span>
-        <span className="mt-1 flex min-w-0 items-center gap-1.5">
-          <EventRepoBadge repo={thread.repo} />
-          <span className="truncate text-xs text-muted-foreground">
-            {thread.worktree.displayName}
-          </span>
+      </div>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <EventRepoBadge repo={thread.repo} />
+        <span className="truncate text-[11px] text-muted-foreground">
+          {thread.worktree.displayName}
         </span>
-      </span>
-      {/* Why (single-line right cluster): keeping time and count on the same
-          row stops the right column from forcing a ~48px height when the
-          left column's prompt is only one line. The row now collapses to
-          fit a 1-line title and grows naturally for 2-line prompts. */}
-      <span className="inline-flex shrink-0 items-center gap-1.5 pt-[3px]">
-        {thread.unread ? (
-          <span className="rounded-full bg-primary px-1.5 py-0.5 text-[9px] font-semibold leading-none text-primary-foreground">
-            New
-          </span>
-        ) : null}
-        <Badge variant="outline" className="h-5 px-1.5 text-[10px] font-normal">
-          {thread.events.length}
-        </Badge>
-        <span className="relative inline-flex h-5 min-w-16 items-center justify-end">
-          <span className="transition-opacity group-hover:opacity-0">
-            <EventTime timestamp={latest.timestamp} />
-          </span>
-          <span className="absolute right-0 top-1/2 -translate-y-1/2 opacity-0 transition-opacity group-hover:opacity-100">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon-xs"
-                  aria-label={toggleLabel}
-                  onClick={(event) => {
-                    event.stopPropagation()
-                    onToggleRead()
-                  }}
-                  onMouseDown={(event) => event.stopPropagation()}
-                >
-                  {thread.unread ? <BellOff className="size-3" /> : <Bell className="size-3" />}
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="left">{toggleLabel}</TooltipContent>
-            </Tooltip>
-          </span>
-        </span>
-      </span>
+      </div>
     </div>
   )
 }
