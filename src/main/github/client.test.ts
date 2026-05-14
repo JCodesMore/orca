@@ -4,6 +4,8 @@ const {
   execFileAsyncMock,
   ghExecFileAsyncMock,
   getOwnerRepoMock,
+  getIssueOwnerRepoMock,
+  getOwnerRepoForRemoteMock,
   gitExecFileAsyncMock,
   acquireMock,
   releaseMock
@@ -11,6 +13,8 @@ const {
   execFileAsyncMock: vi.fn(),
   ghExecFileAsyncMock: vi.fn(),
   getOwnerRepoMock: vi.fn(),
+  getIssueOwnerRepoMock: vi.fn(),
+  getOwnerRepoForRemoteMock: vi.fn(),
   gitExecFileAsyncMock: vi.fn(),
   acquireMock: vi.fn(),
   releaseMock: vi.fn()
@@ -20,6 +24,13 @@ vi.mock('./gh-utils', () => ({
   execFileAsync: execFileAsyncMock,
   ghExecFileAsync: ghExecFileAsyncMock,
   getOwnerRepo: getOwnerRepoMock,
+  getIssueOwnerRepo: getIssueOwnerRepoMock,
+  getOwnerRepoForRemote: getOwnerRepoForRemoteMock,
+  gitExecFileAsync: gitExecFileAsyncMock,
+  parseGitHubOwnerRepo: (remoteUrl: string) => {
+    const match = remoteUrl.trim().match(/github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?$/)
+    return match ? { owner: match[1], repo: match[2] } : null
+  },
   acquire: acquireMock,
   release: releaseMock,
   _resetOwnerRepoCache: vi.fn()
@@ -29,13 +40,15 @@ vi.mock('../git/runner', () => ({
   gitExecFileAsync: gitExecFileAsyncMock
 }))
 
-import { getPRForBranch, _resetOwnerRepoCache } from './client'
+import { getPRForBranch, getPullRequestPushTarget, _resetOwnerRepoCache } from './client'
 
 describe('getPRForBranch', () => {
   beforeEach(() => {
     execFileAsyncMock.mockReset()
     ghExecFileAsyncMock.mockReset()
     getOwnerRepoMock.mockReset()
+    getIssueOwnerRepoMock.mockReset()
+    getOwnerRepoForRemoteMock.mockReset()
     gitExecFileAsyncMock.mockReset()
     acquireMock.mockReset()
     releaseMock.mockReset()
@@ -255,5 +268,64 @@ describe('getPRForBranch', () => {
     const pr = await getPRForBranch('/repo-root', 'no-pr-branch')
 
     expect(pr).toBeNull()
+  })
+
+  it('resolves fork PR push target using the origin URL protocol', async () => {
+    getOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca' })
+    getOwnerRepoForRemoteMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca' })
+    ghExecFileAsyncMock.mockResolvedValueOnce({
+      stdout: JSON.stringify({
+        head: {
+          ref: 'prateek/fix-sidebar-agents-toggle',
+          repo: {
+            full_name: 'prateek/orca',
+            name: 'orca',
+            clone_url: 'https://github.com/prateek/orca.git',
+            ssh_url: 'git@github.com:prateek/orca.git',
+            owner: { login: 'prateek' }
+          }
+        }
+      })
+    })
+    gitExecFileAsyncMock.mockResolvedValueOnce({
+      stdout: 'git@github.com:stablyai/orca.git\n',
+      stderr: ''
+    })
+
+    const target = await getPullRequestPushTarget('/repo-root', 1738)
+
+    expect(ghExecFileAsyncMock).toHaveBeenCalledWith(['api', 'repos/stablyai/orca/pulls/1738'], {
+      cwd: '/repo-root'
+    })
+    expect(target).toEqual({
+      remoteName: 'pr-prateek-orca',
+      branchName: 'prateek/fix-sidebar-agents-toggle',
+      remoteUrl: 'git@github.com:prateek/orca.git'
+    })
+  })
+
+  it('uses origin for same-repository PR push targets', async () => {
+    getOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca' })
+    getOwnerRepoForRemoteMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca' })
+    ghExecFileAsyncMock.mockResolvedValueOnce({
+      stdout: JSON.stringify({
+        head: {
+          ref: 'fix-sidebar',
+          repo: {
+            full_name: 'stablyai/orca',
+            name: 'orca',
+            clone_url: 'https://github.com/stablyai/orca.git',
+            ssh_url: 'git@github.com:stablyai/orca.git',
+            owner: { login: 'stablyai' }
+          }
+        }
+      })
+    })
+
+    await expect(getPullRequestPushTarget('/repo-root', 1738)).resolves.toEqual({
+      remoteName: 'origin',
+      branchName: 'fix-sidebar'
+    })
+    expect(gitExecFileAsyncMock).not.toHaveBeenCalled()
   })
 })

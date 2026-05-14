@@ -1,16 +1,26 @@
 import { toast } from 'sonner'
 import { useAppStore } from '@/store'
 import { AGENT_CATALOG } from '@/lib/agent-catalog'
-import { waitForAgentReady } from '@/lib/agent-ready-wait'
-import { buildAgentStartupPlan } from '@/lib/tui-agent-startup'
-import { activateAndRevealWorktree } from '@/lib/worktree-activation'
+import { pasteDraftWhenAgentReady } from '@/lib/agent-paste-draft'
+import { buildAgentDraftLaunchPlan, buildAgentStartupPlan } from '@/lib/tui-agent-startup'
+import { TUI_AGENT_CONFIG } from '../../../shared/tui-agent-config'
+import { activateAndRevealWorktree, type AgentStartedTelemetry } from '@/lib/worktree-activation'
 import {
   CLIENT_PLATFORM,
   getLinkedWorkItemSuggestedName,
   getSetupConfig,
   getWorkspaceSeedName
 } from '@/lib/new-workspace'
-import type { OrcaHooks, RepoHookSettings, SetupDecision, TuiAgent } from '../../../shared/types'
+import { ensureHooksConfirmed } from '@/lib/ensure-hooks-confirmed'
+import { track, tuiAgentToAgentKind } from '@/lib/telemetry'
+import type {
+  OrcaHooks,
+  RepoHookSettings,
+  SetupDecision,
+  TuiAgent,
+  WorkspaceCreateTelemetrySource
+} from '../../../shared/types'
+import type { LaunchSource } from '../../../shared/telemetry-events'
 
 export type LaunchableWorkItem = {
   title: string
@@ -20,15 +30,17 @@ export type LaunchableWorkItem = {
   repoId?: string
   /** Content to paste into the agent's input. Defaults to the URL when omitted. */
   pasteContent?: string
+  /** Linear identifier (e.g. "ENG-123") when the work item originates from
+   *  Linear. Persisted to worktree meta as `linkedLinearIssue` so the sidebar
+   *  and other surfaces can surface the Linear link. Linear issues also pass
+   *  `type: 'issue'` / `number: null` to reuse the GitHub draft-paste flow,
+   *  so this field is the only signal that the worktree is Linear-linked. */
+  linearIdentifier?: string
 }
 
-// Why: bracketed paste markers let modern TUIs treat the inserted text as a
-// single atomic paste — Claude Code / Codex / Gemini put it in their input
-// buffer as a draft instead of echoing character-by-character. Intentionally
-// omit a trailing '\r' so the draft never auto-submits; the user gets to
-// review and send the prompt themselves.
-const BRACKETED_PASTE_BEGIN = '\x1b[200~'
-const BRACKETED_PASTE_END = '\x1b[201~'
+// Why: bracketed paste markers and ready-wait grace timing live in
+// agent-paste-draft.ts so the new-workspace and "Use" flows share one
+// definition of "type into the agent's input as a non-submitted draft".
 
 export type LaunchWorkItemDirectArgs = {
   item: LaunchableWorkItem
@@ -37,6 +49,20 @@ export type LaunchWorkItemDirectArgs = {
    *  `ask`, or the selected repo cannot resolve). Callers wire this to the
    *  existing modal opener so the user still gets a path forward. */
   openModalFallback: () => void
+  /** Optional base branch to start the worktree from. When omitted the
+   *  worktree inherits the repo's effective base ref. Used by the
+   *  smart workspace-name PR selection to branch from the PR's head so the first
+   *  commit lands on the correct base without the user touching the UI. */
+  baseBranch?: string
+  /** Telemetry surface that initiated this agent launch. Threaded into
+   *  the queued startup payload so `agent_started.launch_source` reflects
+   *  the actual entry point. */
+  launchSource: LaunchSource
+  /** Telemetry surface that initiated this launch. Threaded into
+   *  `createWorktree` so `workspace_created.source` reflects the actual
+   *  entry point (Tasks page row → `sidebar`, Create-from modal →
+   *  `command_palette`). Omitted callers default to `unknown`. */
+  telemetrySource?: WorkspaceCreateTelemetrySource
 }
 
 function pickAgent(
@@ -86,6 +112,57 @@ async function resolveSetupDecision(
   }
 }
 
+// Why: telemetry rides the queued startup so main fires `agent_started`
+// only after pty:spawn confirms the launch. No agent / no plan → no event.
+function buildStartupOpts(
+  agent: TuiAgent | null,
+  plan: ReturnType<typeof buildAgentStartupPlan>,
+  launchSource: LaunchSource
+): {
+  startup?: { command: string; env?: Record<string, string>; telemetry?: AgentStartedTelemetry }
+} {
+  if (!plan) {
+    return {}
+  }
+  const telemetry: AgentStartedTelemetry | null =
+    agent === null
+      ? null
+      : { agent_kind: tuiAgentToAgentKind(agent), launch_source: launchSource, request_kind: 'new' }
+  return {
+    startup: {
+      command: plan.launchCommand,
+      ...(plan.env ? { env: plan.env } : {}),
+      ...(telemetry ? { telemetry } : {})
+    }
+  }
+}
+
+async function pasteWorkItemDraftWhenAgentReady(args: {
+  primaryTabId: string
+  startupPlan: NonNullable<ReturnType<typeof buildAgentStartupPlan>>
+  content: string
+  /** Telemetry-only: which agent the renderer thinks it launched, so an
+   *  `agent_error` on timeout can carry the right `agent_kind`. */
+  agentKind?: ReturnType<typeof tuiAgentToAgentKind>
+}): Promise<void> {
+  const { primaryTabId, startupPlan, content, agentKind } = args
+  await pasteDraftWhenAgentReady({
+    tabId: primaryTabId,
+    content,
+    agent: startupPlan.agent,
+    onTimeout: () => {
+      toast.message(
+        'Agent took too long to start. The workspace is ready — paste the issue URL when the agent is idle.'
+      )
+      // Why: process-startup timeout has no v1 enum slot; the `unknown` slice
+      // on the dashboard is the trigger to add one.
+      if (agentKind) {
+        track('agent_error', { error_class: 'unknown', agent_kind: agentKind })
+      }
+    }
+  })
+}
+
 /**
  * "Use" flow: create the workspace, activate it, launch the default agent,
  * and paste the work item URL into the agent's prompt as a draft (no submit).
@@ -100,7 +177,7 @@ async function resolveSetupDecision(
  * has a usable workspace and can paste the URL themselves.
  */
 export async function launchWorkItemDirect(args: LaunchWorkItemDirectArgs): Promise<void> {
-  const { item, repoId, openModalFallback } = args
+  const { item, repoId, openModalFallback, baseBranch, telemetrySource, launchSource } = args
   const store = useAppStore.getState()
   const repo = store.repos.find((r) => r.id === repoId)
   if (!repo) {
@@ -109,14 +186,19 @@ export async function launchWorkItemDirect(args: LaunchWorkItemDirectArgs): Prom
   }
 
   const settings = store.settings
-  const detectedIds = new Set(await store.ensureDetectedAgents())
-  const effectiveAgent = pickAgent(settings?.defaultTuiAgent, detectedIds)
+  // Why: agent detection shells out and can be cold/slow. Start it now, but
+  // don't let it serialize setup-policy resolution or git worktree creation.
+  const detectedAgentsPromise = store.ensureDetectedAgents()
 
   const setupResolution = await resolveSetupDecision(repoId, repo)
   if (setupResolution.kind === 'needs-modal') {
     openModalFallback()
     return
   }
+
+  const trustDecision = await ensureHooksConfirmed(useAppStore.getState(), repoId, 'setup')
+  const finalSetupDecision: SetupDecision =
+    trustDecision === 'skip' ? 'skip' : setupResolution.decision
 
   const workspaceName = getWorkspaceSeedName({
     explicitName: getLinkedWorkItemSuggestedName(item),
@@ -125,34 +207,113 @@ export async function launchWorkItemDirect(args: LaunchWorkItemDirectArgs): Prom
     linkedPR: item.type === 'pr' ? (item.number ?? null) : null
   })
 
-  // Why: launch the agent with no prompt so the first frame it draws is the
-  // empty input box. The URL paste below populates that input buffer, which
-  // gives the user a reviewable draft instead of a submitted request.
-  const startupPlan =
-    effectiveAgent === null
-      ? null
-      : buildAgentStartupPlan({
-          agent: effectiveAgent,
-          prompt: '',
-          cmdOverrides: settings?.agentCmdOverrides ?? {},
-          platform: CLIENT_PLATFORM,
-          allowEmptyPromptLaunch: true
-        })
-
   let worktreeId: string
   let primaryTabId: string | null
+  let startupPlan: ReturnType<typeof buildAgentStartupPlan> = null
+  let effectiveAgent: TuiAgent | null = null
+  let draftLaunchedNatively = false
   try {
     const result = await store.createWorktree(
       repoId,
       workspaceName,
+      baseBranch,
+      finalSetupDecision,
       undefined,
-      setupResolution.decision
+      telemetrySource,
+      item.title,
+      item.type === 'issue' && item.number ? item.number : undefined,
+      item.type === 'pr' && item.number ? item.number : undefined
     )
     worktreeId = result.worktree.id
+    const worktreePath = result.worktree.path
+    const meta: {
+      linkedLinearIssue?: string
+    } = {}
+    if (item.linearIdentifier) {
+      meta.linkedLinearIssue = item.linearIdentifier
+    }
+    if (Object.keys(meta).length > 0) {
+      // Why: Project direct-launch activates the new workspace immediately.
+      // GitHub issue/PR links are persisted during create; Linear metadata
+      // still uses a best-effort follow-up because create args do not carry it.
+      // Best-effort: the worktree is already created on disk, so a meta
+      // write failure must not abort activation and orphan it.
+      void store.updateWorktreeMeta(worktreeId, meta).catch(() => {
+        // Non-critical: continue into activation without the link metadata.
+      })
+    }
+
+    const detectedIds = new Set(await detectedAgentsPromise)
+    effectiveAgent = pickAgent(settings?.defaultTuiAgent, detectedIds)
+    if (effectiveAgent) {
+      // Why: direct task launch creates and starts the workspace in separate
+      // steps so agent detection can overlap git worktree creation. Persist
+      // the chosen agent once known so empty-worktree reopen can recreate it.
+      void store.updateWorktreeMeta(worktreeId, { createdWithAgent: effectiveAgent }).catch(() => {
+        // Non-critical: activation still has the explicit startup below.
+      })
+    }
+    const draftContent = item.pasteContent ?? item.url
+
+    // Why: agents that gate first-launch behind a "Do you trust this folder?"
+    // menu (cursor-agent, copilot) consume the bracketed paste as menu input.
+    // Pre-write the same trust artifact those CLIs write after the user
+    // accepts so the menu never fires. Best-effort — main swallows errors,
+    // and we guard the IPC presence so a stale preload bundle (which can
+    // ship a renderer that's ahead of the loaded preload) doesn't crash the
+    // launch with "Cannot read properties of undefined".
+    if (effectiveAgent && worktreePath && window.api.agentTrust?.markTrusted) {
+      const preflight = TUI_AGENT_CONFIG[effectiveAgent].preflightTrust
+      if (preflight) {
+        try {
+          await window.api.agentTrust.markTrusted({
+            preset: preflight,
+            workspacePath: worktreePath
+          })
+        } catch {
+          // Best-effort: continue with launch even if the trust write
+          // throws. The user can dismiss the trust menu manually.
+        }
+      }
+    }
+
+    // Why: prefer a native prefill flag (e.g. `claude --prefill <url>`) when
+    // the agent's CLI exposes one — the TUI mounts with the URL already in
+    // its input box, which sidesteps the readiness/paste race entirely. Fall
+    // back to launching with no prompt + bracketed-paste-after-ready for
+    // every other agent so the URL still lands as a draft (not auto-
+    // submitted as the first turn).
+    const draftLaunchPlan =
+      effectiveAgent === null
+        ? null
+        : buildAgentDraftLaunchPlan({
+            agent: effectiveAgent,
+            draft: draftContent,
+            cmdOverrides: settings?.agentCmdOverrides ?? {},
+            platform: CLIENT_PLATFORM
+          })
+    if (draftLaunchPlan) {
+      startupPlan = {
+        agent: draftLaunchPlan.agent,
+        launchCommand: draftLaunchPlan.launchCommand,
+        expectedProcess: draftLaunchPlan.expectedProcess,
+        followupPrompt: null,
+        ...(draftLaunchPlan.env ? { env: draftLaunchPlan.env } : {})
+      }
+      draftLaunchedNatively = true
+    } else if (effectiveAgent !== null) {
+      startupPlan = buildAgentStartupPlan({
+        agent: effectiveAgent,
+        prompt: '',
+        cmdOverrides: settings?.agentCmdOverrides ?? {},
+        platform: CLIENT_PLATFORM,
+        allowEmptyPromptLaunch: true
+      })
+    }
 
     const activation = activateAndRevealWorktree(worktreeId, {
       setup: result.setup,
-      ...(startupPlan ? { startup: { command: startupPlan.launchCommand } } : {})
+      ...buildStartupOpts(effectiveAgent, startupPlan, launchSource)
     })
     if (!activation) {
       // Worktree vanished between create and activate — extremely unlikely but
@@ -167,55 +328,30 @@ export async function launchWorkItemDirect(args: LaunchWorkItemDirectArgs): Prom
     return
   }
 
-  const meta: { linkedIssue?: number; linkedPR?: number } = {}
-  if (item.type === 'issue' && item.number) {
-    meta.linkedIssue = item.number
-  } else if (item.type === 'pr' && item.number) {
-    meta.linkedPR = item.number
-  }
-  try {
-    await store.updateWorktreeMeta(worktreeId, meta)
-  } catch {
-    // Meta update is non-critical for the draft flow — continue.
-  }
-
   store.setSidebarOpen(true)
   if (settings?.rightSidebarOpenByDefault) {
     store.setRightSidebarTab('explorer')
     store.setRightSidebarOpen(true)
   }
 
-  // Why: at this point the workspace is live and the agent (if any) has been
-  // queued on `primaryTabId`. The paste step below is the only remaining
-  // draft-specific work; bail out cleanly when either prerequisite is missing.
-  if (!primaryTabId || !startupPlan) {
+  // Why: at this point the workspace is live and the agent (if any) has
+  // been queued on `primaryTabId`. The post-launch paste step below only
+  // applies to agents that lacked a native prefill flag; for agents that
+  // were launched with the URL already on argv (Claude --prefill today),
+  // the URL is in the input box already — pasting again would duplicate it.
+  if (!primaryTabId || !startupPlan || draftLaunchedNatively) {
     return
   }
-
-  const readyResult = await waitForAgentReady(primaryTabId, startupPlan.expectedProcess, {
-    timeoutMs: 5000
-  })
-  if (!readyResult.ready) {
-    toast.message(
-      'Agent took too long to start. The workspace is ready — paste the issue URL when the agent is idle.'
-    )
-    return
-  }
-
-  const finalState = useAppStore.getState()
-  const ptyId = finalState.ptyIdsByTabId[primaryTabId]?.[0]
-  if (!ptyId) {
-    return
-  }
-
-  // Why: TUIs must enable bracketed paste mode (\x1b[?2004h) before they can
-  // interpret our paste markers. `title-idle` means the TUI has fully rendered
-  // its input box and enabled paste mode; weaker signals (`foreground-match`,
-  // `child-process`) only confirm the binary is running — the TUI's input
-  // setup may still be in-flight, especially on slow shell environments.
-  const graceMs = readyResult.reason === 'title-idle' ? 150 : 600
-  await new Promise((resolve) => window.setTimeout(resolve, graceMs))
 
   const content = item.pasteContent ?? item.url
-  window.api.pty.write(ptyId, `${BRACKETED_PASTE_BEGIN}${content}${BRACKETED_PASTE_END}`)
+  // Why: the workspace is already created and visible; do not block selection
+  // latency on agent readiness. Run the paste in the background so the
+  // "Use" CTA's spinner ends when the worktree is ready, not when the TUI
+  // input buffer is ready.
+  void pasteWorkItemDraftWhenAgentReady({
+    primaryTabId,
+    startupPlan,
+    content,
+    ...(effectiveAgent ? { agentKind: tuiAgentToAgentKind(effectiveAgent) } : {})
+  })
 }

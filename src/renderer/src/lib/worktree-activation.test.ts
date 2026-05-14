@@ -64,7 +64,9 @@ describe('ensureWorktreeHasInitialTerminal', () => {
 
     ensureWorktreeHasInitialTerminal(store, 'wt-1')
 
-    expect(store.createTab).toHaveBeenCalledWith('wt-1')
+    expect(store.createTab).toHaveBeenCalledWith('wt-1', undefined, undefined, {
+      pendingActivationSpawn: true
+    })
     expect(store.setActiveTab).toHaveBeenCalledWith('tab-1')
     expect(store.queueTabStartupCommand).not.toHaveBeenCalled()
     expect(store.queueTabSetupSplit).not.toHaveBeenCalled()
@@ -98,13 +100,43 @@ describe('ensureWorktreeHasInitialTerminal', () => {
       undefined
     )
 
-    expect(store.createTab).toHaveBeenCalledWith('wt-1')
+    expect(store.createTab).toHaveBeenCalledWith('wt-1', undefined, undefined, {
+      pendingActivationSpawn: true
+    })
     expect(store.setActiveTab).toHaveBeenCalledWith('tab-1')
     expect(store.queueTabStartupCommand).toHaveBeenCalledWith('tab-1', {
       command: 'claude "Fix this bug"'
     })
     expect(store.queueTabSetupSplit).not.toHaveBeenCalled()
     expect(store.queueTabIssueCommandSplit).not.toHaveBeenCalled()
+  })
+
+  it('forwards telemetry on the queued startup so main can fire agent_started', () => {
+    const store = createMockStore()
+
+    ensureWorktreeHasInitialTerminal(
+      store,
+      'wt-1',
+      {
+        command: 'claude',
+        telemetry: {
+          agent_kind: 'claude-code',
+          launch_source: 'new_workspace_composer',
+          request_kind: 'new'
+        }
+      },
+      undefined,
+      undefined
+    )
+
+    expect(store.queueTabStartupCommand).toHaveBeenCalledWith('tab-1', {
+      command: 'claude',
+      telemetry: {
+        agent_kind: 'claude-code',
+        launch_source: 'new_workspace_composer',
+        request_kind: 'new'
+      }
+    })
   })
 
   it('does not create a terminal just because the legacy terminal slice is empty', () => {
@@ -130,7 +162,9 @@ describe('ensureWorktreeHasInitialTerminal', () => {
       }
     })
 
-    expect(store.createTab).toHaveBeenCalledWith('wt-1')
+    expect(store.createTab).toHaveBeenCalledWith('wt-1', undefined, undefined, {
+      pendingActivationSpawn: true
+    })
     expect(store.setActiveTab).toHaveBeenCalledWith('tab-1')
     expect(store.queueTabSetupSplit).not.toHaveBeenCalled()
     expect(store.queueTabIssueCommandSplit).toHaveBeenCalledWith('tab-1', {

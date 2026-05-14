@@ -1,3 +1,11 @@
+/* eslint-disable max-lines -- Why: this module owns the complete daemon
+lifecycle for the Electron main process — init, out-of-process launch,
+current+legacy adapter wiring, restart orchestration (the 7-step sequence
+from docs/daemon-staleness-ux.md §Phase 1), and teardown on app quit. Splitting
+it would scatter the "swap the running provider atomically" invariant across
+files with no cleaner ownership seam: restart, replaceDaemonProvider, and the
+module-level spawner/adapter singletons must stay co-located so a future
+change cannot leave them drifting out of sync. */
 import { join } from 'path'
 import { app } from 'electron'
 import { mkdirSync, existsSync, unlinkSync, writeFileSync } from 'fs'
@@ -8,6 +16,7 @@ import {
   getDaemonPidPath,
   getDaemonSocketPath,
   getDaemonTokenPath,
+  serializeDaemonPidFile,
   type DaemonLauncher
 } from './daemon-spawner'
 import { DaemonPtyAdapter } from './daemon-pty-adapter'
@@ -18,11 +27,25 @@ import {
   PROTOCOL_VERSION,
   type ListSessionsResult
 } from './types'
-import { healthCheckDaemon, killStaleDaemon } from './daemon-health'
-import { setLocalPtyProvider } from '../ipc/pty'
+import {
+  getDaemonLaunchIdentity,
+  getProcessStartedAtMs,
+  healthCheckDaemon,
+  killStaleDaemon
+} from './daemon-health'
+import {
+  setLocalPtyProvider,
+  unbindLocalProviderListeners,
+  rebindLocalProviderListeners
+} from '../ipc/pty'
 
 let spawner: DaemonSpawner | null = null
 let adapter: DaemonPtyRouter | DaemonPtyAdapter | null = null
+// Why: coalesce concurrent restartDaemon() calls so two clicks (or a UI
+// click racing an internal caller) can't both enter the 7-step sequence —
+// the second entry would read the already-disposed current adapter and
+// race cleanupDaemonForProtocol against a half-spawned replacement.
+let restartInFlight: Promise<RestartDaemonResult> | null = null
 
 function getRuntimeDir(): string {
   const dir = join(app.getPath('userData'), 'daemon')
@@ -42,6 +65,10 @@ function getDaemonEntryPath(): string {
   // execute it from disk. In packaged apps app.getAppPath() points at
   // app.asar, so redirect to the unpacked sibling before joining the script.
   const basePath = app.isPackaged ? appPath.replace('app.asar', 'app.asar.unpacked') : appPath
+  const directEntryPath = join(basePath, 'daemon-entry.js')
+  if (existsSync(directEntryPath)) {
+    return directEntryPath
+  }
   return join(basePath, 'out', 'main', 'daemon-entry.js')
 }
 
@@ -73,13 +100,26 @@ function probeSocket(socketPath: string): Promise<boolean> {
 
 function createOutOfProcessLauncher(runtimeDir: string): DaemonLauncher {
   return async (socketPath, tokenPath) => {
+    const entryPath = getDaemonEntryPath()
     const healthy = await healthCheckDaemon(socketPath, tokenPath)
     if (healthy) {
-      // Why: daemon is already running from a previous app session and
-      // responded to a protocol-level ping. Safe to reuse.
-      return {
-        shutdown: async () => {
-          await cleanupDaemonForProtocol(runtimeDir, PROTOCOL_VERSION)
+      // Why: dev worktrees share the same orca-dev userData, so a daemon from
+      // a deleted sibling checkout can pass protocol health checks while still
+      // pointing at missing native modules. Packaged app paths are stable and
+      // should preserve existing warm daemon reuse semantics.
+      const identity = app.isPackaged
+        ? 'match'
+        : getDaemonLaunchIdentity(runtimeDir, socketPath, tokenPath, entryPath)
+      if (identity === 'mismatch') {
+        console.warn('[daemon] Replacing daemon launched from a different app path')
+        await cleanupDaemonForProtocol(runtimeDir, PROTOCOL_VERSION)
+      } else {
+        // Why: daemon is already running from a previous app session and
+        // responded to a protocol-level ping. Safe to reuse.
+        return {
+          shutdown: async () => {
+            await cleanupDaemonForProtocol(runtimeDir, PROTOCOL_VERSION)
+          }
         }
       }
     }
@@ -88,7 +128,6 @@ function createOutOfProcessLauncher(runtimeDir: string): DaemonLauncher {
     // before respawn so the new daemon does not race the stale process.
     await killStaleDaemon(runtimeDir, socketPath, tokenPath)
 
-    const entryPath = getDaemonEntryPath()
     const userDataPath = app.getPath('userData')
     const child = fork(entryPath, ['--socket', socketPath, '--token', tokenPath], {
       // Why: detached + unref lets the daemon outlive the Electron process.
@@ -130,7 +169,19 @@ function createOutOfProcessLauncher(runtimeDir: string): DaemonLauncher {
         if (msg && typeof msg === 'object' && (msg as { type?: string }).type === 'ready') {
           clearTimeout(timer)
           if (child.pid) {
-            writeFileSync(getDaemonPidPath(runtimeDir), String(child.pid), { mode: 0o600 })
+            // Why: JSON pid file carries pid + process start time so later
+            // killStaleDaemon() can verify the pid still belongs to the daemon
+            // we forked before SIGTERMing it. Prevents pid-recycling hazard
+            // where the OS hands the daemon's old pid to an unrelated process.
+            writeFileSync(
+              getDaemonPidPath(runtimeDir),
+              serializeDaemonPidFile({
+                pid: child.pid,
+                startedAtMs: getProcessStartedAtMs(child.pid),
+                entryPath
+              }),
+              { mode: 0o600 }
+            )
           }
           // Why: disconnect IPC channel and unref so Electron can exit
           // without waiting for the daemon. The daemon keeps running.
@@ -208,12 +259,127 @@ export async function initDaemonPtyProvider(): Promise<void> {
   setLocalPtyProvider(routedAdapter)
 }
 
+// Why: the Manage Sessions IPC handlers need read access to the current
+// adapter/router to list sessions, kill them, etc. Exposed as a narrow getter
+// rather than exporting the module-level variable to keep the "swap on
+// restart" invariant in one place (replaceDaemonProvider).
+export function getDaemonProvider(): DaemonPtyRouter | DaemonPtyAdapter | null {
+  return adapter
+}
+
+// Why: the "Restart daemon" flow rebuilds the current-protocol adapter and
+// must update both the module-level `adapter` singleton here and the
+// `localProvider` reference inside ipc/pty.ts. Without this helper they could
+// drift — app-quit would dispose a stale adapter reference.
+export function replaceDaemonProvider(newAdapter: DaemonPtyAdapter | DaemonPtyRouter): void {
+  adapter = newAdapter
+  setLocalPtyProvider(newAdapter)
+}
+
+export type RestartDaemonResult = {
+  killedCount: number
+}
+
+// Why: the 7-step sequence from docs/daemon-staleness-ux.md §Phase 1 restart.
+// Current-protocol only — legacy adapters are preserved and route to their
+// original daemons with no respawn path. See the design doc for rationale on
+// each step, notably why synthetic exits must fan out *before* the listener
+// unsubscribe.
+export async function restartDaemon(): Promise<RestartDaemonResult> {
+  if (restartInFlight) {
+    return restartInFlight
+  }
+  restartInFlight = runRestartDaemon().finally(() => {
+    restartInFlight = null
+  })
+  return restartInFlight
+}
+
+async function runRestartDaemon(): Promise<RestartDaemonResult> {
+  const currentSpawner = spawner
+  const currentAdapter = adapter
+  if (!currentSpawner || !currentAdapter) {
+    throw new Error('restartDaemon called before initDaemonPtyProvider')
+  }
+
+  const runtimeDir = getRuntimeDir()
+  const currentOnly =
+    currentAdapter instanceof DaemonPtyRouter ? currentAdapter.getCurrentAdapter() : currentAdapter
+  const legacyAdapters =
+    currentAdapter instanceof DaemonPtyRouter ? [...currentAdapter.getLegacyAdapters()] : []
+
+  // Step 1: synthesize pty:exit for every active session on the current
+  // adapter BEFORE any teardown. The daemon's kill-all-and-shutdown path
+  // explicitly does not fan onExit to clients (session.ts:246-252), so
+  // without this the renderer would never see exits and would black-hole
+  // writes against the disposed adapter.
+  const killedCount = currentOnly.getActiveSessionIds().length
+  currentOnly.fanoutSyntheticExits(-1)
+
+  // Step 2: detach renderer listeners from the current adapter. Must happen
+  // AFTER step 1 so the synthesized exits actually reach the renderer, and
+  // BEFORE step 6 so the new provider isn't bound with stale listeners.
+  unbindLocalProviderListeners()
+
+  // Step 3: kill the current-protocol daemon process (shutdown RPC → fallback
+  // killStaleDaemon → socket/pid unlink). Legacy adapters untouched.
+  await cleanupDaemonForProtocol(runtimeDir, PROTOCOL_VERSION)
+
+  // Step 4: reuse the existing spawner so the respawn closure baked into
+  // long-lived adapters stays valid. Do NOT construct a new DaemonSpawner.
+  currentSpawner.resetHandle()
+  const info = await currentSpawner.ensureRunning()
+
+  // Step 5: build a fresh current adapter against the respawned daemon. Its
+  // respawn callback closes over the same spawner instance (identical to the
+  // crash-respawn closure in initDaemonPtyProvider).
+  const newCurrent = new DaemonPtyAdapter({
+    socketPath: info.socketPath,
+    tokenPath: info.tokenPath,
+    historyPath: getHistoryDir(),
+    respawn: async () => {
+      console.warn('[daemon] Daemon process died — respawning')
+      currentSpawner.resetHandle()
+      await currentSpawner.ensureRunning()
+    }
+  })
+
+  // Re-wrap in router if there were legacy adapters at startup; otherwise
+  // point straight at the new adapter. Legacy instances are preserved by
+  // reference — they still route to the same pre-upgrade daemons.
+  const newProvider =
+    legacyAdapters.length > 0
+      ? new DaemonPtyRouter({ current: newCurrent, legacy: legacyAdapters })
+      : newCurrent
+  if (newProvider instanceof DaemonPtyRouter) {
+    await newProvider.discoverLegacySessions()
+  }
+
+  // Why: drain the outgoing router's subscriptions from the shared legacy
+  // adapters before installing the new router (which subscribes fresh). Must
+  // run *after* the new provider exists so no adapter event is unhandled in
+  // the narrow window, and *before* replaceDaemonProvider so the swap is
+  // atomic from the renderer's perspective. Plain dispose() would also tear
+  // down the legacy adapters themselves — use the router-only variant.
+  if (currentAdapter instanceof DaemonPtyRouter) {
+    currentAdapter.disposeRouterOnly()
+  }
+
+  // Step 6: swap module state (adapter + localProvider) atomically.
+  replaceDaemonProvider(newProvider)
+
+  // Step 7: rebind renderer listeners against the new provider.
+  rebindLocalProviderListeners()
+
+  return { killedCount }
+}
+
 // Why: disconnect from the daemon without killing it. The daemon runs as a
 // separate process and survives app quit — sessions stay alive for warm
 // reattach on next launch. Leave history sessions marked "unclean" here so a
 // later daemon crash while Orca is closed is still recoverable on next launch.
-export function disconnectDaemon(): void {
-  adapter?.disconnectOnly()
+export async function disconnectDaemon(): Promise<void> {
+  await adapter?.disconnectOnly()
   adapter = null
 }
 
@@ -239,7 +405,7 @@ export type OrphanedDaemonCleanupResult = {
   killedCount: number
 }
 
-async function cleanupDaemonForProtocol(
+export async function cleanupDaemonForProtocol(
   runtimeDir: string,
   protocolVersion: number
 ): Promise<OrphanedDaemonCleanupResult> {
@@ -327,6 +493,11 @@ async function createLegacyDaemonAdapters(runtimeDir: string): Promise<DaemonPty
     // Legacy adapters intentionally do not respawn: respawning an old protocol
     // daemon from new code would recreate stale env semantics and can be less
     // predictable than letting the session fail if that old daemon dies.
+    // Why historyPath is still passed: checkpoint writes will fail silently
+    // (pre-v4 daemons don't support getSnapshot), but the HistoryManager is
+    // still needed for cleanup — close/exit events must remove history dirs
+    // and mark meta.json as ended. Without it, a later v4 session reusing
+    // the same ID could false-restore stale scrollback.bin.
     adapters.push(
       new DaemonPtyAdapter({
         socketPath,
@@ -337,28 +508,4 @@ async function createLegacyDaemonAdapters(runtimeDir: string): Promise<DaemonPty
     )
   }
   return adapters
-}
-
-/** Detect and tear down an orphaned daemon left behind by a previous app
- *  session (e.g. a user who had `experimentalTerminalDaemon` enabled on an
- *  older build and is now launching a build where the feature is disabled).
- *
- *  Why it matters: the daemon is designed to outlive the Electron process.
- *  If we just skip `initDaemonPtyProvider()` on this launch, any live sessions
- *  from the previous session keep running invisibly — consuming CPU / holding
- *  files open / re-launching on every boot because nothing ever kills them.
- *  This helper connects to the existing socket, enumerates sessions, and asks
- *  the daemon to shut itself down (which terminates all PTYs). */
-export async function cleanupOrphanedDaemon(): Promise<OrphanedDaemonCleanupResult> {
-  const runtimeDir = getRuntimeDir()
-  let cleaned = false
-  let killedCount = 0
-
-  for (const protocolVersion of [PROTOCOL_VERSION, ...PREVIOUS_DAEMON_PROTOCOL_VERSIONS]) {
-    const result = await cleanupDaemonForProtocol(runtimeDir, protocolVersion)
-    cleaned ||= result.cleaned
-    killedCount += result.killedCount
-  }
-
-  return { cleaned, killedCount }
 }

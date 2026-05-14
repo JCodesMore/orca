@@ -10,6 +10,7 @@ export type WindowShortcutInput = {
 export type WindowShortcutAction =
   | { type: 'zoom'; direction: 'in' | 'out' | 'reset' }
   | { type: 'toggleWorktreePalette' }
+  | { type: 'toggleFloatingTerminal' }
   | { type: 'toggleLeftSidebar' }
   | { type: 'toggleRightSidebar' }
   | { type: 'openQuickOpen' }
@@ -68,6 +69,16 @@ function isHistoryNavigateChord(input: WindowShortcutInput, platform: NodeJS.Pla
   )
 }
 
+function isFloatingTerminalChord(input: WindowShortcutInput, platform: NodeJS.Platform): boolean {
+  return (
+    platformPrimaryModifier(input, platform) &&
+    !platformOppositeModifier(input, platform) &&
+    Boolean(input.alt) &&
+    !input.shift &&
+    matchesLetterShortcut(input, 't', 'KeyT')
+  )
+}
+
 function isZoomInShortcut(input: WindowShortcutInput): boolean {
   return input.key === '=' || input.key === '+' || input.code === 'NumpadAdd'
 }
@@ -89,6 +100,27 @@ function isZoomOutShortcut(input: WindowShortcutInput): boolean {
   )
 }
 
+// Why: letter shortcuts must follow the user's active keyboard layout. Matching
+// solely on `input.code` uses the physical QWERTY position of the key, which
+// breaks on Dvorak, Colemak, AZERTY, and other non-QWERTY layouts — e.g. on
+// Dvorak the key that types 'b' sits at physical position 'KeyN', so
+// `input.code === 'KeyB'` never fires when the user presses what is, to them,
+// "Cmd+B". `input.key` carries the layout-aware character, so we prefer it
+// when it looks like a letter. We fall back to the QWERTY code when `key` is
+// empty or non-letter (dead keys, some IME states, rare Electron edge cases)
+// so shortcuts still reach users whose driver does not surface `key`.
+function matchesLetterShortcut(
+  input: WindowShortcutInput,
+  letter: string,
+  codeFallback: string
+): boolean {
+  const key = (input.key ?? '').toLowerCase()
+  if (key.length === 1 && key >= 'a' && key <= 'z') {
+    return key === letter
+  }
+  return input.code === codeFallback
+}
+
 export function resolveWindowShortcutAction(
   input: WindowShortcutInput,
   platform: NodeJS.Platform
@@ -101,6 +133,10 @@ export function resolveWindowShortcutAction(
       type: 'worktreeHistoryNavigate',
       direction: input.code === 'ArrowLeft' ? 'back' : 'forward'
     }
+  }
+
+  if (isFloatingTerminalChord(input, platform)) {
+    return { type: 'toggleFloatingTerminal' }
   }
 
   if (!isWindowShortcutModifierChord(input, platform)) {
@@ -120,7 +156,7 @@ export function resolveWindowShortcutAction(
   }
 
   if (
-    input.code === 'KeyJ' &&
+    matchesLetterShortcut(input, 'j', 'KeyJ') &&
     ((platform === 'darwin' && !input.shift) || (platform !== 'darwin' && input.shift))
   ) {
     return { type: 'toggleWorktreePalette' }
@@ -130,15 +166,15 @@ export function resolveWindowShortcutAction(
   // Without main-process interception, xterm.js processes the keydown before
   // the renderer's window-capture handler can preventDefault, causing ^B / ^L
   // to appear in the terminal alongside the sidebar toggle.
-  if (input.code === 'KeyB' && !input.shift) {
+  if (matchesLetterShortcut(input, 'b', 'KeyB') && !input.shift) {
     return { type: 'toggleLeftSidebar' }
   }
 
-  if (input.code === 'KeyL' && !input.shift) {
+  if (matchesLetterShortcut(input, 'l', 'KeyL') && !input.shift) {
     return { type: 'toggleRightSidebar' }
   }
 
-  if (input.code === 'KeyP' && !input.shift) {
+  if (matchesLetterShortcut(input, 'p', 'KeyP') && !input.shift) {
     return { type: 'openQuickOpen' }
   }
 
@@ -146,8 +182,12 @@ export function resolveWindowShortcutAction(
   // main process so it reaches the renderer even when focus lives inside
   // a contentEditable surface (markdown rich editor) or a browser guest
   // webContents, both of which bypass the renderer's window-level keydown.
-  if (input.code === 'KeyN' && !input.shift) {
-    return { type: 'openNewWorkspace' }
+  // Shift is accepted for compatibility with the former Create-from shortcut;
+  // the unified composer now exposes source switching inside the name field.
+  if (matchesLetterShortcut(input, 'n', 'KeyN')) {
+    if (!input.alt) {
+      return { type: 'openNewWorkspace' }
+    }
   }
 
   if (input.key && input.key >= '1' && input.key <= '9' && !input.shift) {

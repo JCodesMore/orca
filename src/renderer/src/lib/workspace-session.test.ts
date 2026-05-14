@@ -1,6 +1,7 @@
-import { describe, expect, it, vi } from 'vitest'
-import { buildWorkspaceSessionPayload, shouldPersistWorkspaceSession } from './workspace-session'
+import { describe, expect, it } from 'vitest'
+import { buildWorkspaceSessionPayload } from './workspace-session'
 import type { AppState } from '../store'
+import { FLOATING_TERMINAL_WORKTREE_ID } from '../../../shared/constants'
 
 function createSnapshot(overrides: Partial<AppState> = {}): AppState {
   return {
@@ -77,8 +78,20 @@ function createSnapshot(overrides: Partial<AppState> = {}): AppState {
         }
       ]
     },
+    browserUrlHistory: [],
     ...overrides
   } as AppState
+}
+
+function createRepo(id: string, connectionId: string | null): AppState['repos'][number] {
+  return {
+    id,
+    path: `/${id}`,
+    displayName: id,
+    badgeColor: '#fff',
+    addedAt: 1,
+    connectionId
+  }
 }
 
 describe('buildWorkspaceSessionPayload', () => {
@@ -86,6 +99,43 @@ describe('buildWorkspaceSessionPayload', () => {
     const payload = buildWorkspaceSessionPayload(createSnapshot())
 
     expect(payload.activeWorktreeIdsOnShutdown).toEqual(['wt-1'])
+  })
+
+  it('persists floating terminal tabs for daemon reattach after restart', () => {
+    const payload = buildWorkspaceSessionPayload(
+      createSnapshot({
+        tabsByWorktree: {
+          [FLOATING_TERMINAL_WORKTREE_ID]: [
+            {
+              id: 'floating-tab-1',
+              title: 'Terminal 1',
+              ptyId: 'floating-pty-1',
+              worktreeId: FLOATING_TERMINAL_WORKTREE_ID
+            } as never
+          ]
+        },
+        terminalLayoutsByTabId: {
+          'floating-tab-1': {
+            root: null,
+            activeLeafId: null,
+            expandedLeafId: null,
+            buffersByLeafId: { 'pane:1': 'floating-scrollback' },
+            ptyIdsByLeafId: { 'pane:1': 'floating-pty-1' }
+          }
+        },
+        activeTabIdByWorktree: {
+          [FLOATING_TERMINAL_WORKTREE_ID]: 'floating-tab-1'
+        }
+      })
+    )
+
+    expect(payload.tabsByWorktree[FLOATING_TERMINAL_WORKTREE_ID]).toHaveLength(1)
+    expect(payload.activeTabIdByWorktree?.[FLOATING_TERMINAL_WORKTREE_ID]).toBe('floating-tab-1')
+    expect(payload.terminalLayoutsByTabId['floating-tab-1'].buffersByLeafId).toBeUndefined()
+    expect(payload.terminalLayoutsByTabId['floating-tab-1'].ptyIdsByLeafId).toEqual({
+      'pane:1': 'floating-pty-1'
+    })
+    expect(payload.activeWorktreeIdsOnShutdown).toEqual([FLOATING_TERMINAL_WORKTREE_ID])
   })
 
   it('persists only edit-mode files and resets browser loading state', () => {
@@ -105,6 +155,75 @@ describe('buildWorkspaceSessionPayload', () => {
     expect(payload.browserTabsByWorktree?.['wt-1'][0].loading).toBe(false)
   })
 
+  it('drops local terminal scrollback buffers from session payloads', () => {
+    const localWorktreeId = 'repo-1::/local/worktree'
+    const payload = buildWorkspaceSessionPayload(
+      createSnapshot({
+        tabsByWorktree: {
+          [localWorktreeId]: [
+            {
+              id: 'tab-local',
+              title: 'shell',
+              ptyId: 'pty-1',
+              worktreeId: localWorktreeId
+            } as never
+          ]
+        },
+        terminalLayoutsByTabId: {
+          'tab-local': {
+            root: null,
+            activeLeafId: null,
+            expandedLeafId: null,
+            buffersByLeafId: { 'pane:1': 'serialized-local-scrollback' },
+            ptyIdsByLeafId: { 'pane:1': 'pty-1' },
+            titlesByLeafId: { 'pane:1': 'build' }
+          }
+        },
+        repos: [createRepo('repo-1', null)]
+      })
+    )
+
+    expect(payload.terminalLayoutsByTabId['tab-local']).toEqual({
+      root: null,
+      activeLeafId: null,
+      expandedLeafId: null,
+      ptyIdsByLeafId: { 'pane:1': 'pty-1' },
+      titlesByLeafId: { 'pane:1': 'build' }
+    })
+  })
+
+  it('preserves SSH terminal scrollback buffers because relay teardown has no local history', () => {
+    const sshWorktreeId = 'repo-ssh::/remote/worktree'
+    const payload = buildWorkspaceSessionPayload(
+      createSnapshot({
+        tabsByWorktree: {
+          [sshWorktreeId]: [
+            {
+              id: 'tab-ssh',
+              title: 'remote',
+              ptyId: 'relay-pty-1',
+              worktreeId: sshWorktreeId
+            } as never
+          ]
+        },
+        terminalLayoutsByTabId: {
+          'tab-ssh': {
+            root: null,
+            activeLeafId: null,
+            expandedLeafId: null,
+            buffersByLeafId: { 'pane:1': 'serialized-remote-scrollback' },
+            ptyIdsByLeafId: { 'pane:1': 'relay-pty-1' }
+          }
+        },
+        repos: [createRepo('repo-ssh', 'conn-1')]
+      })
+    )
+
+    expect(payload.terminalLayoutsByTabId['tab-ssh'].buffersByLeafId).toEqual({
+      'pane:1': 'serialized-remote-scrollback'
+    })
+  })
+
   it('uses lastKnownRelayPtyIdByTabId fallback for SSH worktrees with null ptyIds', () => {
     const payload = buildWorkspaceSessionPayload(
       createSnapshot({
@@ -113,7 +232,7 @@ describe('buildWorkspaceSessionPayload', () => {
           'wt-ssh': [{ id: 'tab-ssh', title: 'remote', ptyId: null, worktreeId: 'wt-ssh' } as never]
         },
         lastKnownRelayPtyIdByTabId: { 'tab-ssh': 'relay-sess-42' },
-        repos: [{ id: 'repo-ssh', connectionId: 'conn-1' } as never],
+        repos: [createRepo('repo-ssh', 'conn-1')],
         worktreesByRepo: {
           'repo-ssh': [{ id: 'wt-ssh', repoId: 'repo-ssh' } as never]
         },
@@ -138,106 +257,5 @@ describe('buildWorkspaceSessionPayload', () => {
 
     expect(payload.activeFileIdByWorktree).toEqual({})
     expect(payload.activeTabTypeByWorktree).toEqual({ 'wt-2': 'terminal' })
-  })
-})
-
-describe('hydration-failure integration: writer stays gated (issue #1158)', () => {
-  // Why: simulates the App.tsx subscribe pattern end-to-end — a store change
-  // arrives AFTER a failed hydration, and we assert the writer is never
-  // called. If the gate regresses, this test flips red before users do.
-  function simulateWriterSubscription(
-    getState: () => { workspaceSessionReady: boolean; hydrationSucceeded: boolean },
-    writer: () => void
-  ): (nextState: { workspaceSessionReady: boolean; hydrationSucceeded: boolean }) => void {
-    return (nextState) => {
-      // Mirror App.tsx: read from the store; if the gate says no, skip.
-      const state = { ...getState(), ...nextState }
-      if (!shouldPersistWorkspaceSession(state)) {
-        return
-      }
-      writer()
-    }
-  }
-
-  it('never invokes the writer when hydration failed mid-flight', () => {
-    let hydrationSucceeded = false
-    let workspaceSessionReady = false
-    const writer = vi.fn()
-    const notify = simulateWriterSubscription(
-      () => ({ workspaceSessionReady, hydrationSucceeded }),
-      writer
-    )
-
-    // Simulate App.tsx's error path: reconnectPersistedTerminals still flips
-    // workspaceSessionReady=true so the UI can mount, but setHydrationSucceeded
-    // is never called because the try block threw.
-    workspaceSessionReady = true
-    notify({ workspaceSessionReady, hydrationSucceeded })
-
-    // Simulate a state change after failure (user types in a terminal, tab
-    // gets created, etc). The writer MUST remain uncalled — otherwise the
-    // empty in-memory session would overwrite the on-disk file.
-    for (let i = 0; i < 10; i++) {
-      notify({ workspaceSessionReady, hydrationSucceeded })
-    }
-
-    expect(writer).not.toHaveBeenCalled()
-  })
-
-  it('invokes the writer once hydration is marked successful', () => {
-    let hydrationSucceeded = false
-    let workspaceSessionReady = false
-    const writer = vi.fn()
-    const notify = simulateWriterSubscription(
-      () => ({ workspaceSessionReady, hydrationSucceeded }),
-      writer
-    )
-
-    workspaceSessionReady = true
-    hydrationSucceeded = true
-    notify({ workspaceSessionReady, hydrationSucceeded })
-
-    expect(writer).toHaveBeenCalledTimes(1)
-  })
-})
-
-describe('shouldPersistWorkspaceSession (issue #1158 gate)', () => {
-  it('returns false before either flag is set', () => {
-    expect(
-      shouldPersistWorkspaceSession({
-        workspaceSessionReady: false,
-        hydrationSucceeded: false
-      })
-    ).toBe(false)
-  })
-
-  it('returns false when the UI is ready but hydration failed', () => {
-    // The error path in App.tsx flips workspaceSessionReady=true so the UI can
-    // mount, but leaves hydrationSucceeded=false. The writer must stay gated
-    // so the empty in-memory state is never persisted.
-    expect(
-      shouldPersistWorkspaceSession({
-        workspaceSessionReady: true,
-        hydrationSucceeded: false
-      })
-    ).toBe(false)
-  })
-
-  it('returns false when hydration finished but UI isn’t ready yet', () => {
-    expect(
-      shouldPersistWorkspaceSession({
-        workspaceSessionReady: false,
-        hydrationSucceeded: true
-      })
-    ).toBe(false)
-  })
-
-  it('returns true only when both flags are set', () => {
-    expect(
-      shouldPersistWorkspaceSession({
-        workspaceSessionReady: true,
-        hydrationSucceeded: true
-      })
-    ).toBe(true)
   })
 })

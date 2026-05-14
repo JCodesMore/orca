@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- Why: CLI parser tests share one mocked runtime client and fixture queue; splitting this file would duplicate setup and make command coverage harder to audit. */
 import path from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -55,12 +56,25 @@ describe('COMMAND_SPECS collision check', () => {
 })
 
 describe('orca cli worktree awareness', () => {
+  const originalTerminalHandle = process.env.ORCA_TERMINAL_HANDLE
+  const originalUserDataPath = process.env.ORCA_USER_DATA_PATH
+
   beforeEach(() => {
     callMock.mockReset()
   })
 
   afterEach(() => {
     vi.restoreAllMocks()
+    if (originalTerminalHandle === undefined) {
+      delete process.env.ORCA_TERMINAL_HANDLE
+    } else {
+      process.env.ORCA_TERMINAL_HANDLE = originalTerminalHandle
+    }
+    if (originalUserDataPath === undefined) {
+      delete process.env.ORCA_USER_DATA_PATH
+    } else {
+      process.env.ORCA_USER_DATA_PATH = originalUserDataPath
+    }
   })
 
   it('builds the current worktree selector from cwd', () => {
@@ -132,6 +146,91 @@ describe('orca cli worktree awareness', () => {
     })
   })
 
+  it('passes explicit activation through worktree.create', async () => {
+    queueFixtures(
+      callMock,
+      okFixture('req_create', {
+        worktree: buildWorktree('/tmp/repo/feature', 'feature', 'abc', 'repo-1')
+      })
+    )
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    await main(
+      ['worktree', 'create', '--repo', 'id:repo-1', '--name', 'feature', '--activate', '--json'],
+      '/tmp/repo'
+    )
+
+    expect(callMock).toHaveBeenCalledWith('worktree.create', {
+      repo: 'id:repo-1',
+      name: 'feature',
+      baseBranch: undefined,
+      linkedIssue: undefined,
+      comment: undefined,
+      runHooks: false,
+      activate: true
+    })
+  })
+
+  it('opts into setup and activation when worktree.create runs hooks', async () => {
+    queueFixtures(
+      callMock,
+      okFixture('req_create', {
+        worktree: buildWorktree('/tmp/repo/feature', 'feature', 'abc', 'repo-1')
+      })
+    )
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    await main(
+      ['worktree', 'create', '--repo', 'id:repo-1', '--name', 'feature', '--run-hooks', '--json'],
+      '/tmp/repo'
+    )
+
+    expect(callMock).toHaveBeenCalledWith('worktree.create', {
+      repo: 'id:repo-1',
+      name: 'feature',
+      baseBranch: undefined,
+      linkedIssue: undefined,
+      comment: undefined,
+      runHooks: true,
+      activate: true
+    })
+  })
+
+  it('passes explicit focus through terminal.create', async () => {
+    queueFixtures(
+      callMock,
+      okFixture('req_terminal_create', {
+        terminal: {
+          handle: 'term_1',
+          worktreeId: 'repo-1::/tmp/repo/feature',
+          title: 'RUNNER'
+        }
+      })
+    )
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    await main(
+      [
+        'terminal',
+        'create',
+        '--worktree',
+        'path:/tmp/repo/feature',
+        '--title',
+        'RUNNER',
+        '--focus',
+        '--json'
+      ],
+      '/tmp/repo'
+    )
+
+    expect(callMock).toHaveBeenCalledWith('terminal.create', {
+      worktree: 'path:/tmp/repo/feature',
+      command: undefined,
+      title: 'RUNNER',
+      focus: true
+    })
+  })
+
   it('uses the resolved enclosing worktree for other worktree consumers', async () => {
     queueFixtures(
       callMock,
@@ -150,6 +249,91 @@ describe('orca cli worktree awareness', () => {
 
     expect(callMock).toHaveBeenNthCalledWith(2, 'worktree.show', {
       worktree: `path:${path.resolve('/tmp/repo/feature')}`
+    })
+  })
+
+  it('formats group orchestration sends in text mode', async () => {
+    process.env.ORCA_TERMINAL_HANDLE = 'term_sender'
+    callMock.mockResolvedValueOnce({
+      id: 'req_send',
+      ok: true,
+      result: {
+        messages: [{ id: 'msg_1' }, { id: 'msg_2' }],
+        recipients: 2
+      },
+      _meta: {
+        runtimeId: 'runtime-1'
+      }
+    })
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    await main(['orchestration', 'send', '--to', '@all', '--subject', 'hello'], '/tmp/repo')
+
+    expect(callMock).toHaveBeenCalledWith('orchestration.send', {
+      from: 'term_sender',
+      to: '@all',
+      subject: 'hello',
+      body: undefined,
+      type: undefined,
+      priority: undefined,
+      threadId: undefined,
+      payload: undefined,
+      devMode: false
+    })
+    expect(logSpy).toHaveBeenCalledWith('Sent 2 messages to 2 recipients')
+  })
+
+  it('rejects unknown task-update status with an enum-aware error', async () => {
+    process.env.ORCA_TERMINAL_HANDLE = 'term_coord'
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const priorExitCode = process.exitCode
+
+    await main(
+      ['orchestration', 'task-update', '--id', 'task_x', '--status', 'complete'],
+      '/tmp/repo'
+    )
+
+    const output = [...errSpy.mock.calls, ...logSpy.mock.calls]
+      .flat()
+      .map((v) => (typeof v === 'string' ? v : JSON.stringify(v)))
+      .join('\n')
+    expect(output).toContain("invalid status 'complete'")
+    expect(output).toContain('pending, ready, dispatched, completed, failed, blocked')
+    expect(callMock).not.toHaveBeenCalled()
+    expect(process.exitCode).toBe(1)
+
+    // Reset exitCode so subsequent tests don't inherit the failure.
+    process.exitCode = priorExitCode
+    errSpy.mockRestore()
+  })
+
+  it('passes dev mode to injected orchestration dispatches', async () => {
+    process.env.ORCA_TERMINAL_HANDLE = 'term_sender'
+    process.env.ORCA_USER_DATA_PATH = '/tmp/orca-dev'
+    callMock.mockResolvedValueOnce({
+      id: 'req_dispatch',
+      ok: true,
+      result: {
+        dispatch: { id: 'ctx_1', task_id: 'task_1', status: 'dispatched' }
+      },
+      _meta: {
+        runtimeId: 'runtime-1'
+      }
+    })
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    await main(
+      ['orchestration', 'dispatch', '--task', 'task_1', '--to', 'term_worker', '--inject'],
+      '/tmp/repo'
+    )
+
+    expect(callMock).toHaveBeenCalledWith('orchestration.dispatch', {
+      task: 'task_1',
+      to: 'term_worker',
+      from: 'term_sender',
+      inject: true,
+      devMode: true
     })
   })
 

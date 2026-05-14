@@ -2,6 +2,9 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { cn } from '@/lib/utils'
+import { getConnectionId } from '@/lib/connection-context'
+import { detectLanguage } from '@/lib/language-detect'
+import { isPathInsideWorktree, toWorktreeRelativePath } from '@/lib/terminal-links'
 import {
   ArrowLeft,
   ArrowRight,
@@ -25,6 +28,7 @@ import {
   DropdownMenuShortcut,
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useAppStore } from '@/store'
 import { ORCA_BROWSER_BLANK_URL, ORCA_BROWSER_PARTITION } from '../../../../shared/constants'
 import type {
@@ -34,14 +38,27 @@ import type {
 } from '../../../../shared/types'
 import {
   normalizeBrowserNavigationUrl,
-  normalizeExternalBrowserUrl
+  normalizeExternalBrowserUrl,
+  redactKagiSessionToken
 } from '../../../../shared/browser-url'
 import {
-  clearLiveBrowserUrl,
+  browserViewportPresetToOverride,
+  getBrowserViewportPreset
+} from '../../../../shared/browser-viewport-presets'
+import {
   consumeEvictedBrowserTab,
   markEvictedBrowserTab,
   rememberLiveBrowserUrl
 } from './browser-runtime'
+import {
+  destroyPersistentWebview,
+  getHiddenContainer,
+  MAX_PARKED_WEBVIEWS,
+  parkedAtByTabId,
+  registerPersistentWebview,
+  registeredWebContentsIds,
+  webviewRegistry
+} from './webview-registry'
 import type {
   BrowserDownloadRequestedEvent,
   BrowserDownloadProgressEvent,
@@ -83,76 +100,7 @@ type BrowserDownloadState = BrowserDownloadRequestedEvent & {
   status: 'requested' | 'downloading'
 }
 
-const webviewRegistry = new Map<string, Electron.WebviewTag>()
-const registeredWebContentsIds = new Map<string, number>()
-const parkedAtByTabId = new Map<string, number>()
-let hiddenContainer: HTMLDivElement | null = null
-const DRAG_LISTENER_KEY = '__orcaBrowserPaneDragListeners'
-const MAX_PARKED_WEBVIEWS = 6
 const EMPTY_BROWSER_PAGES: BrowserPageState[] = []
-function getHiddenContainer(): HTMLDivElement {
-  if (!hiddenContainer) {
-    hiddenContainer = document.createElement('div')
-    hiddenContainer.style.position = 'fixed'
-    hiddenContainer.style.left = '-9999px'
-    hiddenContainer.style.top = '-9999px'
-    hiddenContainer.style.width = '100vw'
-    hiddenContainer.style.height = '100vh'
-    hiddenContainer.style.overflow = 'hidden'
-    hiddenContainer.style.pointerEvents = 'none'
-    document.body.appendChild(hiddenContainer)
-  }
-  return hiddenContainer
-}
-
-function setWebviewsDragPassthrough(passthrough: boolean): void {
-  for (const webview of webviewRegistry.values()) {
-    webview.style.pointerEvents = passthrough ? 'none' : ''
-  }
-}
-
-if (typeof window !== 'undefined') {
-  type DragListenerRegistry = {
-    dragstart: () => void
-    dragend: () => void
-    drop: () => void
-  }
-  const listenerHost = window as Window & { [DRAG_LISTENER_KEY]?: DragListenerRegistry }
-  const existingListeners = listenerHost[DRAG_LISTENER_KEY]
-  if (existingListeners) {
-    window.removeEventListener('dragstart', existingListeners.dragstart, true)
-    window.removeEventListener('dragend', existingListeners.dragend, true)
-    window.removeEventListener('drop', existingListeners.drop, true)
-  }
-
-  const dragstart = (): void => setWebviewsDragPassthrough(true)
-  const dragend = (): void => setWebviewsDragPassthrough(false)
-  const drop = (): void => setWebviewsDragPassthrough(false)
-
-  window.addEventListener('dragstart', dragstart, true)
-  window.addEventListener('dragend', dragend, true)
-  window.addEventListener('drop', drop, true)
-  // Why: BrowserPane installs process-wide drag listeners so parked webviews
-  // stop swallowing drop targets. We store/remove the previous handlers on
-  // window to keep Vite HMR from stacking duplicates across module reloads.
-  listenerHost[DRAG_LISTENER_KEY] = { dragstart, dragend, drop }
-}
-
-export function destroyPersistentWebview(browserTabId: string): void {
-  const webview = webviewRegistry.get(browserTabId)
-  if (!webview) {
-    registeredWebContentsIds.delete(browserTabId)
-    parkedAtByTabId.delete(browserTabId)
-    clearLiveBrowserUrl(browserTabId)
-    return
-  }
-  void window.api.browser.unregisterGuest({ browserPageId: browserTabId })
-  webview.remove()
-  webviewRegistry.delete(browserTabId)
-  registeredWebContentsIds.delete(browserTabId)
-  parkedAtByTabId.delete(browserTabId)
-  clearLiveBrowserUrl(browserTabId)
-}
 
 function buildLoadError(event: {
   errorCode?: number
@@ -162,12 +110,12 @@ function buildLoadError(event: {
   return {
     code: event.errorCode ?? -1,
     description: event.errorDescription ?? 'Unknown load failure',
-    validatedUrl: event.validatedURL ?? 'about:blank'
+    validatedUrl: redactKagiSessionToken(event.validatedURL ?? 'about:blank')
   }
 }
 
 function toDisplayUrl(url: string): string {
-  return url === ORCA_BROWSER_BLANK_URL ? 'about:blank' : url
+  return url === ORCA_BROWSER_BLANK_URL ? 'about:blank' : redactKagiSessionToken(url)
 }
 
 function getBrowserDisplayTitle(title: string | null | undefined, url: string): string {
@@ -185,6 +133,29 @@ function getBrowserDisplayTitle(title: string | null | undefined, url: string): 
 
 function isChromiumErrorPage(url: string): boolean {
   return url.startsWith('chrome-error://')
+}
+
+function fileUrlToAbsolutePath(url: string): string | null {
+  try {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'file:') {
+      return null
+    }
+    const hostPrefix =
+      parsed.hostname && parsed.hostname !== 'localhost' ? `//${parsed.hostname}` : ''
+    let absolutePath = `${hostPrefix}${decodeURIComponent(parsed.pathname)}`
+    if (/^\/[A-Za-z]:\//.test(absolutePath)) {
+      absolutePath = absolutePath.slice(1)
+    }
+    return absolutePath
+  } catch {
+    return null
+  }
+}
+
+function getNotebookPathFromBrowserUrl(url: string): string | null {
+  const filePath = fileUrlToAbsolutePath(url)
+  return filePath?.toLowerCase().endsWith('.ipynb') ? filePath : null
 }
 
 function getLoadErrorMetadata(loadError: BrowserLoadError | null): {
@@ -225,7 +196,7 @@ function getOpenableExternalUrl(
       currentUrl = fallbackUrl
     }
   }
-  return normalizeExternalBrowserUrl(currentUrl)
+  return normalizeExternalBrowserUrl(redactKagiSessionToken(currentUrl))
 }
 
 function getCurrentBrowserUrl(webview: Electron.WebviewTag | null, fallbackUrl: string): string {
@@ -359,6 +330,12 @@ function BrowserPagePane({
   const initialBrowserUrlRef = useRef(browserTab.url)
   const browserTabUrlRef = useRef(browserTab.url)
   const activeLoadFailureRef = useRef<BrowserLoadError | null>(browserTab.loadError)
+  // Why: CDP viewport emulation does not survive all renderer process swaps
+  // (cross-origin navigations, crashes). We reapply on every dom-ready from
+  // this ref so the persisted preset survives reloads without re-running the
+  // webview lifecycle effect whenever the preset changes.
+  const viewportPresetIdRef = useRef(browserTab.viewportPresetId ?? null)
+  viewportPresetIdRef.current = browserTab.viewportPresetId ?? null
   const trackNextLoadingEventRef = useRef(false)
   // Why: tracks the most recent URL the webview has navigated to or been
   // observed at, from any source (navigation events, address bar, initial
@@ -984,8 +961,12 @@ function BrowserPagePane({
       webview.style.width = '100%'
       webview.style.height = '100%'
       webview.style.border = 'none'
-      webview.style.background = 'transparent'
-      webviewRegistry.set(browserTab.id, webview)
+      // Why: default to white so sites that don't set an html/body background
+      // (e.g. httpbin.org/html) don't show through to Orca's dark chrome. Real
+      // browsers paint the viewport white by default; sites that specify their
+      // own background (including dark ones) still override this.
+      webview.style.background = '#ffffff'
+      registerPersistentWebview(browserTab.id, webview)
       container.appendChild(webview)
       needsInitialNavigation = true
     }
@@ -1000,6 +981,7 @@ function BrowserPagePane({
           browserPageId: browserTab.id,
           workspaceId,
           worktreeId,
+          sessionProfileId,
           webContentsId
         })
       }
@@ -1007,6 +989,21 @@ function BrowserPagePane({
       if (keepAddressBarFocusRef.current) {
         focusAddressBarNow()
       }
+      // Why: CDP Emulation.setDeviceMetricsOverride and related overrides are
+      // scoped to the guest's debugger session and do not survive all
+      // cross-origin navigations (renderer swaps). Reapplying on dom-ready is
+      // idempotent, so users who picked a viewport preset keep it after
+      // reloads, SPA navigations, and persisted-session restoration.
+      const presetId = viewportPresetIdRef.current
+      const preset = getBrowserViewportPreset(presetId)
+      // Why: always reapply on dom-ready (including null) because
+      // Emulation.setDeviceMetricsOverride can persist across same-origin navigations
+      // within the same renderer. Sending null ensures CDP matches the store state
+      // instead of showing a stale emulated viewport after the user picks "Default".
+      void window.api.browser.setViewportOverride({
+        browserPageId: browserTab.id,
+        override: preset ? browserViewportPresetToOverride(preset) : null
+      })
     }
 
     const handleDidStartLoading = (): void => {
@@ -1022,13 +1019,16 @@ function BrowserPagePane({
 
     const handleDidStopLoading = (): void => {
       const currentUrl = webview.getURL() || webview.src || 'about:blank'
+      const browserModelUrl = redactKagiSessionToken(currentUrl)
       const activeLoadFailure = activeLoadFailureRef.current
       if (isChromiumErrorPage(currentUrl)) {
         trackNextLoadingEventRef.current = false
         const synthesizedFailure = {
           code: -1,
           description: 'This site could not be reached.',
-          validatedUrl: browserTabUrlRef.current || addressBarValueRef.current || 'about:blank'
+          validatedUrl: redactKagiSessionToken(
+            browserTabUrlRef.current || addressBarValueRef.current || 'about:blank'
+          )
         }
         activeLoadFailureRef.current = synthesizedFailure
         onUpdatePageStateRef.current(browserTab.id, {
@@ -1041,7 +1041,8 @@ function BrowserPagePane({
         const normalizedAttemptedUrl =
           normalizeBrowserNavigationUrl(activeLoadFailure.validatedUrl) ??
           activeLoadFailure.validatedUrl
-        const normalizedCurrentUrl = normalizeBrowserNavigationUrl(currentUrl) ?? currentUrl
+        const normalizedCurrentUrl =
+          normalizeBrowserNavigationUrl(browserModelUrl) ?? browserModelUrl
         if (normalizedAttemptedUrl === normalizedCurrentUrl) {
           trackNextLoadingEventRef.current = false
           // Why: some webview failures still emit did-stop-loading on the
@@ -1050,7 +1051,7 @@ function BrowserPagePane({
           // already knows this exact load failed.
           onUpdatePageStateRef.current(browserTab.id, {
             loading: false,
-            title: getBrowserDisplayTitle(webview.getTitle(), currentUrl),
+            title: getBrowserDisplayTitle(webview.getTitle(), browserModelUrl),
             faviconUrl: faviconUrlRef.current,
             canGoBack: webview.canGoBack(),
             canGoForward: webview.canGoForward(),
@@ -1061,14 +1062,15 @@ function BrowserPagePane({
       }
       trackNextLoadingEventRef.current = false
       activeLoadFailureRef.current = null
-      lastKnownWebviewUrlRef.current = normalizeBrowserNavigationUrl(currentUrl) ?? currentUrl
-      rememberLiveBrowserUrl(browserTab.id, currentUrl)
+      lastKnownWebviewUrlRef.current =
+        normalizeBrowserNavigationUrl(browserModelUrl) ?? browserModelUrl
+      rememberLiveBrowserUrl(browserTab.id, browserModelUrl)
       // Why: don't overwrite in-progress typing. See comment on the
       // browserTab.url sync effect above.
       if (document.activeElement !== addressBarInputRef.current) {
-        setAddressBarValue(toDisplayUrl(currentUrl))
+        setAddressBarValue(toDisplayUrl(browserModelUrl))
       }
-      onSetUrlRef.current(browserTab.id, currentUrl)
+      onSetUrlRef.current(browserTab.id, browserModelUrl)
       if (keepAddressBarFocusRef.current && currentUrl === ORCA_BROWSER_BLANK_URL) {
         focusAddressBarNow()
       } else {
@@ -1076,7 +1078,7 @@ function BrowserPagePane({
       }
       onUpdatePageStateRef.current(browserTab.id, {
         loading: false,
-        title: getBrowserDisplayTitle(webview.getTitle(), currentUrl),
+        title: getBrowserDisplayTitle(webview.getTitle(), browserModelUrl),
         faviconUrl: faviconUrlRef.current,
         canGoBack: webview.canGoBack(),
         canGoForward: webview.canGoForward(),
@@ -1092,15 +1094,17 @@ function BrowserPagePane({
       if (isChromiumErrorPage(currentUrl)) {
         return
       }
-      lastKnownWebviewUrlRef.current = normalizeBrowserNavigationUrl(currentUrl) ?? currentUrl
-      rememberLiveBrowserUrl(browserTab.id, currentUrl)
+      const browserModelUrl = redactKagiSessionToken(currentUrl)
+      lastKnownWebviewUrlRef.current =
+        normalizeBrowserNavigationUrl(browserModelUrl) ?? browserModelUrl
+      rememberLiveBrowserUrl(browserTab.id, browserModelUrl)
       // Why: don't overwrite in-progress typing (see above).
       if (document.activeElement !== addressBarInputRef.current) {
-        setAddressBarValue(toDisplayUrl(currentUrl))
+        setAddressBarValue(toDisplayUrl(browserModelUrl))
       }
-      onSetUrlRef.current(browserTab.id, currentUrl)
+      onSetUrlRef.current(browserTab.id, browserModelUrl)
       onUpdatePageStateRef.current(browserTab.id, {
-        title: webview.getTitle() || currentUrl,
+        title: webview.getTitle() || browserModelUrl,
         canGoBack: webview.canGoBack(),
         canGoForward: webview.canGoForward()
       })
@@ -1109,9 +1113,10 @@ function BrowserPagePane({
     const handleTitleUpdate = (event: { title?: string }): void => {
       try {
         const currentUrl = webview.getURL() || browserTab.url
-        const title = getBrowserDisplayTitle(event.title, currentUrl)
+        const browserModelUrl = redactKagiSessionToken(currentUrl)
+        const title = getBrowserDisplayTitle(event.title, browserModelUrl)
         onUpdatePageStateRef.current(browserTab.id, { title })
-        addBrowserHistoryEntryRef.current(currentUrl, title)
+        addBrowserHistoryEntryRef.current(browserModelUrl, title)
       } catch {
         // Why: title-updated can fire before dom-ready, making getURL() throw.
       }
@@ -1296,7 +1301,7 @@ function BrowserPagePane({
           loadError: {
             code: -1,
             description: 'This site could not be reached.',
-            validatedUrl: attemptedUrl
+            validatedUrl: redactKagiSessionToken(attemptedUrl)
           }
         })
       } catch {
@@ -1523,39 +1528,94 @@ function BrowserPagePane({
 
   const navigateToUrl = useCallback(
     (url: string): void => {
-      setAddressBarValue(toDisplayUrl(url))
-      onSetUrlRef.current(browserTab.id, url)
-      onUpdatePageStateRef.current(browserTab.id, {
-        loading: true,
-        loadError: null,
-        title: getBrowserDisplayTitle(url, url)
-      })
-      setResourceNotice(null)
+      const navigateBrowserUrl = (targetUrl: string): void => {
+        const browserModelUrl = redactKagiSessionToken(targetUrl)
+        setAddressBarValue(toDisplayUrl(browserModelUrl))
+        onSetUrlRef.current(browserTab.id, browserModelUrl)
+        onUpdatePageStateRef.current(browserTab.id, {
+          loading: true,
+          loadError: null,
+          title: getBrowserDisplayTitle(browserModelUrl, browserModelUrl)
+        })
+        setResourceNotice(null)
 
-      const webview = webviewRef.current
-      if (!webview) {
+        const webview = webviewRef.current
+        if (!webview) {
+          return
+        }
+        trackNextLoadingEventRef.current = targetUrl !== ORCA_BROWSER_BLANK_URL
+        lastKnownWebviewUrlRef.current =
+          normalizeBrowserNavigationUrl(browserModelUrl) ?? browserModelUrl
+        webview.src = targetUrl
+        if (targetUrl !== ORCA_BROWSER_BLANK_URL) {
+          focusWebviewNow()
+        }
+      }
+
+      const notebookPath = getNotebookPathFromBrowserUrl(url)
+      if (notebookPath) {
+        void (async () => {
+          const store = useAppStore.getState()
+          const connectionId = getConnectionId(worktreeId)
+          if (connectionId !== null) {
+            navigateBrowserUrl(url)
+            return
+          }
+
+          try {
+            await window.api.fs.authorizeExternalPath({ targetPath: notebookPath })
+            const stat = await window.api.fs.stat({ filePath: notebookPath })
+            if (stat.isDirectory) {
+              navigateBrowserUrl(url)
+              return
+            }
+
+            const activeWorktree = store.allWorktrees().find((w) => w.id === worktreeId)
+            let relativePath = notebookPath
+            if (activeWorktree?.path && isPathInsideWorktree(notebookPath, activeWorktree.path)) {
+              relativePath =
+                toWorktreeRelativePath(notebookPath, activeWorktree.path) ?? notebookPath
+            }
+
+            // Why: file:// notebooks in the browser are otherwise rendered as raw JSON by Chromium.
+            store.setActiveTabType('editor')
+            store.openFile(
+              {
+                filePath: notebookPath,
+                relativePath,
+                worktreeId,
+                language: detectLanguage(notebookPath),
+                mode: 'edit'
+              },
+              { preview: false, targetGroupId: store.ensureWorktreeRootGroup(worktreeId) }
+            )
+          } catch {
+            navigateBrowserUrl(url)
+          }
+        })()
         return
       }
-      trackNextLoadingEventRef.current = url !== ORCA_BROWSER_BLANK_URL
-      lastKnownWebviewUrlRef.current = url
-      webview.src = url
-      if (url !== ORCA_BROWSER_BLANK_URL) {
-        focusWebviewNow()
-      }
+
+      navigateBrowserUrl(url)
     },
-    [browserTab.id, focusWebviewNow]
+    [browserTab.id, focusWebviewNow, worktreeId]
   )
 
   const submitAddressBar = (): void => {
     keepAddressBarFocusRef.current = false
     const searchEngine = useAppStore.getState().browserDefaultSearchEngine
-    const nextUrl = normalizeBrowserNavigationUrl(addressBarValue, searchEngine)
+    const kagiSessionLink = useAppStore.getState().browserKagiSessionLink
+    const nextUrl = normalizeBrowserNavigationUrl(addressBarValue, searchEngine, {
+      kagiSessionLink
+    })
     if (!nextUrl) {
       onUpdatePageStateRef.current(browserTab.id, {
         loadError: {
           code: 0,
           description: 'Enter a valid http(s) or localhost URL.',
-          validatedUrl: addressBarValue.trim() || 'about:blank'
+          // Why: the user may have pasted a Kagi URL with a token; redact
+          // before persisting it into BrowserPage.loadError.
+          validatedUrl: redactKagiSessionToken(addressBarValue.trim()) || 'about:blank'
         }
       })
       return
@@ -1785,16 +1845,28 @@ function BrowserPagePane({
           inputRef={addressBarInputRef}
         />
 
-        <Button
-          size="icon"
-          variant={grab.state !== 'idle' ? 'default' : 'ghost'}
-          className={`h-8 w-8 ${grab.state !== 'idle' ? 'bg-foreground/80 text-background hover:bg-foreground/90' : ''}`}
-          onClick={grab.toggle}
-          title={`Grab page element (${navigator.userAgent.includes('Mac') ? '⌘C' : 'Ctrl+C'})`}
-          disabled={isBlankTab}
-        >
-          <Crosshair className="size-4" />
-        </Button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            {/* Why: wrap the disabled button in a span so pointer events still
+                reach the tooltip trigger — Radix (and the DOM) drop hover
+                events on disabled <button>, which is why the previous native
+                `title` attribute fired inconsistently. */}
+            <span className="inline-flex">
+              <Button
+                size="icon"
+                variant={grab.state !== 'idle' ? 'default' : 'ghost'}
+                className={`h-8 w-8 ${grab.state !== 'idle' ? 'bg-foreground/80 text-background hover:bg-foreground/90' : ''}`}
+                onClick={grab.toggle}
+                disabled={isBlankTab}
+              >
+                <Crosshair className="size-4" />
+              </Button>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" sideOffset={4}>
+            {`Grab page element (${navigator.userAgent.includes('Mac') ? '⌘C' : 'Ctrl+C'})`}
+          </TooltipContent>
+        </Tooltip>
 
         <Button
           size="icon"
@@ -1825,6 +1897,8 @@ function BrowserPagePane({
         <BrowserToolbarMenu
           currentProfileId={sessionProfileId}
           workspaceId={workspaceId}
+          browserPageId={browserTab.id}
+          viewportPresetId={browserTab.viewportPresetId ?? null}
           onDestroyWebview={() => destroyPersistentWebview(browserTab.id)}
         />
       </div>

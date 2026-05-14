@@ -7,24 +7,37 @@ import {
   FlaskConical,
   GitBranch,
   Globe,
+  Info,
   Keyboard,
+  Lock,
+  MousePointerClick,
+  Network,
+  ShieldCheck,
   Palette,
   Server,
   SlidersHorizontal,
+  Smartphone,
   Blocks,
-  SquareTerminal
+  SquareTerminal,
+  UserCog
 } from 'lucide-react'
 import type { OrcaHooks } from '../../../../shared/types'
 import { getRepoKindLabel, isFolderRepo } from '../../../../shared/repo-kind'
 import { useAppStore } from '../../store'
 import { useSystemPrefersDark } from '@/components/terminal-pane/use-system-prefers-dark'
 import { isMacUserAgent, isWindowsUserAgent } from '@/components/terminal-pane/pane-helpers'
+import { applyDocumentTheme } from '@/lib/document-theme'
 import { SCROLLBACK_PRESETS_MB, getFallbackTerminalFonts } from './SettingsConstants'
+import { DEFAULT_APP_FONT_FAMILY } from '../../../../shared/constants'
 import { GeneralPane, GENERAL_PANE_SEARCH_ENTRIES } from './GeneralPane'
 import { BrowserPane, BROWSER_PANE_SEARCH_ENTRIES } from './BrowserPane'
 import { AppearancePane, APPEARANCE_PANE_SEARCH_ENTRIES } from './AppearancePane'
 import { ShortcutsPane, SHORTCUTS_PANE_SEARCH_ENTRIES } from './ShortcutsPane'
 import { TerminalPane } from './TerminalPane'
+import { useGhosttyImport } from './useGhosttyImport'
+import { Button } from '../ui/button'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/tooltip'
+import ghosttyIcon from '../../../../../resources/ghostty.svg'
 import { RepositoryPane, getRepositoryPaneSearchEntries } from './RepositoryPane'
 import { getTerminalPaneSearchEntries } from './terminal-search'
 import { GitPane, GIT_PANE_SEARCH_ENTRIES } from './GitPane'
@@ -32,8 +45,19 @@ import { NotificationsPane, NOTIFICATIONS_PANE_SEARCH_ENTRIES } from './Notifica
 import { SshPane, SSH_PANE_SEARCH_ENTRIES } from './SshPane'
 import { ExperimentalPane, EXPERIMENTAL_PANE_SEARCH_ENTRIES } from './ExperimentalPane'
 import { AgentsPane, AGENTS_PANE_SEARCH_ENTRIES } from './AgentsPane'
+import { OrchestrationPane } from './OrchestrationPane'
+import { ORCHESTRATION_PANE_SEARCH_ENTRIES } from './orchestration-search'
+import { AccountsPane, ACCOUNTS_PANE_SEARCH_ENTRIES } from './AccountsPane'
 import { StatsPane, STATS_PANE_SEARCH_ENTRIES } from '../stats/StatsPane'
 import { IntegrationsPane, INTEGRATIONS_PANE_SEARCH_ENTRIES } from './IntegrationsPane'
+import {
+  DeveloperPermissionsPane,
+  DEVELOPER_PERMISSIONS_PANE_SEARCH_ENTRIES
+} from './DeveloperPermissionsPane'
+import { ComputerUsePane, COMPUTER_USE_PANE_SEARCH_ENTRIES } from './ComputerUsePane'
+import { MobileSettingsPane, MOBILE_SETTINGS_PANE_SEARCH_ENTRIES } from './MobileSettingsPane'
+import { PrivacyPane } from './PrivacyPane'
+import { PRIVACY_PANE_SEARCH_ENTRIES } from './privacy-search'
 import { SettingsSidebar } from './SettingsSidebar'
 import { SettingsSection } from './SettingsSection'
 import { matchesSettingsSearch, type SettingsSearchEntry } from './settings-search'
@@ -41,16 +65,22 @@ import { matchesSettingsSearch, type SettingsSearchEntry } from './settings-sear
 type SettingsNavTarget =
   | 'general'
   | 'integrations'
+  | 'accounts'
   | 'browser'
   | 'git'
   | 'appearance'
   | 'terminal'
   | 'notifications'
+  | 'computer-use'
+  | 'developer-permissions'
+  | 'privacy'
   | 'shortcuts'
   | 'stats'
   | 'ssh'
   | 'experimental'
   | 'agents'
+  | 'orchestration'
+  | 'mobile'
   | 'repo'
 
 type SettingsNavSection = {
@@ -73,6 +103,16 @@ function getFallbackVisibleSection(sections: SettingsNavSection[]): SettingsNavS
   return sections.at(0)
 }
 
+function computerUsePlatformLabel(args: { isWindows: boolean; isMac: boolean }): string {
+  if (args.isWindows) {
+    return 'Windows'
+  }
+  if (!args.isMac) {
+    return 'Linux'
+  }
+  return 'This platform'
+}
+
 // Why: after a sidebar jump the target section is now in the viewport center
 // rather than the top, which can make it less obvious which section just
 // scrolled into view. Pulsing the border for a moment reassures the user that
@@ -80,18 +120,14 @@ function getFallbackVisibleSection(sections: SettingsNavSection[]): SettingsNavS
 const SECTION_FLASH_CLASS = 'settings-section-flash'
 const SECTION_FLASH_DURATION_MS = 900
 
-function scrollSectionIntoView(sectionId: string, container: HTMLElement | null): void {
+function scrollSectionIntoView(sectionId: string): void {
   const target = document.getElementById(sectionId)
   if (!target) {
     return
   }
-  // Why: centering a tall section pushes its heading above the viewport,
-  // which defeats the purpose of jumping to it. Only center when the whole
-  // section fits; otherwise align to the top so the title is always visible.
-  const fitsInViewport = container
-    ? target.getBoundingClientRect().height <= container.clientHeight
-    : true
-  target.scrollIntoView({ block: fitsInViewport ? 'center' : 'start' })
+  // Why: the scroll spy samples from the upper part of the viewport. Top-align
+  // sidebar jumps so it does not immediately reselect the previous section.
+  target.scrollIntoView({ block: 'start' })
 }
 
 function flashSectionHighlight(sectionId: string): void {
@@ -106,6 +142,17 @@ function flashSectionHighlight(sectionId: string): void {
   window.setTimeout(() => {
     target.classList.remove(SECTION_FLASH_CLASS)
   }, SECTION_FLASH_DURATION_MS)
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) {
+    return false
+  }
+  if (target.isContentEditable) {
+    return true
+  }
+  const tag = target.tagName
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
 }
 
 function Settings(): React.JSX.Element {
@@ -127,6 +174,8 @@ function Settings(): React.JSX.Element {
   const systemPrefersDark = useSystemPrefersDark()
   const isWindows = isWindowsUserAgent()
   const isMac = isMacUserAgent()
+  const showComputerUsePreviewTooltip = !isMac
+  const computerUsePlatform = computerUsePlatformLabel({ isWindows, isMac })
   // Why: the Terminal settings section shares one search index with the
   // sidebar. We trim platform-only entries on other platforms so search never
   // reveals controls that the renderer will intentionally hide.
@@ -136,8 +185,24 @@ function Settings(): React.JSX.Element {
   )
   const [scrollbackMode, setScrollbackMode] = useState<'preset' | 'custom'>('preset')
   const [prevScrollbackBytes, setPrevScrollbackBytes] = useState(settings?.terminalScrollbackBytes)
-  const [terminalFontSuggestions, setTerminalFontSuggestions] = useState<string[]>(
-    getFallbackTerminalFonts()
+  // Why: lifted out of TerminalPane so the Terminal section header can render
+  // the import trigger as a headerAction. The modal itself still lives inside
+  // TerminalPane, driven by this shared state.
+  const ghostty = useGhosttyImport(updateSettings, settings)
+  const [wslAvailable, setWslAvailable] = useState(false)
+  const [pwshAvailable, setPwshAvailable] = useState(false)
+  useEffect(() => {
+    if (!isWindows) {
+      setWslAvailable(false)
+      setPwshAvailable(false)
+      return
+    }
+
+    void window.api.wsl.isAvailable().then(setWslAvailable)
+    void window.api.pwsh.isAvailable().then(setPwshAvailable)
+  }, [isWindows])
+  const [fontSuggestions, setFontSuggestions] = useState<string[]>(
+    Array.from(new Set([DEFAULT_APP_FONT_FAMILY, ...getFallbackTerminalFonts()]))
   )
   const [activeSectionId, setActiveSectionId] = useState('general')
   // Why: the hidden-experimental group is an unlock — Shift-clicking the
@@ -146,6 +211,7 @@ function Settings(): React.JSX.Element {
   // leak through into a normal reopen of Settings.
   const [hiddenExperimentalUnlocked, setHiddenExperimentalUnlocked] = useState(false)
   const contentScrollRef = useRef<HTMLDivElement | null>(null)
+  const searchInputRef = useRef<HTMLInputElement | null>(null)
   const terminalFontsLoadedRef = useRef(false)
   const pendingNavSectionRef = useRef<string | null>(null)
   const pendingScrollTargetRef = useRef<string | null>(null)
@@ -153,6 +219,50 @@ function Settings(): React.JSX.Element {
   useEffect(() => {
     fetchSettings()
   }, [fetchSettings])
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape' || event.defaultPrevented) {
+        return
+      }
+      // Why: Escape in an editable control usually means "cancel this edit",
+      // not "close Settings". Closing the entire page would discard the user's
+      // in-progress typing. Defer to the field's own handler when focus is on
+      // an input/textarea/select or contenteditable region; a subsequent
+      // Escape (with focus back on the body) will then close the page.
+      if (isEditableTarget(event.target)) {
+        return
+      }
+      closeSettingsPage()
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [closeSettingsPage])
+
+  useEffect(() => {
+    const handleFindShortcut = (event: KeyboardEvent): void => {
+      if (event.defaultPrevented || event.altKey || event.shiftKey) {
+        return
+      }
+      // Why: Cmd on Mac, Ctrl elsewhere — matches the rest of the app's
+      // mod-key convention (see App.tsx) and aligns with platform Find norms.
+      const mod = isMac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey
+      if (!mod || event.key.toLowerCase() !== 'f') {
+        return
+      }
+      const input = searchInputRef.current
+      if (!input) {
+        return
+      }
+      event.preventDefault()
+      input.focus()
+      input.select()
+    }
+
+    document.addEventListener('keydown', handleFindShortcut)
+    return () => document.removeEventListener('keydown', handleFindShortcut)
+  }, [isMac])
 
   useEffect(
     () => () => {
@@ -164,7 +274,7 @@ function Settings(): React.JSX.Element {
   )
 
   useEffect(() => {
-    if (!settingsNavigationTarget) {
+    if (!settings || !settingsNavigationTarget) {
       return
     }
 
@@ -175,7 +285,7 @@ function Settings(): React.JSX.Element {
     pendingNavSectionRef.current = paneSectionId
     pendingScrollTargetRef.current = settingsNavigationTarget.sectionId ?? paneSectionId
     clearSettingsTarget()
-  }, [clearSettingsTarget, settingsNavigationTarget])
+  }, [clearSettingsTarget, settings, settingsNavigationTarget])
 
   useEffect(() => {
     if (terminalFontsLoadedRef.current) {
@@ -191,7 +301,9 @@ function Settings(): React.JSX.Element {
           return
         }
         terminalFontsLoadedRef.current = true
-        setTerminalFontSuggestions((prev) => Array.from(new Set([...fonts, ...prev])).slice(0, 320))
+        setFontSuggestions((prev) =>
+          Array.from(new Set([DEFAULT_APP_FONT_FAMILY, ...fonts, ...prev])).slice(0, 320)
+        )
       } catch {
         // Fall back to curated cross-platform suggestions.
       }
@@ -258,19 +370,7 @@ function Settings(): React.JSX.Element {
   }, [repos])
 
   const applyTheme = useCallback((theme: 'system' | 'dark' | 'light') => {
-    const root = document.documentElement
-    if (theme === 'dark') {
-      root.classList.add('dark')
-    } else if (theme === 'light') {
-      root.classList.remove('dark')
-    } else {
-      const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
-      if (prefersDark) {
-        root.classList.add('dark')
-      } else {
-        root.classList.remove('dark')
-      }
-    }
+    applyDocumentTheme(theme)
   }, [])
 
   const displayedGitUsername = repos[0]?.gitUsername ?? ''
@@ -290,6 +390,13 @@ function Settings(): React.JSX.Element {
         description: 'Manage AI agents, set a default, and customize commands.',
         icon: Bot,
         searchEntries: AGENTS_PANE_SEARCH_ENTRIES
+      },
+      {
+        id: 'accounts',
+        title: 'Agent Accounts',
+        description: 'Sign in and switch between Claude, Codex, Gemini, and OpenCode Go accounts.',
+        icon: UserCog,
+        searchEntries: ACCOUNTS_PANE_SEARCH_ENTRIES
       },
       {
         id: 'git',
@@ -327,6 +434,47 @@ function Settings(): React.JSX.Element {
         searchEntries: NOTIFICATIONS_PANE_SEARCH_ENTRIES
       },
       {
+        id: 'orchestration',
+        title: 'Orchestration',
+        description: 'Coordinate multiple coding agents through Orca.',
+        icon: Network,
+        searchEntries: ORCHESTRATION_PANE_SEARCH_ENTRIES
+      },
+      {
+        id: 'mobile',
+        title: 'Mobile',
+        description: 'Control terminals and agents from your phone.',
+        icon: Smartphone,
+        searchEntries: MOBILE_SETTINGS_PANE_SEARCH_ENTRIES,
+        badge: 'Beta'
+      },
+      {
+        id: 'computer-use',
+        title: 'Computer Use',
+        description: 'Enable agents to control any app on your computer.',
+        icon: MousePointerClick,
+        searchEntries: COMPUTER_USE_PANE_SEARCH_ENTRIES,
+        badge: 'Beta'
+      },
+      ...(isMac
+        ? [
+            {
+              id: 'developer-permissions' as const,
+              title: 'Permissions',
+              description: 'macOS privacy access for terminal-launched developer tools.',
+              icon: ShieldCheck,
+              searchEntries: DEVELOPER_PERMISSIONS_PANE_SEARCH_ENTRIES
+            }
+          ]
+        : []),
+      {
+        id: 'privacy',
+        title: 'Privacy & Telemetry',
+        description: 'Anonymous usage data and telemetry controls.',
+        icon: Lock,
+        searchEntries: PRIVACY_PANE_SEARCH_ENTRIES
+      },
+      {
         id: 'shortcuts',
         title: 'Shortcuts',
         description: 'Keyboard shortcuts for common actions.',
@@ -352,8 +500,7 @@ function Settings(): React.JSX.Element {
         title: 'SSH',
         description: 'Remote SSH connections.',
         icon: Server,
-        searchEntries: SSH_PANE_SEARCH_ENTRIES,
-        badge: 'Beta'
+        searchEntries: SSH_PANE_SEARCH_ENTRIES
       },
       {
         id: 'experimental',
@@ -370,7 +517,7 @@ function Settings(): React.JSX.Element {
         searchEntries: getRepositoryPaneSearchEntries(repo)
       }))
     ],
-    [repos, terminalPaneSearchEntries]
+    [isMac, repos, terminalPaneSearchEntries]
   )
 
   const visibleNavSections = useMemo(
@@ -387,7 +534,7 @@ function Settings(): React.JSX.Element {
     const visibleIds = new Set(visibleNavSections.map((section) => section.id))
 
     if (scrollTargetId && pendingNavSectionId && visibleIds.has(pendingNavSectionId)) {
-      scrollSectionIntoView(scrollTargetId, contentScrollRef.current)
+      scrollSectionIntoView(scrollTargetId)
       flashSectionHighlight(scrollTargetId)
       setActiveSectionId(pendingNavSectionId)
       pendingNavSectionRef.current = null
@@ -492,7 +639,7 @@ function Settings(): React.JSX.Element {
       if (sectionId === 'experimental' && modifiers?.shiftKey) {
         setHiddenExperimentalUnlocked((previous) => !previous)
       }
-      scrollSectionIntoView(sectionId, contentScrollRef.current)
+      scrollSectionIntoView(sectionId)
       flashSectionHighlight(sectionId)
       setActiveSectionId(sectionId)
     },
@@ -523,6 +670,7 @@ function Settings(): React.JSX.Element {
         repoSections={repoNavSections}
         hasRepos={repos.length > 0}
         searchQuery={settingsSearchQuery}
+        searchInputRef={searchInputRef}
         onBack={closeSettingsPage}
         onSearchChange={setSettingsSearchQuery}
         onSelectSection={scrollToSection}
@@ -565,6 +713,15 @@ function Settings(): React.JSX.Element {
                 </SettingsSection>
 
                 <SettingsSection
+                  id="accounts"
+                  title="Agent Accounts"
+                  description="Sign in and switch between Claude, Codex, Gemini, and OpenCode Go accounts."
+                  searchEntries={ACCOUNTS_PANE_SEARCH_ENTRIES}
+                >
+                  <AccountsPane settings={settings} updateSettings={updateSettings} />
+                </SettingsSection>
+
+                <SettingsSection
                   id="git"
                   title="Git"
                   description="Branch naming and local ref behavior."
@@ -587,6 +744,7 @@ function Settings(): React.JSX.Element {
                     settings={settings}
                     updateSettings={updateSettings}
                     applyTheme={applyTheme}
+                    fontSuggestions={fontSuggestions}
                   />
                 </SettingsSection>
 
@@ -595,14 +753,30 @@ function Settings(): React.JSX.Element {
                   title="Terminal"
                   description="Terminal appearance, previews, and defaults for new panes."
                   searchEntries={terminalPaneSearchEntries}
+                  headerAction={
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="gap-1.5"
+                      onClick={() => void ghostty.handleClick()}
+                    >
+                      <img src={ghosttyIcon} alt="" aria-hidden="true" className="size-4" />
+                      Import from Ghostty
+                    </Button>
+                  }
                 >
                   <TerminalPane
                     settings={settings}
                     updateSettings={updateSettings}
                     systemPrefersDark={systemPrefersDark}
-                    terminalFontSuggestions={terminalFontSuggestions}
+                    terminalFontSuggestions={fontSuggestions.filter(
+                      (font) => font !== DEFAULT_APP_FONT_FAMILY
+                    )}
                     scrollbackMode={scrollbackMode}
                     setScrollbackMode={setScrollbackMode}
+                    ghostty={ghostty}
+                    wslAvailable={wslAvailable}
+                    pwshAvailable={pwshAvailable}
                   />
                 </SettingsSection>
 
@@ -622,6 +796,78 @@ function Settings(): React.JSX.Element {
                   searchEntries={NOTIFICATIONS_PANE_SEARCH_ENTRIES}
                 >
                   <NotificationsPane settings={settings} updateSettings={updateSettings} />
+                </SettingsSection>
+
+                <SettingsSection
+                  id="orchestration"
+                  title="Orchestration"
+                  description="Coordinate multiple coding agents through Orca."
+                  searchEntries={ORCHESTRATION_PANE_SEARCH_ENTRIES}
+                >
+                  <OrchestrationPane />
+                </SettingsSection>
+
+                <SettingsSection
+                  id="mobile"
+                  title="Mobile"
+                  badge="Beta"
+                  description="Control terminals and agents from your phone."
+                  searchEntries={MOBILE_SETTINGS_PANE_SEARCH_ENTRIES}
+                >
+                  <MobileSettingsPane settings={settings} updateSettings={updateSettings} />
+                </SettingsSection>
+
+                <SettingsSection
+                  id="computer-use"
+                  title="Computer Use"
+                  badge="Beta"
+                  badgeAccessory={
+                    showComputerUsePreviewTooltip ? (
+                      <TooltipProvider delayDuration={250}>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <button
+                              type="button"
+                              className="text-muted-foreground transition-colors hover:text-foreground"
+                              aria-label={`${computerUsePlatform} Computer Use preview details`}
+                            >
+                              <Info className="size-3.5" />
+                            </button>
+                          </TooltipTrigger>
+                          <TooltipContent side="top" sideOffset={6} className="max-w-72">
+                            <span>
+                              {computerUsePlatform} Computer Use is an early preview. Some apps and
+                              desktop environments may behave inconsistently.
+                            </span>
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    ) : null
+                  }
+                  description="Enable agents to control any app on your computer."
+                  searchEntries={COMPUTER_USE_PANE_SEARCH_ENTRIES}
+                >
+                  <ComputerUsePane />
+                </SettingsSection>
+
+                {isMac ? (
+                  <SettingsSection
+                    id="developer-permissions"
+                    title="Permissions"
+                    description="macOS privacy access for terminal-launched developer tools."
+                    searchEntries={DEVELOPER_PERMISSIONS_PANE_SEARCH_ENTRIES}
+                  >
+                    <DeveloperPermissionsPane />
+                  </SettingsSection>
+                ) : null}
+
+                <SettingsSection
+                  id="privacy"
+                  title="Privacy & Telemetry"
+                  description="Anonymous usage data and telemetry controls."
+                  searchEntries={PRIVACY_PANE_SEARCH_ENTRIES}
+                >
+                  <PrivacyPane settings={settings} />
                 </SettingsSection>
 
                 <SettingsSection
@@ -645,7 +891,6 @@ function Settings(): React.JSX.Element {
                 <SettingsSection
                   id="ssh"
                   title="SSH"
-                  badge="Beta"
                   description="Manage remote SSH connections. Connect to remote servers to browse files, run terminals, and use git."
                   searchEntries={SSH_PANE_SEARCH_ENTRIES}
                 >

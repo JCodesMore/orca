@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useSortable } from '@dnd-kit/sortable'
-import { X, Terminal as TerminalIcon, Minimize2, Columns2, Rows2 } from 'lucide-react'
+import { X, Minimize2, Columns2, Rows2 } from 'lucide-react'
+import { ShellIcon } from './shell-icons'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -80,6 +81,16 @@ export default function SortableTab({
   // because the slice returns a fresh object reference on each mark/clear.
   const hasUnreadActivity = useAppStore((s) => s.unreadTerminalTabs[tab.id] === true)
 
+  // Why: on Windows, tabs created before the per-tab shell override landed (or
+  // created via the default Ctrl+T path without picking a specific shell)
+  // don't carry a shellOverride. We still want the tab-strip icon to reflect
+  // the shell actually running, so fall back to the user's configured default
+  // Windows shell. On mac/linux this resolves to undefined and the ShellIcon
+  // generic-terminal fallback renders.
+  const defaultWindowsShell = useAppStore((s) => s.settings?.terminalWindowsShell)
+  const isWindows = navigator.userAgent.includes('Windows')
+  const shellForIcon = tab.shellOverride ?? (isWindows ? defaultWindowsShell : undefined)
+
   // Why: intentionally no transform/transition/opacity here. The PR's
   // design is that tabs stay visually anchored during a drag — only the
   // blue insertion bar moves. Siblings also don't shift (see
@@ -148,6 +159,20 @@ export default function SortableTab({
     return () => window.removeEventListener(CLOSE_ALL_CONTEXT_MENUS_EVENT, closeMenu)
   }, [])
 
+  // Why: Electron <webview> elements run in a separate process, so clicking
+  // inside one never dispatches a pointerdown on the renderer document. Radix
+  // DropdownMenu relies on document pointerdown for outside-click detection,
+  // so it misses webview clicks. Listening for window blur catches the moment
+  // focus leaves the renderer (including into a webview).
+  useEffect(() => {
+    if (!menuOpen) {
+      return
+    }
+    const dismiss = (): void => setMenuOpen(false)
+    window.addEventListener('blur', dismiss)
+    return () => window.removeEventListener('blur', dismiss)
+  }, [menuOpen])
+
   // Why: while editing, suppress dnd-kit drag listeners and tab-activation/double-click
   // handlers so typing/clicking inside the inline input doesn't start a drag, re-open the
   // editor, or steal focus away from the input. We still spread `attributes` unconditionally
@@ -170,6 +195,12 @@ export default function SortableTab({
           data-testid="sortable-tab"
           data-tab-id={tab.id}
           data-tab-title={tab.customTitle ?? tab.title}
+          // Why: expose the active/inactive flag as a DOM attribute so E2E specs
+          // can assert on user-observable selection state without reading the
+          // Zustand store. A store-only "is this tab active?" round-trip would
+          // pass even if the tab-bar render path had silently broken (the same
+          // tautology that let PR #1186's render crash ship past E2E in #1193).
+          data-active={isActive ? 'true' : 'false'}
           {...attributes}
           {...dragListeners}
           // Why: on unread activity, tint the whole tab with a subtle amber
@@ -235,9 +266,20 @@ export default function SortableTab({
               <FilledBellIcon className="w-3 h-3 mr-1 text-amber-500 drop-shadow-sm" />
             </span>
           ) : (
-            <TerminalIcon
-              className={`w-3 h-3 mr-1 shrink-0 ${isActive ? 'text-foreground' : 'text-muted-foreground'}`}
-            />
+            // Why: ShellIcon renders a colored brand-style tile for PowerShell,
+            // CMD, and WSL so Windows users can distinguish shells at a glance.
+            // On mac/linux (or Windows tabs without a resolved shell) it falls
+            // back to a matching colored generic-terminal tile — keeping every
+            // tab's leading glyph in the same visual idiom instead of mixing a
+            // flat lucide chevron with the brand tiles. Opacity dims the icon
+            // on inactive tabs to match the existing text treatment without
+            // desaturating the brand colors beyond recognition.
+            <span
+              className={`mr-1 inline-flex shrink-0 ${isActive ? '' : 'opacity-70'}`}
+              aria-hidden
+            >
+              <ShellIcon shell={shellForIcon} size={12} />
+            </span>
           )}
           {isEditing ? (
             <Input
@@ -313,6 +355,12 @@ export default function SortableTab({
                   ? 'text-muted-foreground hover:text-foreground hover:bg-muted'
                   : 'text-transparent group-hover:text-muted-foreground hover:!text-foreground hover:!bg-muted'
               }`}
+              // Why: per-tab close affordance needs a stable accessible name so
+              // E2E specs can drive the same path a user takes (hover → click X)
+              // instead of bypassing the render layer by calling closeTab() on
+              // the store — a store-only assertion would pass even if this
+              // button had been accidentally unmounted.
+              aria-label={`Close tab ${tab.customTitle ?? tab.title}`}
               onPointerDown={(e) => e.stopPropagation()}
               onClick={(e) => {
                 e.stopPropagation()

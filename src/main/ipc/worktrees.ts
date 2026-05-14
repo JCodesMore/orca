@@ -5,11 +5,18 @@ import { rm } from 'fs/promises'
 import type { Store } from '../persistence'
 import { isFolderRepo } from '../../shared/repo-kind'
 import { deleteWorktreeHistoryDir } from '../terminal-history'
-import type { CreateWorktreeArgs, CreateWorktreeResult, WorktreeMeta } from '../../shared/types'
+import type {
+  CreateWorktreeArgs,
+  CreateWorktreeResult,
+  GitPushTarget,
+  GitWorktreeInfo,
+  Repo,
+  WorktreeMeta
+} from '../../shared/types'
 import { removeWorktree } from '../git/worktree'
 import { gitExecFileAsync } from '../git/runner'
 import { getDefaultRemote } from '../git/repo'
-import { getWorkItem } from '../github/client'
+import { getPullRequestPushTarget, getWorkItem } from '../github/client'
 import { listRepoWorktrees, createFolderWorktree } from '../repo-worktrees'
 import { getSshGitProvider } from '../providers/ssh-git-dispatch'
 import {
@@ -33,9 +40,67 @@ import {
   createRemoteWorktree,
   notifyWorktreesChanged
 } from './worktree-remote'
-import { rebuildAuthorizedRootsCache, ensureAuthorizedRootsCache } from './filesystem-auth'
+import { invalidateAuthorizedRootsCache, registerWorktreeRootsForRepo } from './filesystem-auth'
+import type { OrcaRuntimeService } from '../runtime/orca-runtime'
+import { killAllProcessesForWorktree } from '../runtime/worktree-teardown'
+import { getLocalPtyProvider } from './pty'
+import { removeWorktreeSymlinks } from './worktree-symlinks'
+import { track } from '../telemetry/client'
+import { getCohortAtEmit } from '../telemetry/cohort-classifier'
+import { workspaceSourceSchema, type WorkspaceSource } from '../../shared/telemetry-events'
+import { classifyWorkspaceCreateError } from './workspace-create-error-classifier'
 
-export function registerWorktreeHandlers(mainWindow: BrowserWindow, store: Store): void {
+// Why: worktrees discovered on disk (not created via Orca's UI) have no
+// persisted WorktreeMeta, so mergeWorktree falls back to `lastActivityAt: 0`.
+// That makes them sort to the bottom of "Recent" even though the user just
+// added the repo / folder. Stamp discovery time the first time we see a
+// worktree so its very existence counts as a recency signal. Subsequent
+// list calls find the persisted meta and skip the stamp.
+function resolveWorktreeMetaWithDiscoveryStamp(store: Store, worktreeId: string): WorktreeMeta {
+  const existing = store.getWorktreeMeta(worktreeId)
+  if (existing) {
+    return existing
+  }
+  return store.setWorktreeMeta(worktreeId, { lastActivityAt: Date.now() })
+}
+
+const loggedUnavailableSshGitProviders = new Set<string>()
+const loggedWorktreeListFailures = new Set<string>()
+
+function warnOnce(keySet: Set<string>, key: string, message: string, error?: unknown): void {
+  if (keySet.has(key)) {
+    return
+  }
+  keySet.add(key)
+  if (error) {
+    console.warn(message, error)
+  } else {
+    console.warn(message)
+  }
+}
+
+function rememberLocalWorktreeRoots(
+  store: Store,
+  repo: Repo,
+  gitWorktrees: GitWorktreeInfo[]
+): void {
+  if (repo.connectionId) {
+    return
+  }
+  // Why: worktrees:list already paid the `git worktree list` cost. Reusing
+  // that result keeps later git/file IPC validation from doing a second
+  // background scan that can trigger macOS folder-permission prompts.
+  registerWorktreeRootsForRepo(store, repo.id, [
+    repo.path,
+    ...gitWorktrees.map((worktree) => worktree.path)
+  ])
+}
+
+export function registerWorktreeHandlers(
+  mainWindow: BrowserWindow,
+  store: Store,
+  runtime: OrcaRuntimeService
+): void {
   // Remove any previously registered handlers so we can re-register them
   // (e.g. when macOS re-activates the app and creates a new window).
   ipcMain.removeHandler('worktrees:listAll')
@@ -51,10 +116,6 @@ export function registerWorktreeHandlers(mainWindow: BrowserWindow, store: Store
   ipcMain.removeHandler('hooks:writeIssueCommand')
 
   ipcMain.handle('worktrees:listAll', async () => {
-    // Why: use ensureAuthorizedRootsCache (not rebuild) to avoid redundantly
-    // listing git worktrees when the cache is already fresh — the handler
-    // itself calls listWorktrees for every repo below.
-    await ensureAuthorizedRootsCache(store)
     const repos = store.getRepos()
 
     // Why: repos are listed in parallel so total time = slowest repo, not
@@ -68,18 +129,39 @@ export function registerWorktreeHandlers(mainWindow: BrowserWindow, store: Store
           } else if (repo.connectionId) {
             const provider = getSshGitProvider(repo.connectionId)
             if (!provider) {
+              warnOnce(
+                loggedUnavailableSshGitProviders,
+                `${repo.connectionId}:${repo.id}`,
+                `[worktrees] SSH git provider unavailable; skipping worktree list for repo "${repo.displayName}" (${repo.id}) at ${repo.path} on connection ${repo.connectionId}`
+              )
               return []
             }
+            loggedUnavailableSshGitProviders.delete(`${repo.connectionId}:${repo.id}`)
             gitWorktrees = await provider.listWorktrees(repo.path)
           } else {
             gitWorktrees = await listRepoWorktrees(repo)
           }
+          rememberLocalWorktreeRoots(store, repo, gitWorktrees)
+          loggedWorktreeListFailures.delete(`${repo.id}:${repo.path}`)
           return gitWorktrees.map((gw) => {
             const worktreeId = `${repo.id}::${gw.path}`
-            const meta = store.getWorktreeMeta(worktreeId)
+            const meta = resolveWorktreeMetaWithDiscoveryStamp(store, worktreeId)
             return mergeWorktree(repo.id, gw, meta, repo.displayName)
           })
-        } catch {
+        } catch (err) {
+          warnOnce(
+            loggedWorktreeListFailures,
+            `${repo.id}:${repo.path}`,
+            `[worktrees] failed to list worktrees for repo "${repo.displayName}" (${repo.id}) at ${repo.path}`,
+            err
+          )
+          // Why: do NOT seed an empty success here. registerWorktreeRootsForRepo
+          // would mark this repo as registered and flip
+          // registeredWorktreeRootsDirty to false, which causes
+          // resolveRegisteredWorktreePath to permanently deny access to
+          // legitimate linked worktrees of this repo until something invalidates
+          // the cache. Leaving it unregistered keeps the cache dirty so the
+          // next access path can rebuild.
           return []
         }
       })
@@ -89,38 +171,54 @@ export function registerWorktreeHandlers(mainWindow: BrowserWindow, store: Store
   })
 
   ipcMain.handle('worktrees:list', async (_event, args: { repoId: string }) => {
-    // Why: use ensureAuthorizedRootsCache (not rebuild) to avoid redundantly
-    // listing git worktrees when the cache is already fresh — the handler
-    // itself calls listWorktrees below.
-    await ensureAuthorizedRootsCache(store)
     const repo = store.getRepo(args.repoId)
     if (!repo) {
       return []
     }
 
-    let gitWorktrees
-    if (isFolderRepo(repo)) {
-      gitWorktrees = [createFolderWorktree(repo)]
-    } else if (repo.connectionId) {
-      const provider = getSshGitProvider(repo.connectionId)
-      // Why: when SSH is disconnected the provider is null. Return [] so the
-      // renderer's fetchWorktrees guard (`worktrees.length === 0 && current.length > 0`)
-      // preserves its cached worktree list. This avoids a console error on every
-      // fetchAllWorktrees cycle while the connection is being (re-)established —
-      // worktrees will be properly populated when the SSH `connected` event fires
-      // and triggers a re-fetch.
-      if (!provider) {
-        return []
+    try {
+      let gitWorktrees
+      if (isFolderRepo(repo)) {
+        gitWorktrees = [createFolderWorktree(repo)]
+      } else if (repo.connectionId) {
+        const provider = getSshGitProvider(repo.connectionId)
+        // Why: when SSH is disconnected the provider is null. Return [] so the
+        // renderer's fetchWorktrees guard (`worktrees.length === 0 && current.length > 0`)
+        // preserves its cached worktree list. This avoids a console error on every
+        // fetchAllWorktrees cycle while the connection is being (re-)established —
+        // worktrees will be properly populated when the SSH `connected` event fires
+        // and triggers a re-fetch.
+        if (!provider) {
+          warnOnce(
+            loggedUnavailableSshGitProviders,
+            `${repo.connectionId}:${repo.id}`,
+            `[worktrees] SSH git provider unavailable; skipping worktree list for repo "${repo.displayName}" (${repo.id}) at ${repo.path} on connection ${repo.connectionId}`
+          )
+          return []
+        }
+        loggedUnavailableSshGitProviders.delete(`${repo.connectionId}:${repo.id}`)
+        gitWorktrees = await provider.listWorktrees(repo.path)
+      } else {
+        gitWorktrees = await listRepoWorktrees(repo)
       }
-      gitWorktrees = await provider.listWorktrees(repo.path)
-    } else {
-      gitWorktrees = await listRepoWorktrees(repo)
+      rememberLocalWorktreeRoots(store, repo, gitWorktrees)
+      loggedWorktreeListFailures.delete(`${repo.id}:${repo.path}`)
+      return gitWorktrees.map((gw) => {
+        const worktreeId = `${repo.id}::${gw.path}`
+        const meta = resolveWorktreeMetaWithDiscoveryStamp(store, worktreeId)
+        return mergeWorktree(repo.id, gw, meta, repo.displayName)
+      })
+    } catch (err) {
+      warnOnce(
+        loggedWorktreeListFailures,
+        `${repo.id}:${repo.path}`,
+        `[worktrees] failed to list worktrees for repo "${repo.displayName}" (${repo.id}) at ${repo.path}`,
+        err
+      )
+      // Why: see worktrees:listAll catch — seeding an empty-success result
+      // would poison the auth cache and block linked worktrees.
+      return []
     }
-    return gitWorktrees.map((gw) => {
-      const worktreeId = `${repo.id}::${gw.path}`
-      const meta = store.getWorktreeMeta(worktreeId)
-      return mergeWorktree(repo.id, gw, meta, repo.displayName)
-    })
   })
 
   ipcMain.handle(
@@ -134,12 +232,43 @@ export function registerWorktreeHandlers(mainWindow: BrowserWindow, store: Store
         throw new Error('Folder mode does not support creating worktrees.')
       }
 
-      // Remote repos route all git operations through the relay
-      if (repo.connectionId) {
-        return createRemoteWorktree(args, repo, store, mainWindow)
+      const sourceParse = workspaceSourceSchema.safeParse(args.telemetrySource)
+      const source: WorkspaceSource = sourceParse.success ? sourceParse.data : 'unknown'
+
+      let result: CreateWorktreeResult
+      try {
+        // Why: only wrap the helpers themselves. The pre-validation throws
+        // above (`Repo not found`, `Folder mode does not support creating
+        // worktrees`) signal IPC-shape bugs, not the user-visible
+        // git/filesystem failures the funnel cares about — bucketing them
+        // into `unknown` would pollute the failure taxonomy.
+        result = repo.connectionId
+          ? await createRemoteWorktree(args, repo, store, mainWindow)
+          : await createLocalWorktree(args, repo, store, mainWindow, runtime)
+      } catch (error) {
+        track('workspace_create_failed', {
+          source,
+          error_class: classifyWorkspaceCreateError(error),
+          ...getCohortAtEmit()
+        })
+        throw error
       }
 
-      return createLocalWorktree(args, repo, store, mainWindow)
+      // Why: emit `workspace_created` only after the underlying create has
+      // resolved (the helpers throw on failure, so reaching this line means
+      // git-add succeeded — we deliberately do not also emit a separate
+      // `workspace_initialized`, see telemetry-plan.md§Deferred events).
+      // `from_existing_branch` is true iff the caller specified a non-empty
+      // baseBranch; an unspecified baseBranch means "branch from default
+      // HEAD", which is the not-from-existing-branch case. We never send
+      // the branch name itself.
+      track('workspace_created', {
+        source,
+        from_existing_branch: typeof args.baseBranch === 'string' && args.baseBranch.length > 0,
+        ...getCohortAtEmit()
+      })
+
+      return result
     }
   )
 
@@ -153,7 +282,7 @@ export function registerWorktreeHandlers(mainWindow: BrowserWindow, store: Store
         headRefName?: string
         isCrossRepository?: boolean
       }
-    ): Promise<{ baseBranch: string } | { error: string }> => {
+    ): Promise<{ baseBranch: string; pushTarget?: GitPushTarget } | { error: string }> => {
       const repo = store.getRepo(args.repoId)
       if (!repo) {
         return { error: 'Repo not found' }
@@ -169,10 +298,14 @@ export function registerWorktreeHandlers(mainWindow: BrowserWindow, store: Store
 
       let headRefName = args.headRefName?.trim() ?? ''
       let isCrossRepository = args.isCrossRepository === true
+      let pushTarget: CreateWorktreeArgs['pushTarget'] | undefined
 
       // Skip the gh lookup when both hints are present (picker already has them).
       if (!headRefName) {
-        const item = await getWorkItem(repo.path, args.prNumber)
+        // Why: the caller already knows this is a PR number, so scope the
+        // lookup to `type: 'pr'` and skip the speculative issue-first probe
+        // that would hit the upstream issue tracker for fork checkouts.
+        const item = await getWorkItem(repo.path, args.prNumber, 'pr')
         if (!item || item.type !== 'pr') {
           return { error: `PR #${args.prNumber} not found.` }
         }
@@ -182,6 +315,21 @@ export function registerWorktreeHandlers(mainWindow: BrowserWindow, store: Store
         }
         if (item.isCrossRepository === true) {
           isCrossRepository = true
+        }
+      }
+      if (isCrossRepository) {
+        try {
+          pushTarget = (await getPullRequestPushTarget(repo.path, args.prNumber)) ?? undefined
+        } catch (error) {
+          return {
+            error:
+              error instanceof Error
+                ? error.message
+                : `Could not resolve PR #${args.prNumber} head push target.`
+          }
+        }
+        if (!pushTarget) {
+          return { error: `Could not resolve PR #${args.prNumber} head push target.` }
         }
       }
 
@@ -221,11 +369,14 @@ export function registerWorktreeHandlers(mainWindow: BrowserWindow, store: Store
         if (!sha) {
           return { error: `Empty SHA resolving fork PR #${args.prNumber} head.` }
         }
-        return { baseBranch: sha }
+        return { baseBranch: sha, ...(pushTarget ? { pushTarget } : {}) }
       }
 
       try {
-        await gitExecFileAsync(['fetch', remote, headRefName], { cwd: repo.path })
+        await gitExecFileAsync(
+          ['fetch', remote, `+refs/heads/${headRefName}:refs/remotes/${remote}/${headRefName}`],
+          { cwd: repo.path }
+        )
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         return {
@@ -240,13 +391,16 @@ export function registerWorktreeHandlers(mainWindow: BrowserWindow, store: Store
         return { error: `Remote ref ${remoteRef} does not exist after fetch.` }
       }
 
-      return { baseBranch: remoteRef }
+      if (!pushTarget) {
+        pushTarget = { remoteName: remote, branchName: headRefName }
+      }
+      return { baseBranch: remoteRef, pushTarget }
     }
   )
 
   ipcMain.handle(
     'worktrees:remove',
-    async (_event, args: { worktreeId: string; force?: boolean }) => {
+    async (_event, args: { worktreeId: string; force?: boolean; skipArchive?: boolean }) => {
       const { repoId, worktreePath } = parseWorktreeId(args.worktreeId)
       const repo = store.getRepo(repoId)
       if (!repo) {
@@ -256,12 +410,38 @@ export function registerWorktreeHandlers(mainWindow: BrowserWindow, store: Store
         throw new Error('Folder mode does not support deleting worktrees.')
       }
 
+      // Why: kill every PTY belonging to this worktree BEFORE git-level
+      // removal. The renderer pre-kills via shutdownWorktreeTerminals, but
+      // defensive teardown here protects against: (a) a future renderer bug,
+      // (b) a disconnected window, (c) an out-of-band window.api.worktrees.remove
+      // caller. Placement is before the SSH early-return so local-host PTYs
+      // are still reaped for local repos; SSH-backed PTYs are handled by the
+      // remote provider's own teardown (design §4.3, §6).
+      if (!repo.connectionId) {
+        await killAllProcessesForWorktree(args.worktreeId, {
+          runtime,
+          localProvider: getLocalPtyProvider()
+        })
+          .then((r) => {
+            const total = r.runtimeStopped + r.providerStopped + r.registryStopped
+            if (total > 0) {
+              console.info(
+                `[worktree-teardown] ${args.worktreeId} killed runtime=${r.runtimeStopped} provider=${r.providerStopped} registry=${r.registryStopped}`
+              )
+            }
+          })
+          .catch((err) => {
+            console.warn(`[worktree-teardown] failed for ${args.worktreeId}:`, err)
+          })
+      }
+
       if (repo.connectionId) {
         const provider = getSshGitProvider(repo.connectionId)
         if (!provider) {
           throw new Error(`No git provider for connection "${repo.connectionId}"`)
         }
         await provider.removeWorktree(worktreePath, args.force)
+        runtime.clearOptimisticReconcileToken(args.worktreeId)
         store.removeWorktreeMeta(args.worktreeId)
         deleteWorktreeHistoryDir(args.worktreeId)
         notifyWorktreesChanged(mainWindow, repoId)
@@ -270,11 +450,20 @@ export function registerWorktreeHandlers(mainWindow: BrowserWindow, store: Store
 
       // Run archive hook before removal
       const hooks = getEffectiveHooks(repo)
-      if (hooks?.scripts.archive) {
+      if (hooks?.scripts.archive && !args.skipArchive) {
         const result = await runHook('archive', worktreePath, repo)
         if (!result.success) {
           console.error(`[hooks] archive hook failed for ${worktreePath}:`, result.output)
         }
+      }
+
+      // Why: `git worktree remove` (non-force) refuses to delete a worktree
+      // that has untracked files, and a symlink pointing into the primary
+      // checkout looks untracked to git. Unlink the user-configured symlinks
+      // first so the normal delete path keeps working — otherwise every
+      // deletion would require the Force Delete toast once the feature is on.
+      if (repo.symlinkPaths && repo.symlinkPaths.length > 0) {
+        await removeWorktreeSymlinks(worktreePath, repo.symlinkPaths)
       }
 
       try {
@@ -289,17 +478,19 @@ export function registerWorktreeHandlers(mainWindow: BrowserWindow, store: Store
           // list` continues to show the stale entry and the branch it had checked out
           // remains locked — other worktrees cannot check it out.
           await gitExecFileAsync(['worktree', 'prune'], { cwd: repo.path }).catch(() => {})
+          runtime.clearOptimisticReconcileToken(args.worktreeId)
           store.removeWorktreeMeta(args.worktreeId)
           deleteWorktreeHistoryDir(args.worktreeId)
-          await rebuildAuthorizedRootsCache(store)
+          invalidateAuthorizedRootsCache()
           notifyWorktreesChanged(mainWindow, repoId)
           return
         }
         throw new Error(formatWorktreeRemovalError(error, worktreePath, args.force ?? false))
       }
+      runtime.clearOptimisticReconcileToken(args.worktreeId)
       store.removeWorktreeMeta(args.worktreeId)
       deleteWorktreeHistoryDir(args.worktreeId)
-      await rebuildAuthorizedRootsCache(store)
+      invalidateAuthorizedRootsCache()
 
       notifyWorktreesChanged(mainWindow, repoId)
     }

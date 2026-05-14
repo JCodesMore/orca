@@ -1,5 +1,5 @@
 import type { PaneManager } from '@/lib/pane-manager/pane-manager'
-import { captureScrollState, restoreScrollState } from '@/lib/pane-manager/pane-tree-ops'
+import { safeFit } from '@/lib/pane-manager/pane-tree-ops'
 
 type ExpandCollapseState = {
   expandedPaneIdRef: React.MutableRefObject<number | null>
@@ -93,6 +93,13 @@ export function createExpandCollapseActions(state: ExpandCollapseState) {
     restoreExpandedLayoutFrom(state.expandedStyleSnapshotRef.current)
   }
 
+  // Why: expand/collapse flips inline display/flex styles on ancestor panes
+  // synchronously. The rAF here lets layout settle so FitAddon's
+  // proposeDimensions reads the final rects, not the pre-toggle ones.
+  // xterm preserves viewportY natively across resize (see
+  // scroll-reflow.test.ts "reference: undisturbed"), so a bare fit() is
+  // enough — the content-hash capture/restore we used to do here jumped to
+  // the wrong duplicate scrollback line in long sessions.
   const refreshPaneSizes = (focusActive: boolean): void => {
     requestAnimationFrame(() => {
       const manager = state.managerRef.current
@@ -101,13 +108,7 @@ export function createExpandCollapseActions(state: ExpandCollapseState) {
       }
       const panes = manager.getPanes()
       for (const p of panes) {
-        try {
-          const state = captureScrollState(p.terminal)
-          p.fitAddon.fit()
-          restoreScrollState(p.terminal, state)
-        } catch {
-          /* container may not have dimensions */
-        }
+        safeFit(p)
       }
       if (focusActive) {
         const active = manager.getActivePane() ?? panes[0]

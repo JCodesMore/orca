@@ -92,6 +92,25 @@ describe('createIpcPtyTransport', () => {
     expect(onAgentBecameIdle).not.toHaveBeenCalled()
   })
 
+  it('keeps exit sidecars after eager-buffered PTYs attach to a terminal', async () => {
+    const { createIpcPtyTransport, registerEagerPtyBuffer, subscribeToPtyExit } =
+      await import('./pty-transport')
+    const eagerExit = vi.fn()
+    const sidecarExit = vi.fn()
+
+    registerEagerPtyBuffer('pty-restored', eagerExit)
+    subscribeToPtyExit('pty-restored', sidecarExit)
+
+    createIpcPtyTransport().attach({
+      existingPtyId: 'pty-restored',
+      callbacks: {}
+    })
+    onExit?.({ id: 'pty-restored', code: 0 })
+
+    expect(eagerExit).not.toHaveBeenCalled()
+    expect(sidecarExit).toHaveBeenCalledWith(0)
+  })
+
   it('fires onBell for bare BELs but ignores BELs inside OSC sequences', async () => {
     // Why: Claude's OSC titles end with a BEL terminator (`\e]0;…\a`). The
     // stateful bell detector must know it is inside an OSC when that BEL
@@ -419,6 +438,90 @@ describe('createIpcPtyTransport', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('suppresses the error toast when pty:spawn rejects with TerminalKilledError', async () => {
+    // Why: after the user hits "Kill All" in Settings → Manage Sessions, a
+    // remounted pane's connect() will call pty:spawn with a killed session
+    // ID. The main-side tombstone rejects with TerminalKilledError. That
+    // rejection is the kill working as intended — not a bug — so the
+    // transport must not surface a "please file an issue" toast. Match the
+    // IPC-wrapped form Electron actually throws ("Error invoking remote
+    // method 'pty:spawn': TerminalKilledError: Session \"...\" was
+    // explicitly killed") to exercise the real error path.
+    const { createIpcPtyTransport } = await import('./pty-transport')
+    const spawnMock = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          `Error invoking remote method 'pty:spawn': TerminalKilledError: Session "pty-dead" was explicitly killed`
+        )
+      )
+
+    ;(globalThis as { window: typeof window }).window = {
+      ...originalWindow,
+      api: {
+        ...originalWindow?.api,
+        pty: {
+          ...originalWindow?.api?.pty,
+          spawn: spawnMock,
+          write: vi.fn(),
+          resize: vi.fn(),
+          kill: vi.fn(),
+          onData: vi.fn(() => () => {}),
+          onReplay: vi.fn(() => () => {}),
+          onExit: vi.fn(() => () => {})
+        }
+      }
+    } as unknown as typeof window
+
+    const transport = createIpcPtyTransport()
+    const onError = vi.fn()
+
+    const result = await transport.connect({
+      url: '',
+      sessionId: 'pty-dead',
+      callbacks: { onError }
+    })
+
+    expect(onError).not.toHaveBeenCalled()
+    expect(result).toBeUndefined()
+  })
+
+  it('still surfaces non-kill spawn errors via onError', async () => {
+    // Why: the TerminalKilledError suppression must be narrowly scoped —
+    // unrelated spawn failures (no shell binary, bad cwd, etc.) still need
+    // to reach the user so they can act on them. Guard against an
+    // over-broad `.includes` match regressing and swallowing real errors.
+    const { createIpcPtyTransport } = await import('./pty-transport')
+    const spawnMock = vi.fn().mockRejectedValue(new Error('ENOENT: spawn /bin/nope not found'))
+
+    ;(globalThis as { window: typeof window }).window = {
+      ...originalWindow,
+      api: {
+        ...originalWindow?.api,
+        pty: {
+          ...originalWindow?.api?.pty,
+          spawn: spawnMock,
+          write: vi.fn(),
+          resize: vi.fn(),
+          kill: vi.fn(),
+          onData: vi.fn(() => () => {}),
+          onReplay: vi.fn(() => () => {}),
+          onExit: vi.fn(() => () => {})
+        }
+      }
+    } as unknown as typeof window
+
+    const transport = createIpcPtyTransport()
+    const onError = vi.fn()
+
+    await transport.connect({
+      url: '',
+      callbacks: { onError }
+    })
+
+    expect(onError).toHaveBeenCalledWith('ENOENT: spawn /bin/nope not found')
   })
 
   it('keeps the exit observer alive after detach so remounts do not reuse dead PTYs', async () => {

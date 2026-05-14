@@ -7,7 +7,8 @@ import { randomUUID } from 'node:crypto'
 import { shell, webContents } from 'electron'
 import {
   normalizeBrowserNavigationUrl,
-  normalizeExternalBrowserUrl
+  normalizeExternalBrowserUrl,
+  redactKagiSessionToken
 } from '../../shared/browser-url'
 import type {
   BrowserDownloadFinishedEvent,
@@ -34,12 +35,28 @@ import {
   setupGuestShortcutForwarding
 } from './browser-guest-ui'
 import { ANTI_DETECTION_SCRIPT } from './anti-detection'
+import { cleanElectronUserAgent } from './browser-session-ua'
+import type { BrowserViewportOverride } from '../../shared/types'
+
+// Why: mobile presets need a touch-capable UA or responsive sites serve the
+// desktop variant based on UA sniffing. This is the Chrome DevTools default
+// iPhone UA template; we splice in the guest session's real Chrome major so
+// sec-ch-ua headers (see setupClientHintsOverride) stay consistent.
+function buildMobileUserAgent(chromeMajor: string): string {
+  return `Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/${chromeMajor}.0.0.0 Mobile/15E148 Safari/604.1`
+}
+
+function extractChromeMajor(ua: string): string {
+  const match = ua.match(/Chrome\/(\d+)/)
+  return match ? match[1] : '134'
+}
 
 export type BrowserGuestRegistration = {
   browserPageId?: string
   browserTabId?: string
   workspaceId?: string
   worktreeId?: string
+  sessionProfileId?: string | null
   webContentsId: number
   rendererWebContentsId: number
 }
@@ -82,7 +99,13 @@ export class BrowserManager {
   // visibility/focus state is keyed by browser workspace id. Screenshot prep
   // has to bridge that mismatch to activate the right tab before capture.
   private readonly workspaceIdByPageId = new Map<string, string>()
+  private readonly sessionProfileIdByPageId = new Map<string, string | null>()
   private readonly rendererWebContentsIdByTabId = new Map<string, number>()
+  // Why: chain setViewportOverride calls per tab so rapid toggles don't
+  // interleave CDP commands. Without serialization, two concurrent calls can
+  // race (e.g. clearDeviceMetricsOverride landing after a later mobile
+  // setDeviceMetricsOverride), leaving emulation in an unexpected state.
+  private readonly viewportOpsByTabId = new Map<string, Promise<unknown>>()
   private readonly contextMenuCleanupByTabId = new Map<string, () => void>()
   private readonly grabShortcutCleanupByTabId = new Map<string, () => void>()
   private readonly shortcutForwardingCleanupByTabId = new Map<string, () => void>()
@@ -109,6 +132,7 @@ export class BrowserManager {
   // further re-attach attempts.
   private injectAntiDetection(guest: Electron.WebContents): () => void {
     let disposed = false
+    let reattachTimer: ReturnType<typeof setTimeout> | null = null
 
     const attach = (): void => {
       if (disposed || guest.isDestroyed()) {
@@ -137,8 +161,11 @@ export class BrowserManager {
     // sessions end. The 500ms delay avoids racing with the proxy/bridge if
     // it is mid-restart (detach → re-attach).
     const onDetach = (): void => {
-      if (!disposed && !guest.isDestroyed()) {
-        setTimeout(attach, 500)
+      if (!disposed && !guest.isDestroyed() && reattachTimer === null) {
+        reattachTimer = setTimeout(() => {
+          reattachTimer = null
+          attach()
+        }, 500)
       }
     }
 
@@ -151,6 +178,10 @@ export class BrowserManager {
 
     return () => {
       disposed = true
+      if (reattachTimer !== null) {
+        clearTimeout(reattachTimer)
+        reattachTimer = null
+      }
       try {
         guest.debugger.off('detach', onDetach)
       } catch {
@@ -423,7 +454,10 @@ export class BrowserManager {
           action: 'opened-in-orca'
         })
       } else if (externalUrl) {
-        void shell.openExternal(externalUrl)
+        // Why: a target=_blank click on a Kagi search result page produces a
+        // popup URL that still contains the bearer token; redact before
+        // handing the URL to the OS default browser.
+        void shell.openExternal(redactKagiSessionToken(externalUrl))
         this.forwardOrQueuePopupEvent(guest.id, {
           origin: safeOrigin(externalUrl),
           action: 'opened-external'
@@ -523,6 +557,7 @@ export class BrowserManager {
     browserTabId: legacyBrowserTabId,
     workspaceId,
     worktreeId,
+    sessionProfileId,
     webContentsId,
     rendererWebContentsId
   }: BrowserGuestRegistration): void {
@@ -572,6 +607,7 @@ export class BrowserManager {
     if (workspaceId) {
       this.workspaceIdByPageId.set(browserTabId, workspaceId)
     }
+    this.sessionProfileIdByPageId.set(browserTabId, sessionProfileId ?? null)
     this.rendererWebContentsIdByTabId.set(browserTabId, rendererWebContentsId)
     if (worktreeId) {
       this.worktreeIdByTabId.set(browserTabId, worktreeId)
@@ -635,7 +671,11 @@ export class BrowserManager {
     this.webContentsIdByTabId.delete(browserTabId)
     this.rendererWebContentsIdByTabId.delete(browserTabId)
     this.workspaceIdByPageId.delete(browserTabId)
+    this.sessionProfileIdByPageId.delete(browserTabId)
     this.worktreeIdByTabId.delete(browserTabId)
+    // Why: drop any pending viewport-op chain for this tab so the Map doesn't
+    // retain a resolved promise keyed to a destroyed guest.
+    this.viewportOpsByTabId.delete(browserTabId)
   }
 
   unregisterAll(): void {
@@ -658,6 +698,7 @@ export class BrowserManager {
     this.policyCleanupByGuestId.clear()
     this.tabIdByWebContentsId.clear()
     this.worktreeIdByTabId.clear()
+    this.sessionProfileIdByPageId.clear()
     this.pendingLoadFailuresByGuestId.clear()
     this.pendingPermissionEventsByGuestId.clear()
     this.pendingPopupEventsByGuestId.clear()
@@ -674,6 +715,10 @@ export class BrowserManager {
 
   getWorktreeIdForTab(browserTabId: string): string | undefined {
     return this.worktreeIdByTabId.get(browserTabId)
+  }
+
+  getSessionProfileIdForTab(browserTabId: string): string | null {
+    return this.sessionProfileIdByPageId.get(browserTabId) ?? null
   }
 
   notifyPermissionDenied(args: {
@@ -873,6 +918,132 @@ export class BrowserManager {
     }
     guest.openDevTools({ mode: 'detach' })
     return true
+  }
+
+  // Why: Electron <webview> guests do not expose Chrome DevTools' device
+  // toolbar (Cmd+Shift+M) to the embedding app, so viewport emulation must be
+  // driven through CDP directly. We reuse the debugger attachment that
+  // injectAntiDetection already established and never detach it here — doing
+  // so would clear Page.addScriptToEvaluateOnNewDocument and other per-guest
+  // overrides. Passing override=null clears emulation.
+  async setViewportOverride(
+    browserTabId: string,
+    override: BrowserViewportOverride | null
+  ): Promise<boolean> {
+    // Why: chain per-tab so rapid toggles (e.g. user clicking presets quickly)
+    // don't interleave CDP commands. Each call waits for the previous one to
+    // settle, guaranteeing the last-requested override wins rather than whichever
+    // sendCommand sequence happens to finish last.
+    const prev = this.viewportOpsByTabId.get(browserTabId) ?? Promise.resolve()
+    const next = prev
+      .catch(() => {})
+      .then(() => this.doSetViewportOverrideImpl(browserTabId, override))
+    this.viewportOpsByTabId.set(browserTabId, next)
+    try {
+      return await next
+    } finally {
+      // Why: only clear if this call's promise is still the tail. A concurrent
+      // later call may have already replaced the entry; deleting would drop the
+      // chain and break serialization for the next invocation.
+      if (this.viewportOpsByTabId.get(browserTabId) === next) {
+        this.viewportOpsByTabId.delete(browserTabId)
+      }
+    }
+  }
+
+  private async doSetViewportOverrideImpl(
+    browserTabId: string,
+    override: BrowserViewportOverride | null
+  ): Promise<boolean> {
+    const webContentsId = this.webContentsIdByTabId.get(browserTabId)
+    if (!webContentsId) {
+      return false
+    }
+    const guest = webContents.fromId(webContentsId)
+    if (!guest || guest.isDestroyed()) {
+      this.webContentsIdByTabId.delete(browserTabId)
+      this.tabIdByWebContentsId.delete(webContentsId)
+      return false
+    }
+
+    try {
+      if (!guest.debugger.isAttached()) {
+        guest.debugger.attach('1.3')
+      }
+    } catch (err) {
+      // Why: DevTools being open on the guest causes attach to throw with
+      // "Another debugger is already attached". Silently returning false made
+      // this failure mode undiagnosable — surface it via the logger with enough
+      // context (tab + webContents ids) to correlate with user reports.
+      console.warn('[browser-manager] setViewportOverride: failed to attach debugger', {
+        browserTabId,
+        webContentsId,
+        error: err instanceof Error ? err.message : String(err)
+      })
+      return false
+    }
+
+    const dbg = guest.debugger
+    try {
+      if (override) {
+        await dbg.sendCommand('Emulation.setDeviceMetricsOverride', {
+          width: override.width,
+          height: override.height,
+          deviceScaleFactor: override.deviceScaleFactor,
+          mobile: override.mobile
+        })
+        await dbg.sendCommand('Emulation.setTouchEmulationEnabled', {
+          enabled: override.mobile,
+          maxTouchPoints: override.mobile ? 5 : 0
+        })
+        if (override.mobile) {
+          const chromeMajor = extractChromeMajor(cleanElectronUserAgent(guest.getUserAgent()))
+          // Why: pass userAgentMetadata alongside the mobile UA string so
+          // sec-ch-ua-mobile / sec-ch-ua-platform client hints match. Without
+          // it, session-level desktop client-hints leak through and create a
+          // UA/CH mismatch that bot-detection (Cloudflare, Turnstile) flags.
+          await dbg.sendCommand('Emulation.setUserAgentOverride', {
+            userAgent: buildMobileUserAgent(chromeMajor),
+            userAgentMetadata: {
+              brands: [
+                { brand: 'Google Chrome', version: chromeMajor },
+                { brand: 'Chromium', version: chromeMajor },
+                { brand: 'Not/A)Brand', version: '24' }
+              ],
+              fullVersionList: [
+                { brand: 'Google Chrome', version: `${chromeMajor}.0.0.0` },
+                { brand: 'Chromium', version: `${chromeMajor}.0.0.0` },
+                { brand: 'Not/A)Brand', version: '24.0.0.0' }
+              ],
+              fullVersion: `${chromeMajor}.0.0.0`,
+              platform: 'iOS',
+              platformVersion: '17.0',
+              architecture: '',
+              model: 'iPhone',
+              mobile: true
+            }
+          })
+        } else {
+          // Why: desktop presets still need the clean (non-Electron) UA so
+          // Cloudflare/Turnstile don't flag the session. Passing the cleaned
+          // real UA keeps sec-ch-ua consistent with the override.
+          await dbg.sendCommand('Emulation.setUserAgentOverride', {
+            userAgent: cleanElectronUserAgent(guest.getUserAgent())
+          })
+        }
+      } else {
+        await dbg.sendCommand('Emulation.clearDeviceMetricsOverride', {})
+        await dbg.sendCommand('Emulation.setTouchEmulationEnabled', {
+          enabled: false,
+          maxTouchPoints: 0
+        })
+        // Why: passing an empty string restores the session default UA.
+        await dbg.sendCommand('Emulation.setUserAgentOverride', { userAgent: '' })
+      }
+      return true
+    } catch {
+      return false
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1266,9 +1437,15 @@ export class BrowserManager {
       return
     }
 
+    // Why: redact Kagi session tokens before the validated URL is persisted
+    // by the renderer into BrowserPage.loadError (saved to disk via the
+    // workspace session writer).
     renderer.send('browser:guest-load-failed', {
       browserPageId: browserTabId,
-      loadError
+      loadError: {
+        ...loadError,
+        validatedUrl: redactKagiSessionToken(loadError.validatedUrl)
+      }
     })
   }
 

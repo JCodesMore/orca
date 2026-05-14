@@ -2,7 +2,11 @@
    splitting individual settings into separate files would scatter related controls without a
    meaningful abstraction boundary. Mirrors the same decision made for GeneralPane.tsx. */
 import { useState } from 'react'
-import type { GlobalSettings, SetupScriptLaunchMode } from '../../../../shared/types'
+import type {
+  FloatingTerminalTriggerLocation,
+  GlobalSettings,
+  SetupScriptLaunchMode
+} from '../../../../shared/types'
 import {
   DEFAULT_TERMINAL_FONT_WEIGHT,
   TERMINAL_FONT_WEIGHT_MAX,
@@ -19,7 +23,7 @@ import { Input } from '../ui/input'
 import { Label } from '../ui/label'
 import { Separator } from '../ui/separator'
 import { ToggleGroup, ToggleGroupItem } from '../ui/toggle-group'
-import { Minus, Plus } from 'lucide-react'
+import { FolderOpen, Minus, Plus } from 'lucide-react'
 import {
   clampNumber,
   resolveEffectiveTerminalAppearance,
@@ -32,20 +36,31 @@ import { matchesSettingsSearch } from './settings-search'
 import { useAppStore } from '../../store'
 import { isMacUserAgent, isWindowsUserAgent } from '@/components/terminal-pane/pane-helpers'
 import {
+  MANAGE_SESSIONS_SEARCH_ENTRIES,
   TERMINAL_ADVANCED_SEARCH_ENTRIES,
   TERMINAL_CURSOR_SEARCH_ENTRIES,
   TERMINAL_DARK_THEME_SEARCH_ENTRIES,
   TERMINAL_LIGHT_THEME_SEARCH_ENTRIES,
   TERMINAL_MAC_OPTION_SEARCH_ENTRIES,
+  TERMINAL_FLOATING_SEARCH_ENTRIES,
   TERMINAL_PANE_STYLE_SEARCH_ENTRIES,
-  TERMINAL_RIGHT_CLICK_TO_PASTE_SEARCH_ENTRY,
+  TERMINAL_RENDERING_SEARCH_ENTRIES,
   TERMINAL_SETUP_SCRIPT_SEARCH_ENTRIES,
   TERMINAL_TYPOGRAPHY_SEARCH_ENTRIES,
-  TERMINAL_WINDOWS_SHELL_SEARCH_ENTRY
+  TERMINAL_WINDOW_SEARCH_ENTRIES
 } from './terminal-search'
+import {
+  TERMINAL_RIGHT_CLICK_TO_PASTE_SEARCH_ENTRY,
+  TERMINAL_WINDOWS_POWERSHELL_IMPLEMENTATION_SEARCH_ENTRY,
+  TERMINAL_WINDOWS_SHELL_SEARCH_ENTRY
+} from './terminal-windows-search'
 import { useDetectedOptionAsAlt } from '@/lib/keyboard-layout/use-effective-mac-option-as-alt'
 import { detectedCategoryToDefault } from '@/lib/keyboard-layout/detect-option-as-alt'
 import { DarkTerminalThemeSection, LightTerminalThemeSection } from './TerminalThemeSections'
+import { TerminalWindowSection } from './TerminalWindowSection'
+import { GhosttyImportModal } from './GhosttyImportModal'
+import type { UseGhosttyImportReturn } from './useGhosttyImport'
+import { ManageSessionsSection } from './ManageSessionsSection'
 
 type TerminalPaneProps = {
   settings: GlobalSettings
@@ -54,6 +69,14 @@ type TerminalPaneProps = {
   terminalFontSuggestions: string[]
   scrollbackMode: 'preset' | 'custom'
   setScrollbackMode: (mode: 'preset' | 'custom') => void
+  /** Ghostty import modal state + handlers. Lifted to the Settings shell so
+   *  the section header can render the trigger button as a headerAction
+   *  instead of taking its own row inside the settings list. */
+  ghostty: UseGhosttyImportReturn
+  /** Whether WSL is installed on this Windows machine. */
+  wslAvailable?: boolean
+  /** Whether PowerShell 7+ (pwsh.exe) is installed on this Windows machine. */
+  pwshAvailable?: boolean
 }
 
 export function TerminalPane({
@@ -62,7 +85,10 @@ export function TerminalPane({
   systemPrefersDark,
   terminalFontSuggestions,
   scrollbackMode,
-  setScrollbackMode
+  setScrollbackMode,
+  ghostty,
+  wslAvailable,
+  pwshAvailable
 }: TerminalPaneProps): React.JSX.Element {
   const searchQuery = useAppStore((state) => state.settingsSearchQuery)
   const isWindows = isWindowsUserAgent()
@@ -93,6 +119,16 @@ export function TerminalPane({
   )
   const scrollbackToggleValue =
     scrollbackMode === 'custom' ? 'custom' : isPreset ? `${scrollbackMb}` : 'custom'
+  const windowsShell = settings.terminalWindowsShell ?? 'powershell.exe'
+  const powerShellImplementation = settings.terminalWindowsPowerShellImplementation ?? 'auto'
+  const showWindowsPowerShellImplementation = isWindows && windowsShell === 'powershell.exe'
+  const pickFloatingTerminalDirectory = async (): Promise<void> => {
+    const path = await window.api.repos.pickFolder()
+    if (!path) {
+      return
+    }
+    updateSettings({ floatingTerminalCwd: path })
+  }
 
   const visibleSections = [
     isWindows && matchesSettingsSearch(searchQuery, TERMINAL_WINDOWS_SHELL_SEARCH_ENTRY) ? (
@@ -113,17 +149,16 @@ export function TerminalPane({
         >
           <Label>Default Shell</Label>
           <div className="flex w-fit gap-1 rounded-md border border-border/50 p-1">
-            {(
-              [
-                { label: 'PowerShell', value: 'powershell.exe' },
-                { label: 'Command Prompt', value: 'cmd.exe' }
-              ] as const
-            ).map(({ label, value }) => (
+            {[
+              { label: 'PowerShell', value: 'powershell.exe' },
+              { label: 'Command Prompt', value: 'cmd.exe' },
+              ...(wslAvailable ? [{ label: 'WSL', value: 'wsl.exe' }] : [])
+            ].map(({ label, value }) => (
               <button
                 key={value}
                 onClick={() => updateSettings({ terminalWindowsShell: value })}
                 className={`rounded-sm px-3 py-1 text-sm transition-colors ${
-                  (settings.terminalWindowsShell ?? 'powershell.exe') === value
+                  windowsShell === value
                     ? 'bg-accent font-medium text-accent-foreground'
                     : 'text-muted-foreground hover:text-foreground'
                 }`}
@@ -135,6 +170,102 @@ export function TerminalPane({
           <p className="text-xs text-muted-foreground">
             Shell used when opening a new terminal pane. Takes effect for new terminals.
           </p>
+        </SearchableSetting>
+      </section>
+    ) : null,
+    matchesSettingsSearch(searchQuery, TERMINAL_FLOATING_SEARCH_ENTRIES) ? (
+      <section key="floating-terminal" className="space-y-4">
+        <div className="space-y-1">
+          <h3 className="text-sm font-semibold">Floating Terminal</h3>
+          <p className="text-xs text-muted-foreground">
+            Global floating terminal tabs outside any repo or worktree.
+          </p>
+        </div>
+
+        <SearchableSetting
+          title="Floating Terminal"
+          description="Enable the global floating terminal and choose where new tabs start."
+          keywords={['terminal', 'global', 'floating', 'quick terminal', 'launch directory']}
+          className="space-y-3"
+        >
+          <div className="flex items-center justify-between gap-4 px-1 py-2">
+            <div className="space-y-0.5">
+              <Label>Enable Floating Terminal</Label>
+              <p className="text-xs text-muted-foreground">
+                Shows the global terminal button and floating terminal panel.
+              </p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={settings.floatingTerminalEnabled}
+              onClick={() =>
+                updateSettings({
+                  floatingTerminalEnabled: !settings.floatingTerminalEnabled
+                })
+              }
+              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors ${
+                settings.floatingTerminalEnabled ? 'bg-foreground' : 'bg-muted-foreground/30'
+              }`}
+            >
+              <span
+                className={`pointer-events-none block size-3.5 rounded-full bg-background shadow-sm transition-transform ${
+                  settings.floatingTerminalEnabled ? 'translate-x-4' : 'translate-x-0.5'
+                }`}
+              />
+            </button>
+          </div>
+
+          <div className="space-y-2">
+            <Label>Default Directory</Label>
+            <div className="flex max-w-xl gap-2">
+              <Input
+                value={settings.floatingTerminalCwd || '~'}
+                onChange={(event) =>
+                  updateSettings({
+                    floatingTerminalCwd: event.target.value
+                  })
+                }
+                placeholder="~"
+                className="min-w-0 flex-1"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                aria-label="Choose floating terminal directory"
+                onClick={() => void pickFloatingTerminalDirectory()}
+              >
+                <FolderOpen className="size-4" />
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Takes effect for new Floating Terminal tabs. Use ~ for your home directory.
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            <Label>Toggle Button Location</Label>
+            <ToggleGroup
+              type="single"
+              value={settings.floatingTerminalTriggerLocation ?? 'floating-button'}
+              onValueChange={(value) => {
+                if (!value) {
+                  return
+                }
+                updateSettings({
+                  floatingTerminalTriggerLocation: value as FloatingTerminalTriggerLocation
+                })
+              }}
+              className="justify-start"
+            >
+              <ToggleGroupItem value="floating-button">Floating Button</ToggleGroupItem>
+              <ToggleGroupItem value="status-bar">Status Bar</ToggleGroupItem>
+            </ToggleGroup>
+            <p className="text-xs text-muted-foreground">
+              The keyboard shortcut works regardless of where the toggle is shown.
+            </p>
+          </div>
         </SearchableSetting>
       </section>
     ) : null,
@@ -311,6 +442,58 @@ export function TerminalPane({
         </SearchableSetting>
       </section>
     ) : null,
+    matchesSettingsSearch(searchQuery, TERMINAL_RENDERING_SEARCH_ENTRIES) ? (
+      <section key="rendering" className="space-y-4">
+        <div className="space-y-1">
+          <h3 className="text-sm font-semibold">Rendering</h3>
+          <p className="text-xs text-muted-foreground">
+            Terminal renderer behavior for live panes and new panes.
+          </p>
+        </div>
+
+        <SearchableSetting
+          title="GPU Acceleration"
+          description="Controls whether the terminal uses xterm.js WebGL rendering. Auto mirrors VS Code: try GPU and fall back to DOM if WebGL fails."
+          keywords={[
+            'terminal',
+            'gpu',
+            'acceleration',
+            'webgl',
+            'renderer',
+            'rendering',
+            'graphics',
+            'linux',
+            'vscode'
+          ]}
+          className="space-y-2"
+        >
+          <Label>GPU Acceleration</Label>
+          <div className="flex w-fit gap-1 rounded-md border border-border/50 p-1">
+            {(['auto', 'on', 'off'] as const).map((option) => (
+              <button
+                key={option}
+                type="button"
+                onClick={() => updateSettings({ terminalGpuAcceleration: option })}
+                className={`rounded-sm px-3 py-1 text-sm capitalize transition-colors ${
+                  (settings.terminalGpuAcceleration ?? 'auto') === option
+                    ? 'bg-accent font-medium text-accent-foreground'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                {option === 'auto' ? 'Auto' : option === 'on' ? 'On' : 'Off'}
+              </button>
+            ))}
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {settings.terminalGpuAcceleration === 'off'
+              ? 'WebGL is disabled; xterm uses the DOM renderer for maximum compatibility.'
+              : settings.terminalGpuAcceleration === 'on'
+                ? 'WebGL is always attempted for terminal panes.'
+                : 'Auto tries WebGL for performance and falls back to the DOM renderer if WebGL fails, matching VS Code.'}
+          </p>
+        </SearchableSetting>
+      </section>
+    ) : null,
     matchesSettingsSearch(searchQuery, TERMINAL_CURSOR_SEARCH_ENTRIES) ? (
       <section key="cursor" className="space-y-4">
         <div className="space-y-1">
@@ -375,6 +558,28 @@ export function TerminalPane({
                 }`}
               />
             </button>
+          </SearchableSetting>
+
+          <SearchableSetting
+            title="Cursor Opacity"
+            description="Opacity of the terminal cursor."
+            keywords={['terminal', 'cursor', 'opacity', 'transparency']}
+          >
+            <NumberField
+              label="Cursor Opacity"
+              description="Opacity of the terminal cursor."
+              value={settings.terminalCursorOpacity ?? 1}
+              defaultValue={1}
+              min={0}
+              max={1}
+              step={0.05}
+              suffix="0 to 1"
+              onChange={(value) =>
+                updateSettings({
+                  terminalCursorOpacity: clampNumber(value, 0, 1)
+                })
+              }
+            />
           </SearchableSetting>
         </div>
       </section>
@@ -597,6 +802,9 @@ export function TerminalPane({
         </SearchableSetting>
       </section>
     ) : null,
+    matchesSettingsSearch(searchQuery, TERMINAL_WINDOW_SEARCH_ENTRIES) ? (
+      <TerminalWindowSection key="window" settings={settings} updateSettings={updateSettings} />
+    ) : null,
     matchesSettingsSearch(searchQuery, TERMINAL_DARK_THEME_SEARCH_ENTRIES) ? (
       <DarkTerminalThemeSection
         key="dark-theme"
@@ -691,7 +899,15 @@ export function TerminalPane({
         </SearchableSetting>
       </section>
     ) : null,
+    matchesSettingsSearch(searchQuery, MANAGE_SESSIONS_SEARCH_ENTRIES) ? (
+      <ManageSessionsSection key="manage-sessions" />
+    ) : null,
     matchesSettingsSearch(searchQuery, TERMINAL_ADVANCED_SEARCH_ENTRIES) ||
+    (showWindowsPowerShellImplementation &&
+      matchesSettingsSearch(
+        searchQuery,
+        TERMINAL_WINDOWS_POWERSHELL_IMPLEMENTATION_SEARCH_ENTRY
+      )) ||
     (isMac && matchesSettingsSearch(searchQuery, TERMINAL_MAC_OPTION_SEARCH_ENTRIES)) ? (
       <section key="advanced" className="space-y-4">
         <div className="space-y-1">
@@ -763,6 +979,95 @@ export function TerminalPane({
           ) : null}
         </SearchableSetting>
 
+        <SearchableSetting
+          title="Word Separators"
+          description="Characters treated as word boundaries for double-click selection."
+          keywords={['word', 'separator', 'boundary', 'double-click', 'selection']}
+          className="space-y-2"
+        >
+          <Label>Word Separators</Label>
+          <Input
+            value={settings.terminalWordSeparator ?? ''}
+            onChange={(e) => {
+              const value = e.target.value
+              updateSettings({ terminalWordSeparator: value || undefined })
+            }}
+            placeholder={` ()[]{},'"\``}
+            className="max-w-sm"
+          />
+          <p className="text-xs text-muted-foreground">
+            Characters treated as word boundaries for double-click selection.
+          </p>
+        </SearchableSetting>
+        {showWindowsPowerShellImplementation &&
+        matchesSettingsSearch(
+          searchQuery,
+          TERMINAL_WINDOWS_POWERSHELL_IMPLEMENTATION_SEARCH_ENTRY
+        ) ? (
+          <SearchableSetting
+            title="PowerShell Version"
+            description="Choose whether the PowerShell shell option launches Windows PowerShell or PowerShell 7+ for new terminal panes."
+            keywords={[
+              'terminal',
+              'windows',
+              'powershell',
+              'pwsh',
+              'powershell 7',
+              'windows powershell',
+              'version',
+              'advanced'
+            ]}
+            className="space-y-2"
+          >
+            <Label>PowerShell Version</Label>
+            <div className="flex w-fit gap-1 rounded-md border border-border/50 p-1">
+              {[
+                { label: 'Auto', value: 'auto' },
+                { label: 'Windows PowerShell', value: 'powershell.exe' },
+                { label: 'PowerShell 7+', value: 'pwsh.exe', disabled: !pwshAvailable }
+              ].map(({ label, value, disabled }) => (
+                <button
+                  key={value}
+                  onClick={() => {
+                    if (disabled) {
+                      return
+                    }
+                    updateSettings({
+                      terminalWindowsPowerShellImplementation: value as
+                        | 'auto'
+                        | 'powershell.exe'
+                        | 'pwsh.exe'
+                    })
+                  }}
+                  aria-disabled={disabled ? 'true' : undefined}
+                  className={`rounded-sm px-3 py-1 text-sm transition-colors ${
+                    powerShellImplementation === value
+                      ? 'bg-accent font-medium text-accent-foreground'
+                      : disabled
+                        ? 'cursor-not-allowed text-muted-foreground/50'
+                        : 'text-muted-foreground hover:text-foreground'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {!pwshAvailable ? (
+              <p className="text-xs text-muted-foreground">
+                Auto uses Windows PowerShell now and switches to PowerShell 7+ when installed.{' '}
+                <a
+                  href="https://github.com/PowerShell/PowerShell/releases/latest"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline hover:text-foreground"
+                >
+                  Download PowerShell 7+
+                </a>
+                .
+              </p>
+            ) : null}
+          </SearchableSetting>
+        ) : null}
         {isMac ? (
           <SearchableSetting
             title="Option as Alt"
@@ -835,6 +1140,15 @@ export function TerminalPane({
           {section}
         </div>
       ))}
+      <GhosttyImportModal
+        open={ghostty.open}
+        onOpenChange={ghostty.handleOpenChange}
+        preview={ghostty.preview}
+        loading={ghostty.loading}
+        onApply={ghostty.handleApply}
+        applied={ghostty.applied}
+        applyError={ghostty.applyError}
+      />
     </div>
   )
 }

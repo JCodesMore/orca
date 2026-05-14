@@ -1,8 +1,47 @@
 /* eslint-disable max-lines */
-import type { SshTarget } from './ssh-types'
+import type { SshRemotePtyLease, SshTarget } from './ssh-types'
+import type { Automation, AutomationRun } from './automations-types'
+import type { WorkspaceSource } from './telemetry-events'
+import type { GitHubProjectSettings } from './github-project-types'
+
+// Re-exported for backward compat with renderer call sites that import
+// `WorkspaceCreateTelemetrySource` from '../../../shared/types'.
+export type { WorkspaceSource as WorkspaceCreateTelemetrySource } from './telemetry-events'
+
+// ─── Shell PATH hydration ────────────────────────────────────────────
+// Why: shared so the main-side `HydrationResult` discriminator and the
+// telemetry schema in `telemetry-events.ts` stay in lockstep without
+// `src/shared/` taking a forbidden import from `src/main/`. A compile-time
+// guard in telemetry-events.ts asserts the schema enum matches this alias —
+// adding a new failure mode without updating both places fails the build.
+export type ShellHydrationFailureReason =
+  | 'none'
+  | 'no_shell'
+  | 'timeout'
+  | 'spawn_error'
+  | 'empty_path'
+
+export type PathSource = 'shell_hydrate' | 'sync_seed_only'
 
 // ─── Repo ────────────────────────────────────────────────────────────
 export type RepoKind = 'git' | 'folder'
+
+/**
+ * Per-repo user choice for where issues are fetched and filed.
+ *
+ * Why three states, not two: storage must distinguish "user explicitly chose
+ * upstream" from "heuristic happens to resolve to upstream right now." Collapsing
+ * the two would let a remote-topology change (someone removes `upstream`, or
+ * adds one later) silently move the effective source — the exact silent-source-
+ * switch class the upstream-issue-source design rejects.
+ *
+ * - `'auto'` (or undefined): honor the heuristic in `getIssueOwnerRepo`
+ *   (upstream-if-exists, else origin). Initial state for every repo.
+ * - `'upstream'`: explicit upstream. Wins over heuristic and future topology
+ *   changes. Falls back to origin if `upstream` remote vanishes, with a toast.
+ * - `'origin'`: explicit origin. Same precedence.
+ */
+export type IssueSourcePreference = 'upstream' | 'origin' | 'auto'
 
 export type Repo = {
   id: string
@@ -16,10 +55,41 @@ export type Repo = {
   hookSettings?: RepoHookSettings
   /** SSH target ID for remote repos. null/undefined = local. */
   connectionId?: string | null
+  /** Per-repo override for issue-source resolution. `undefined` is treated
+   *  identically to `'auto'`; writers leave it undefined on creation so
+   *  existing persisted records stay forward-compatible. */
+  issueSourcePreference?: IssueSourcePreference
+  /** Paths (relative to the primary checkout) that should be symlinked into
+   *  newly created worktrees of this repo. Consumed only when the global
+   *  `experimentalWorktreeSymlinks` flag is on — the per-repo list is the
+   *  "what to link", the global flag is the "whether to link at all" switch.
+   *  Undefined/empty means no symlinks are created for this repo. */
+  symlinkPaths?: string[]
 }
 
 export type SetupRunPolicy = 'ask' | 'run-by-default' | 'skip-by-default'
 export type SetupDecision = 'inherit' | 'run' | 'skip'
+
+/**
+ * Envelope returned by the `repos:getBaseRefDefault` IPC handler.
+ *
+ * Why: declared in `shared/` rather than colocated with the handler so the
+ * preload bridge and renderer can import the same named type. Before this
+ * lived in `src/main/git/repo.ts` — the preload layer cannot import from
+ * `src/main/`, which forced three sites to inline the same structural shape
+ * and risk silent drift.
+ *
+ * Why `remoteCount`: BaseRefPicker renders a multi-remote hint when the repo
+ * has more than one configured remote; piggybacking the count on this IPC
+ * avoids a second round-trip.
+ *
+ * Why `defaultBaseRef` (not `default`): `default` is a reserved word and is
+ * awkward to destructure.
+ */
+export type BaseRefDefaultResult = {
+  defaultBaseRef: string | null
+  remoteCount: number
+}
 
 // ─── Worktree (git-level) ────────────────────────────────────────────
 export type GitWorktreeInfo = {
@@ -27,6 +97,7 @@ export type GitWorktreeInfo = {
   head: string
   branch: string
   isBare: boolean
+  isSparse?: boolean
   /** True for the repo's main working tree (the first entry from `git worktree list`).
    *  Linked worktrees created via `git worktree add` have this set to false. */
   isMainWorktree: boolean
@@ -46,8 +117,32 @@ export type Worktree = {
   isPinned: boolean
   sortOrder: number
   lastActivityAt: number
+  /** Set once when Orca creates the worktree. Absent for worktrees discovered
+   *  on disk or persisted before this field existed. Used by the sidebar to
+   *  grant newly-created worktrees a short grace window at the top of Recent,
+   *  immune to ambient PTY-bump reordering in other worktrees. */
+  createdAt?: number
+  /** Agent selected when Orca originally created the worktree. Used only to
+   *  seed a replacement terminal if the user later reopens the worktree after
+   *  closing every visible surface. */
+  createdWithAgent?: TuiAgent
+  sparseDirectories?: string[]
+  sparseBaseRef?: string
+  /** ID of the saved preset this worktree was created from, if any. Cleared
+   *  when the worktree is no longer sparse on refresh. */
+  sparsePresetId?: string
+  /** Intended create base for stale-base probes. Persisted metadata, not UI drift state. */
+  baseRef?: string
+  /** Remote/branch Orca should publish review commits to when it created this worktree. */
+  pushTarget?: GitPushTarget
   diffComments?: DiffComment[]
 } & GitWorktreeInfo
+
+export type GitPushTarget = {
+  remoteName: string
+  branchName: string
+  remoteUrl?: string
+}
 
 // ─── Worktree metadata (persisted user-authored fields only) ─────────
 export type WorktreeMeta = {
@@ -61,6 +156,17 @@ export type WorktreeMeta = {
   isPinned: boolean
   sortOrder: number
   lastActivityAt: number
+  /** See {@link Worktree.createdAt}. Persisted to orca-data.json. */
+  createdAt?: number
+  /** See {@link Worktree.createdWithAgent}. Persisted to orca-data.json. */
+  createdWithAgent?: TuiAgent
+  sparseDirectories?: string[]
+  sparseBaseRef?: string
+  sparsePresetId?: string
+  /** Intended create base for stale-base probes. Persisted metadata, not UI drift state. */
+  baseRef?: string
+  /** See {@link Worktree.pushTarget}. Persisted so refreshed worktree lists keep the target. */
+  pushTarget?: GitPushTarget
   diffComments?: DiffComment[]
 }
 
@@ -144,6 +250,21 @@ export type TerminalTab = {
   createdAt: number
   /** Bumped on shutdown so TerminalPane remounts with a fresh PTY. */
   generation?: number
+  /** Why: records the shell this tab was explicitly opened with (e.g. 'wsl.exe'
+   *  from the "+" submenu) so the PTY can re-use the same shell on reconnect
+   *  without needing the user to interact with the tab again. Undefined means
+   *  "use the default shell setting". */
+  shellOverride?: string
+  /** Why: when `setActiveWorktree` bumps generation on all-dead tabs to drive a
+   *  TerminalPane remount, the fresh PTY that results is caused by navigation,
+   *  not by the user doing work. Without this flag the resulting
+   *  `updateTabPtyId` call would call `bumpWorktreeActivity` and flip the
+   *  sidebar's recency sort on every click — the reorder-on-click bug. The
+   *  flag is set by `setActiveWorktree` and consumed (cleared) by the first
+   *  `updateTabPtyId` that follows, which then suppresses the activity bump
+   *  and the `sortEpoch` increment. Never persisted — it is a transient
+   *  handoff between the two calls. */
+  pendingActivationSpawn?: boolean
 }
 
 export type BrowserHistoryEntry = {
@@ -160,6 +281,24 @@ export type BrowserLoadError = {
   validatedUrl: string
 }
 
+// Why: BrowserPage persists the active viewport preset so CDP emulation can be
+// reapplied on reload/navigation without the user re-picking from the toolbar.
+export type BrowserViewportPresetId =
+  | 'mobile-s'
+  | 'mobile-m'
+  | 'mobile-l'
+  | 'tablet'
+  | 'laptop'
+  | 'laptop-l'
+  | 'desktop'
+
+export type BrowserViewportOverride = {
+  width: number
+  height: number
+  deviceScaleFactor: number
+  mobile: boolean
+}
+
 export type BrowserPage = {
   id: string
   workspaceId: string
@@ -172,6 +311,8 @@ export type BrowserPage = {
   canGoForward: boolean
   loadError: BrowserLoadError | null
   createdAt: number
+  /** Active CDP viewport emulation preset. null = default (fill pane, no CDP override) */
+  viewportPresetId?: BrowserViewportPresetId | null
 }
 
 export type BrowserWorkspace = {
@@ -317,6 +458,13 @@ export type WorkspaceSessionState = {
    *  shutdown from renderer state so remote PTYs can be reattached via
    *  the relay's pty.attach RPC on startup. */
   remoteSessionIdsByTabId?: Record<string, string>
+  /** Per-worktree focus-recency timestamps used by the Cmd+J empty-query
+   *  ordering. Separate from worktree.lastActivityAt (background signal)
+   *  and worktreeNavHistory (Back/Forward stack). See
+   *  docs/cmd-j-empty-query-ordering.md. Absent in sessions written by
+   *  older builds — hydration tolerates missing/partial maps and the
+   *  active worktree is seeded on first restore. */
+  lastVisitedAtByWorktreeId?: Record<string, number>
 }
 
 // ─── GitHub ──────────────────────────────────────────────────────────
@@ -363,6 +511,21 @@ export type PRCheckDetail = {
   url: string | null
 }
 
+export type GitHubReactionContent =
+  | '+1'
+  | '-1'
+  | 'laugh'
+  | 'confused'
+  | 'heart'
+  | 'hooray'
+  | 'rocket'
+  | 'eyes'
+
+export type GitHubReaction = {
+  content: GitHubReactionContent
+  count: number
+}
+
 export type PRComment = {
   id: number
   author: string
@@ -370,6 +533,7 @@ export type PRComment = {
   body: string
   createdAt: string
   url: string
+  reactions?: GitHubReaction[]
   /** File path for inline review comments (absent for top-level conversation comments). */
   path?: string
   /** GraphQL node ID of the review thread — present only for inline review comments.
@@ -389,6 +553,8 @@ export type PRComment = {
   isBot?: boolean
 }
 
+export type GitHubCommentResult = { ok: true; comment: PRComment } | { ok: false; error: string }
+
 export type IssueInfo = {
   number: number
   title: string
@@ -400,6 +566,12 @@ export type IssueInfo = {
 export type GitHubViewer = {
   login: string
   email: string | null
+}
+
+export type GitHubAssignableUser = {
+  login: string
+  name: string | null
+  avatarUrl: string
 }
 
 export type GitHubWorkItem = {
@@ -415,8 +587,8 @@ export type GitHubWorkItem = {
   branchName?: string
   baseRefName?: string
   // Why: true when a PR's head lives on a fork (headRepositoryOwner !== selected repo owner).
-  // The Start-from picker disables fork PRs in v1 because the create flow cannot
-  // safely resolve a fork head from headRefName alone.
+  // The Start-from picker passes this to resolvePrBase so fork heads use
+  // refs/pull/<N>/head for creation and a separate PR-head push target.
   isCrossRepository?: boolean
   /** Why: required because the cross-repo view merges items from every selected
    *  repo — the table row's repo pill and the "open in browser" fallback need
@@ -442,6 +614,16 @@ export type GitHubPRFileContents = {
   modifiedIsBinary: boolean
 }
 
+export type GitHubPRReviewCommentInput = {
+  repoPath: string
+  prNumber: number
+  commitId: string
+  path: string
+  line: number
+  startLine?: number
+  body: string
+}
+
 export type GitHubWorkItemDetails = {
   // Why: main-process doesn't know Orca's Repo.id, so this inner item omits
   // repoId. The renderer stamps it when routing the details through the store.
@@ -453,6 +635,7 @@ export type GitHubWorkItemDetails = {
   baseSha?: string
   checks?: PRCheckDetail[]
   files?: GitHubPRFile[]
+  participants?: GitHubAssignableUser[]
   /** Logins of current assignees. Only set for issues. */
   assignees?: string[]
 }
@@ -511,6 +694,11 @@ export type LinearComment = {
 export type GitHubIssueUpdate = {
   state?: 'open' | 'closed'
   title?: string
+  // Why: body writes are driven by the Project-mode slug-addressed path
+  // (`updateIssueBySlug`) because `gh issue edit` does not consistently
+  // cover every body-edit case the dialog needs; the repoPath-based
+  // `updateIssue` flow keeps ignoring `body` for backward compatibility.
+  body?: string
   addLabels?: string[]
   removeLabels?: string[]
   addAssignees?: string[]
@@ -529,11 +717,84 @@ export type ClassifiedError = {
   type:
     | 'permission_denied'
     | 'not_found'
+    | 'issues_disabled'
     | 'validation_error'
     | 'rate_limited'
     | 'network_error'
     | 'unknown'
   message: string
+}
+
+// Why: declared here as a shared shape so IPC return envelopes and renderer
+// slices can reference the same structural type without importing from main.
+// Aliased as `OwnerRepo` in `src/main/github/gh-utils.ts` so main call sites
+// can continue using the short local name.
+export type GitHubOwnerRepo = { owner: string; repo: string }
+
+/**
+ * GitHub API rate-limit buckets surfaced in the TaskPage header so users can
+ * see remaining budget before they hit the wall. `core` = REST (5000/hr),
+ * `search` = Search API (30/min — hit by countWorkItems), `graphql` =
+ * GraphQL (5000 points/hr — hit by project-view + discovery). All three are
+ * the buckets this app actually stresses; other buckets (e.g. code_search)
+ * are not surfaced because we don't touch them.
+ */
+export type GitHubRateLimitBucket = {
+  remaining: number
+  limit: number
+  /** Unix epoch seconds when the window resets. */
+  resetAt: number
+}
+
+export type GitHubRateLimitSnapshot = {
+  core: GitHubRateLimitBucket
+  search: GitHubRateLimitBucket
+  graphql: GitHubRateLimitBucket
+  /** Unix epoch ms the snapshot was produced (for "fetched Xs ago" copy). */
+  fetchedAt: number
+}
+
+export type GetRateLimitResult =
+  | { ok: true; snapshot: GitHubRateLimitSnapshot }
+  | { ok: false; error: string }
+
+/**
+ * Envelope for `gh:listWorkItems`. Carries resolved issue/PR sources so the
+ * renderer can render the "Issues from owner/repo" indicator without an
+ * extra IPC round-trip, and per-source classified errors so the UI can show
+ * a retryable banner when (e.g.) a private upstream 403s.
+ *
+ * Why piggyback instead of adding `gh:resolveWorkItemSources`: the renderer
+ * already round-trips this endpoint on every Tasks refresh, and the source
+ * data is a 2-field-per-side metadata add — cheaper than another IPC call.
+ *
+ * Invariant: `items` always contains whatever succeeded; `errors.issues` indicates
+ * the issues-side fetch failed, but any PR-side items that succeeded are still
+ * present in `items`. Consumers should render `items` alongside the error banner.
+ */
+export type ListWorkItemsResult<T> = {
+  items: T[]
+  sources: {
+    issues: GitHubOwnerRepo | null
+    prs: GitHubOwnerRepo | null
+    /** Raw `upstream` remote resolved for this repo, independent of the
+     *  user's preference. Present so the renderer's issue-source selector
+     *  can always decide whether to render (upstream exists & differs from
+     *  origin) and show both slugs in its tooltips, even when the user has
+     *  picked 'origin' and `sources.issues` has collapsed onto origin. */
+    upstreamCandidate: GitHubOwnerRepo | null
+  }
+  errors?: {
+    issues?: ClassifiedError
+  }
+  /** True when the user's per-repo preference was `'upstream'` but no upstream
+   *  remote is configured, so the resolver fell back to origin. Renderer uses
+   *  this to surface a one-time-per-session toast. Omitted when absent so
+   *  existing consumers and test fixtures don't care about it.
+   *  Typed as `?: true` (not `?: boolean`) to encode the invariant "present
+   *  iff fell-back" — an explicit `false` write would be a bug, so make it a
+   *  compile error. */
+  issueSourceFellBack?: true
 }
 
 export type LinearWorkflowState = {
@@ -588,16 +849,83 @@ export type WorktreeSetupLaunch = {
   envVars: Record<string, string>
 }
 
+export type WorktreeStartupLaunch = {
+  command: string
+  env?: Record<string, string>
+}
+
+export type CreateSparseCheckoutRequest = {
+  directories: string[]
+  /** Set when the directories came from a saved preset and the user did not
+   *  modify them — recorded on WorktreeMeta so the worktree can show "from
+   *  preset X" later. Cleared if the user edited the textarea. */
+  presetId?: string
+}
+
+/** A reusable per-repo sparse directory list. Saved by the user from the
+ *  composer; surfaced again the next time they create a worktree in the same
+ *  repo. The MVP scope (no preset) is `presetId === undefined`. */
+export type SparsePreset = {
+  id: string
+  repoId: string
+  name: string
+  directories: string[]
+  createdAt: number
+  updatedAt: number
+}
+
 export type CreateWorktreeArgs = {
   repoId: string
   name: string
+  /** Optional user-facing label to persist separately from the git-safe
+   *  branch/path seed. Used when a workspace is created from a GitHub or
+   *  Linear artifact whose title should remain readable in the sidebar. */
+  displayName?: string
   baseBranch?: string
   setupDecision?: SetupDecision
+  sparseCheckout?: CreateSparseCheckoutRequest
+  linkedIssue?: number
+  linkedPR?: number
+  pushTarget?: GitPushTarget
+  /** Agent selected in the create surface. Omitted for blank-shell creates. */
+  createdWithAgent?: TuiAgent
+  /** Telemetry-only: which UI surface initiated this create. Threaded from
+   *  the renderer entry point so main can emit `workspace_created` with the
+   *  correct `source`. `unknown` is a valid wire value — an unrecognized
+   *  surface emits `source: 'unknown'` rather than dropping the event, so
+   *  dashboards surface enum-coverage gaps as a slice rather than as
+   *  missing data. Optional on the type so older renderer code paths that
+   *  pre-date this prop default to `unknown` at the IPC boundary instead
+   *  of failing typecheck. */
+  telemetrySource?: WorkspaceSource
 }
 
 export type CreateWorktreeResult = {
   worktree: Worktree
   setup?: WorktreeSetupLaunch
+  warning?: string
+  initialBaseStatus?: WorktreeBaseStatusEvent
+}
+
+export type WorktreeBaseStatusKind = 'checking' | 'current' | 'drift' | 'base_changed' | 'unknown'
+
+export type WorktreeBaseStatusEvent = {
+  repoId: string
+  worktreeId: string
+  status: WorktreeBaseStatusKind
+  base: string
+  /** Configured remote name parsed from `base` (longest-prefix match). Absent
+   *  when classification skipped optimistic reconcile (e.g. legacy fallback). */
+  remote?: string
+  behind?: number
+  recentSubjects?: string[]
+}
+
+export type WorktreeRemoteBranchConflictEvent = {
+  repoId: string
+  worktreeId: string
+  remote: string
+  branchName: string
 }
 
 // ─── Updater ─────────────────────────────────────────────────────────
@@ -646,6 +974,7 @@ export type NotificationSettings = {
   agentTaskComplete: boolean
   terminalBell: boolean
   suppressWhenFocused: boolean
+  customSoundPath: string | null
 }
 
 export type CodexManagedAccount = {
@@ -709,6 +1038,7 @@ export type ClaudeRateLimitAccountsState = {
 export type TuiAgent =
   | 'claude' // Claude Code
   | 'codex' // OpenAI Codex
+  | 'autohand' // Autohand Code CLI
   | 'opencode' // OpenCode
   | 'pi' // Pi (pi.dev)
   | 'gemini' // Gemini CLI
@@ -742,6 +1072,39 @@ export type SetupScriptLaunchMode = 'split-vertical' | 'split-horizontal' | 'new
 /** Direction used when the setup script launch mode is a split. */
 export type SetupSplitDirection = 'vertical' | 'horizontal'
 
+export type TerminalColorOverrides = {
+  foreground?: string
+  background?: string
+  cursor?: string
+  cursorAccent?: string
+  selectionBackground?: string
+  selectionForeground?: string
+  black?: string
+  red?: string
+  green?: string
+  yellow?: string
+  blue?: string
+  magenta?: string
+  cyan?: string
+  white?: string
+  brightBlack?: string
+  brightRed?: string
+  brightGreen?: string
+  brightYellow?: string
+  brightBlue?: string
+  brightMagenta?: string
+  brightCyan?: string
+  brightWhite?: string
+  // Why: xterm.js ITheme does not expose a `bold` key, but Ghostty users
+  // expect the setting to be preserved so a future renderer CSS override
+  // or xterm upgrade can honour it without a migration.
+  bold?: string
+}
+
+export type FloatingTerminalCwdRequest = {
+  path?: string
+}
+
 export type GlobalSettings = {
   workspaceDir: string
   nestWorkspaces: boolean
@@ -750,12 +1113,19 @@ export type GlobalSettings = {
   branchPrefixCustom: string
   enableGitHubAttribution: boolean
   theme: 'system' | 'dark' | 'light'
+  appFontFamily: string
   editorAutoSave: boolean
   editorAutoSaveDelayMs: number
+  editorMinimapEnabled: boolean
   terminalFontSize: number
   terminalFontFamily: string
   terminalFontWeight: number
   terminalLineHeight: number
+  /** Mirrors VS Code's terminal.integrated.gpuAcceleration shape.
+   *  - 'auto': try xterm WebGL and fall back to DOM if the renderer fails.
+   *  - 'on': always try xterm WebGL.
+   *  - 'off': keep terminal rendering on xterm's DOM renderer. */
+  terminalGpuAcceleration: 'auto' | 'on' | 'off'
   /** Whether to enable programming-ligatures rendering via
    *  `@xterm/addon-ligatures`.
    *  - `'auto'` (default): enabled only when the configured font is known to
@@ -776,6 +1146,14 @@ export type GlobalSettings = {
   terminalActivePaneOpacity: number
   terminalPaneOpacityTransitionMs: number
   terminalDividerThicknessPx: number
+  terminalBackgroundOpacity?: number
+  terminalColorOverrides?: TerminalColorOverrides
+  terminalPaddingX?: number
+  terminalPaddingY?: number
+  terminalMouseHideWhileTyping?: boolean
+  terminalWordSeparator?: string
+  terminalCursorOpacity?: number
+  windowBackgroundBlur?: boolean
   /** Why: Windows terminals conventionally use right-click as a paste gesture.
    *  The setting stays Windows-only so macOS/Linux keep their existing context
    *  menu behavior and users can still reach the menu with Ctrl+right-click. */
@@ -785,6 +1163,9 @@ export type GlobalSettings = {
    *  user's preferred shell. Defaults to 'powershell.exe' which is the
    *  modern choice for an IDE context. Only consulted on Windows. */
   terminalWindowsShell: string
+  /** Why: "PowerShell" is the product-facing shell family. Auto resolves to
+   *  PowerShell 7+ when present and falls back to inbox Windows PowerShell. */
+  terminalWindowsPowerShellImplementation: 'auto' | 'powershell.exe' | 'pwsh.exe'
   terminalFocusFollowsMouse: boolean
   /** Why: mirrors X11 / gnome-terminal "copy on select" UX — making a terminal
    *  selection copies it to the system clipboard automatically, so users can
@@ -809,11 +1190,25 @@ export type GlobalSettings = {
    *  until the user explicitly wants worktree-scoped in-app browsing. */
   openLinksInApp: boolean
   rightSidebarOpenByDefault: boolean
-  /** Whether to show the live agent activity count badge in the titlebar. */
-  showTitlebarAgentActivity: boolean
-  /** Why: the Tasks sidebar label can be kept cleaner for users who do not
-   *  actively use the GitHub/Linear integrations behind it. */
-  showTaskProviderIcons: boolean
+  /** Whether to show the Orca app name in the titlebar. */
+  showTitlebarAppName: boolean
+  /** Why: some users do not use the Tasks feature and prefer to keep the
+   *  left sidebar free of its button entirely. Hiding the button here also
+   *  removes it from keyboard navigation. */
+  showTasksButton: boolean
+  /** Why: Floating Terminal is the default global shell surface so users can
+   *  reach a terminal outside repo/worktree context immediately. */
+  floatingTerminalEnabled: boolean
+  /** One-shot migration flag for the default-on rollout. Before this field
+   *  landed, the floating terminal defaulted off and many profiles persisted
+   *  that inherited false. Once migrated, an explicit off choice sticks. */
+  floatingTerminalDefaultedForAllUsers?: boolean
+  /** Where new Floating Terminal tabs start. Defaults to '~' so the visible
+   *  setting matches the shell-oriented directory users expect. */
+  floatingTerminalCwd: string
+  /** Where the Floating Terminal toggle is shown. Defaults to the floating
+   *  button for discoverability. */
+  floatingTerminalTriggerLocation: FloatingTerminalTriggerLocation
   diffDefaultView: 'inline' | 'side-by-side'
   notifications: NotificationSettings
   /** When true, a countdown timer is shown after a Claude agent becomes idle,
@@ -825,9 +1220,9 @@ export type GlobalSettings = {
   promptCacheTtlMs: number
   /** Why: Codex rate-limit account routing is a durable app preference owned by
    *  the main process, not transient UI state. Persisting the selected managed
-   *  homes here lets Orca resolve the correct `CODEX_HOME` before the renderer
-   *  hydrates, while keeping this scope explicitly separate from Codex usage
-   *  analytics and external terminal sessions. */
+   *  auth here lets Orca prepare shared ~/.codex before the renderer hydrates,
+   *  while keeping this scope explicitly separate from Codex usage analytics
+   *  and external terminal sessions. */
   codexManagedAccounts: CodexManagedAccount[]
   activeCodexManagedAccountId: string | null
   /** Why: Claude Code keeps conversations under one shared config root. Orca
@@ -850,6 +1245,10 @@ export type GlobalSettings = {
    *  again" checkbox inside it or from the General settings pane. We keep this
    *  defaulted to false so first-time behavior stays safe. */
   skipDeleteWorktreeConfirm: boolean
+  /** Why: deleting an automation also deletes its run history. Keep this
+   *  separate from worktree deletion so skipping one destructive confirmation
+   *  does not silently skip the other. */
+  skipDeleteAutomationConfirm: boolean
   /** Default preset in the new-workspace GitHub task view. */
   defaultTaskViewPreset: TaskViewPresetId
   /** Why: persists the user's last-used task source so the Tasks page
@@ -866,6 +1265,14 @@ export type GlobalSettings = {
    *  Same nullable-array pattern as `defaultRepoSelection`: `null` = sticky-all,
    *  `string[]` = frozen subset of team IDs. */
   defaultLinearTeamSelection: string[] | null
+  /** Session cookie for OpenCode Go rate-limit fetching. Stored encrypted. */
+  opencodeSessionCookie: string
+  /** Optional workspace ID override for OpenCode Go. When set, skips the
+   *  workspaces lookup and fetches usage directly for this workspace. */
+  opencodeWorkspaceId: string
+  /** Whether to extract OAuth credentials from the local Gemini CLI installation
+   *  for rate-limit fetching. Disabled by default for explicit opt-in. */
+  geminiCliOAuthEnabled: boolean
   /** Per-agent CLI command overrides. A missing key means use the catalog default binary name. */
   agentCmdOverrides: Partial<Record<TuiAgent, string>>
   /** Why: macOS terminals must choose between letting Option compose layout
@@ -888,17 +1295,80 @@ export type GlobalSettings = {
    *  detection, so no visible behavior change. Then we flip this flag to true
    *  and never migrate again. */
   terminalMacOptionAsAltMigrated: boolean
-  /** Experimental: persist terminal sessions across app restarts via an
-   *  out-of-process daemon (src/main/daemon/**). Opt-in because the daemon
-   *  protocol is still stabilizing — some sessions have been observed to go
-   *  unresponsive after internal state drift. Disabled sessions fall back to
-   *  the in-process LocalPtyProvider. Requires an app restart to apply. */
-  experimentalTerminalDaemon: boolean
-  /** One-shot flag for the "persistent sessions are now opt-in" transition
-   *  toast shown to users upgrading from v1.3.0 (where the daemon was on by
-   *  default). Set to true the first time the toast fires so it never repeats. */
-  experimentalTerminalDaemonNoticeShown: boolean
+  experimentalMobile: boolean
+  /** Auto-restore window for a phone-fit PTY after the last mobile
+   *  subscriber leaves. `null` (default) holds the PTY at phone size
+   *  indefinitely; the desktop "Restore" banner remains the explicit
+   *  return-to-desktop-size action. A finite millisecond value schedules
+   *  an automatic restore that long after the last unsubscribe. Clamped
+   *  on read into [5_000ms, 60min] to defend against bad config.
+   *  See docs/mobile-fit-hold.md. */
+  mobileAutoRestoreFitMs: number | null
+  /** Experimental: floating animated pet (claude.webp) in the bottom-right
+   *  corner. Opt-in because it's a cosmetic joke feature; users who leave it
+   *  off never mount the overlay. Toggling takes effect immediately in the
+   *  current session (no relaunch) because it is purely renderer-side. */
+  experimentalPet: boolean
+  /** Legacy persisted key from before the sidekick -> pet rename. Read only
+   *  during migration; new writes use experimentalPet. */
+  experimentalSidekick?: boolean
+  /** Legacy persisted flag from when Activity was experimental. Activity is
+   *  now default-on and this no longer gates the page. */
+  experimentalActivity: boolean
+  /** Experimental: when creating a worktree, automatically symlink a
+   *  user-configured set of files/folders from the primary checkout (e.g.
+   *  `.env`, `node_modules`) into the new worktree. Opt-in while the
+   *  configuration surface and edge cases (conflicts with existing paths,
+   *  cleanup on worktree delete) are still being worked out. */
+  experimentalWorktreeSymlinks: boolean
+  /** GitHub Project mode state — pinned/recent/active project, last selected
+   *  view per project. Optional because profiles created before this feature
+   *  landed won't have the key; `getDefaultSettings()` hydrates the empty
+   *  default via the persistence merge. */
+  githubProjects?: GitHubProjectSettings
+  /** Anonymous product-telemetry state. Optional because the one-shot
+   *  migration in `Store.load()` is what populates it on first boot of the
+   *  telemetry release; before migration runs, the field is absent. After
+   *  migration every user has `installId` set and `optedIn` is `true` (new
+   *  users) or `null` (existing users awaiting the first-launch banner).
+   *
+   *  Why this block carries only consent + identity state, not volatile
+   *  counters: DAU and crash attribution are both out of v1 scope
+   *  (daily_active_user is derived server-side from app_opened; crashes are
+   *  handled by a separate crash-reporting lane, not product telemetry). So
+   *  there is no lastActiveDate, no lastSessionId, and no heartbeat
+   *  timestamp here — adding any of those would amplify the debounced
+   *  settings write on a fast cadence and couple user preferences to
+   *  volatile telemetry counters. Keep this surface to values that only
+   *  change on explicit consent transitions. */
+  telemetry?: {
+    /** New users: initialized to `true` at install.
+     *  Existing users: `null` until they resolve the first-launch banner. */
+    optedIn: boolean | null
+    /** Anonymous UUID v4. Generated on first run. Stable across launches; not surfaced in the UI. */
+    installId: string
+    /** Cohort marker set once during migration. True for users with a
+     *  pre-existing profile (gates the existing-user opt-in banner);
+     *  false for fresh installs (no first-launch surface). */
+    existedBeforeTelemetryRelease: boolean
+  }
 }
+
+export type GhosttyImportPreview = {
+  found: boolean
+  configPath?: string
+  diff: Partial<GlobalSettings>
+  unsupportedKeys: string[]
+  error?: string
+}
+
+// Subset of the renderer's onboarding-step Ghostty `DiscoveryState['status']`
+// values that ever ship a telemetry event. The UI-only states (`'idle'`,
+// `'detecting'`) never fire `onboarding_ghostty_discovered`. Lives in
+// `shared/` because the schema in `telemetry-events.ts` (node-tsconfig) and
+// `ThemeStep.tsx` (web-tsconfig) both need it for the compile-time
+// schema-vs-renderer enum sync guard.
+export type DiscoveryStatusEmitted = 'found' | 'absent' | 'imported'
 
 export type NotificationEventSource = 'agent-task-complete' | 'terminal-bell' | 'test'
 
@@ -917,9 +1387,94 @@ export type NotificationDispatchResult = {
   reason?: 'disabled' | 'source-disabled' | 'suppressed-focus' | 'cooldown' | 'not-supported'
 }
 
-export type WorktreeCardProperty = 'status' | 'unread' | 'ci' | 'issue' | 'pr' | 'comment'
+export type NotificationSoundResult = {
+  played: boolean
+  reason?:
+    | 'missing-path'
+    | 'invalid-path'
+    | 'unsupported-type'
+    | 'too-large'
+    | 'read-failed'
+    | 'playback-failed'
+    | 'deduped'
+}
 
-export type StatusBarItem = 'claude' | 'codex' | 'ssh' | 'sessions'
+export type NotificationSoundDataResult =
+  | {
+      ok: true
+      data: Uint8Array
+      mimeType: string
+      path: string
+    }
+  | {
+      ok: false
+      reason: Exclude<NotificationSoundResult['reason'], 'playback-failed'>
+    }
+
+export type NotificationSoundPathResult =
+  | { ok: true; path: string }
+  | { ok: false; reason: 'missing-path' | 'invalid-path' | 'unsupported-type' }
+
+export type OnboardingOutcome = 'completed' | 'dismissed'
+
+export type OnboardingChecklistState = {
+  addedRepo: boolean
+  choseAgent: boolean
+  ranFirstAgent: boolean
+  ranSecondAgentOnSameTask: boolean
+  triedCmdJ: boolean
+  shapedSidebar: boolean
+  reviewedDiff: boolean
+  openedPr: boolean
+  addedFolder: boolean
+  openedFile: boolean
+  ranAgentOnFile: boolean
+  // Why: UI state flag (panel visibility), not an activation event. The
+  // telemetry checklist enum in telemetry-events.ts intentionally omits this.
+  dismissed: boolean
+}
+
+export type OnboardingState = {
+  closedAt: number | null
+  outcome: OnboardingOutcome | null
+  // Sentinel `-1` = not started; `1..4` = highest wizard step the user
+  // finished. Kept as `number` (not a literal union) because callers clamp
+  // via `Math.max`/`Math.min` against arbitrary numerics.
+  lastCompletedStep: number
+  checklist: OnboardingChecklistState
+}
+
+export type NotificationPermissionStatusResult = {
+  supported: boolean
+  platform: NodeJS.Platform
+  requested: boolean
+}
+
+export type WorktreeCardProperty =
+  | 'status'
+  | 'unread'
+  | 'ci'
+  | 'issue'
+  | 'pr'
+  | 'comment'
+  // Why: inline list of agent activity rendered directly inside each
+  // workspace card when the experimental agent-activity feature is on. On by
+  // default (see DEFAULT_WORKTREE_CARD_PROPERTIES in shared/constants.ts) —
+  // live agent activity is the primary reason users opt into the feature.
+  // Users who prefer a compact sidebar can uncheck it from the Workspaces
+  // view options.
+  | 'inline-agents'
+
+export type StatusBarItem = 'claude' | 'codex' | 'gemini' | 'opencode-go' | 'ssh' | 'resource-usage'
+export type FloatingTerminalTriggerLocation = 'floating-button' | 'status-bar'
+
+export type TaskResumeState = {
+  githubMode?: 'items' | 'project'
+  githubItemsPreset?: TaskViewPresetId | null
+  githubItemsQuery?: string
+  linearPreset?: 'assigned' | 'created' | 'all' | 'completed'
+  linearQuery?: string
+}
 
 export type PersistedUIState = {
   lastActiveRepoId: string | null
@@ -929,6 +1484,12 @@ export type PersistedUIState = {
   groupBy: 'none' | 'repo' | 'pr-status'
   sortBy: 'name' | 'smart' | 'recent' | 'repo'
   showActiveOnly: boolean
+  /** Hide the repo's original checked-out branch from workspace navigation
+   *  (sidebar and Cmd+J jump palette). Folder-mode repos are unaffected —
+   *  the predicate in visible-worktrees.ts excludes worktrees with an empty
+   *  branch. Lives alongside showActiveOnly because both are user-facing
+   *  sidebar filters reached through the same dropdown. */
+  hideDefaultBranchWorkspace: boolean
   filterRepoIds: string[]
   collapsedGroups: string[]
   uiZoomLevel: number
@@ -947,10 +1508,20 @@ export type PersistedUIState = {
   /** Once the user has seen the "your sessions won't be interrupted"
    *  reassurance card, we never show it again. */
   updateReassuranceSeen?: boolean
+  /** Per-paneKey "user has visited this row" timestamps, used by the inline
+   *  agents list to mute rows the user has already seen. Persisted because
+   *  agent rows themselves now survive restart; without persisting acks too,
+   *  rows you'd already clicked come back bold on relaunch. Stale entries
+   *  keyed on dead panes are inert: a future paneKey reuse stamps a fresh
+   *  stateStartedAt that beats the old ack via the existing comparison in
+   *  WorktreeCardAgents. Renderer-owned, written through ui:set. */
+  acknowledgedAgentsByPaneKey?: Record<string, number>
   /** URL to navigate to when a new browser tab is opened. Null means blank tab.
    *  Phase 3 will expand this to a full BrowserSessionProfile per workspace. */
   browserDefaultUrl?: string | null
-  browserDefaultSearchEngine?: 'google' | 'duckduckgo' | 'bing' | null
+  browserDefaultSearchEngine?: 'google' | 'duckduckgo' | 'bing' | 'kagi' | null
+  /** Optional Kagi private-session link used only when Kagi is the search engine. */
+  browserKagiSessionLink?: string | null
   /** Saved window bounds so the app restores to the user's last position/size
    *  instead of maximizing on every launch. */
   windowBounds?: { x: number; y: number; width: number; height: number } | null
@@ -962,6 +1533,23 @@ export type PersistedUIState = {
    *  migration never re-fires — allowing users to intentionally select the
    *  new 'recent' (last-activity) sort without it being clobbered on restart. */
   _sortBySmartMigrated?: boolean
+  /** LEGACY one-shot flag from the experimental-toggle era of the inline
+   *  agents feature. It was stamped unconditionally on every successful
+   *  load() in prior builds (regardless of whether the experiment was on),
+   *  so it cannot be used to detect "already migrated under the new
+   *  default-on rules" — every prior-RC user already has it set to true on
+   *  disk. Kept persisted for forward-compat with rollback to a pre-default-on
+   *  build that still reads it; the actual migration gate is now
+   *  `_inlineAgentsDefaultedForAllUsers` below. */
+  _inlineAgentsDefaultedForExperiment?: boolean
+  /** One-shot migration flag for the default-on rollout of the inline
+   *  agents feature. Set once on first load after upgrade once the
+   *  'inline-agents' card property has been ensured in
+   *  `worktreeCardProperties`. Distinct from
+   *  `_inlineAgentsDefaultedForExperiment` because that legacy flag was
+   *  stamped on every prior load and so is permanently dirty for the
+   *  prior-RC opt-out cohort the widened migration is meant to reach. */
+  _inlineAgentsDefaultedForAllUsers?: boolean
   /** Snapshot of totalAgentsSpawned captured the first time we see the current
    *  app version. Why: the nag threshold counts agents spawned *since the
    *  user's last update* so a fresh install or new release does not trigger
@@ -978,12 +1566,108 @@ export type PersistedUIState = {
   /** Once the user has starred Orca (from any entry point) we permanently
    *  suppress the nag — no further thresholds, no notifications. */
   starNagCompleted?: boolean
+  trustedOrcaHooks?: PersistedTrustedOrcaHooks
+  /** Whether the experimental pet overlay is currently visible. Separate
+   *  from the experimentalPet settings flag so "Hide pet" from the
+   *  status-bar menu is a reversible dismiss (re-show without re-enabling the
+   *  feature). Absent = treated as true so existing users see the pet
+   *  the first time they enable the experimental flag. */
+  petVisible?: boolean
+  /** Active pet id: one of the bundled ids or a custom UUID from
+   *  customPets. Unknown ids fall back to the default at read time so
+   *  removing a custom pet the user had selected doesn't leave the
+   *  overlay rendering nothing. */
+  petId?: string
+  /** User-uploaded pet images. Bytes live under the legacy
+   *  userData/sidekicks/custom/ folder; this field is the metadata index so
+   *  custom pets ride the existing PersistedUIState save pipeline. */
+  customPets?: CustomPet[]
+  /** On-screen size of the pet overlay in CSS pixels (square box).
+   *  Clamped to [PET_SIZE_MIN, PET_SIZE_MAX] when read. */
+  petSize?: number
+  /** Legacy persisted keys from before the sidekick -> pet rename. Read only
+   *  during migration; new writes use the pet* names above. */
+  sidekickVisible?: boolean
+  sidekickId?: string
+  customSidekicks?: CustomPet[]
+  sidekickSize?: number
+  /** Page-position state for Tasks. Source/repo/team/project selections keep
+   *  using their existing settings paths; this only restores transient tabs
+   *  and applied searches. */
+  taskResumeState?: TaskResumeState
 }
+
+export const PET_SIZE_MIN = 60
+export const PET_SIZE_MAX = 360
+export const PET_SIZE_DEFAULT = 180
+
+/** Metadata for a user-uploaded pet image. `id` is the stable identifier;
+ *  the on-disk filename (preserving the original extension) lives in `fileName`.
+ *  The renderer never learns the absolute path — it asks main for the bytes
+ *  via pet:read using (id, fileName). */
+export type CustomPet = {
+  id: string
+  label: string
+  fileName: string
+  /** MIME type needed so the renderer builds a Blob with the correct
+   *  Content-Type — especially image/svg+xml, which browsers won't render
+   *  from a misdeclared blob URL. */
+  mimeType: string
+  /** Storage layout. `image` = legacy flat file at `custom/<id>.<ext>`.
+   *  `bundle` = `.codex-pet` import expanded into `custom/<id>/`. Absent =
+   *  legacy `image` for backwards compatibility with persisted state. */
+  kind?: 'image' | 'bundle'
+  /** Sprite-sheet metadata captured at import time. Present iff this entry
+   *  came from a `.codex-pet` bundle and the manifest declared frame layout.
+   *  `columns`/`rows`/`sheetWidth`/`sheetHeight` are derived in main from
+   *  the decoded sheet so the renderer doesn't need to probe the image. */
+  sprite?: {
+    frameWidth: number
+    frameHeight: number
+    columns: number
+    rows: number
+    sheetWidth: number
+    sheetHeight: number
+    fps: number
+    defaultAnimation?: string
+    animations?: Record<string, SpriteAnimation>
+  }
+  /** Manifest-declared fps captured even when the manifest omits `frame` and
+   *  the renderer falls back to auto-detected frames. Lets DetectedSpriteFrame
+   *  honor the bundle's intended playback speed instead of a hardcoded 8 fps. */
+  spriteFps?: number
+}
+
+/** One animation strip within a sprite sheet: `row` is the y-index (0-based)
+ *  and `frames` is the number of consecutive cells played left-to-right. */
+export type SpriteAnimation = {
+  row: number
+  frames: number
+}
+
+export type PersistedTrustedOrcaHookEntry = {
+  contentHash: string
+  approvedAt: number
+}
+
+export type PersistedTrustedOrcaHookRepo = {
+  all?: {
+    approvedAt: number
+  }
+  setup?: PersistedTrustedOrcaHookEntry
+  archive?: PersistedTrustedOrcaHookEntry
+  issueCommand?: PersistedTrustedOrcaHookEntry
+}
+
+export type PersistedTrustedOrcaHooks = Record<string, PersistedTrustedOrcaHookRepo>
 
 // ─── Persistence shape ──────────────────────────────────────────────
 export type PersistedState = {
   schemaVersion: number
   repos: Repo[]
+  /** Sparse-checkout presets keyed by repoId. Empty record on first launch;
+   *  presets are managed from the new-workspace composer and repo settings. */
+  sparsePresetsByRepo: Record<string, SparsePreset[]>
   worktreeMeta: Record<string, WorktreeMeta>
   settings: GlobalSettings
   ui: PersistedUIState
@@ -993,6 +1677,10 @@ export type PersistedState = {
   }
   workspaceSession: WorkspaceSessionState
   sshTargets: SshTarget[]
+  sshRemotePtyLeases: SshRemotePtyLease[]
+  automations: Automation[]
+  automationRuns: AutomationRun[]
+  onboarding: OnboardingState
 }
 
 // ─── Filesystem ─────────────────────────────────────────────
@@ -1000,6 +1688,13 @@ export type DirEntry = {
   name: string
   isDirectory: boolean
   isSymlink: boolean
+}
+
+export type MarkdownDocument = {
+  filePath: string
+  relativePath: string
+  basename: string
+  name: string
 }
 
 // ─── Filesystem watcher ─────────────────────────────────────
@@ -1057,6 +1752,22 @@ export type GitStatusEntry = GitUncommittedEntry
 export type GitStatusResult = {
   entries: GitStatusEntry[]
   conflictOperation: GitConflictOperation
+  head?: string
+  branch?: string
+  // Why: porcelain v2 status already includes upstream/ahead/behind metadata.
+  // Folding it in lets refresh polling avoid a second pair of git subprocesses.
+  upstreamStatus?: GitUpstreamStatus
+}
+
+// Why: when hasUpstream is false, ahead/behind are placeholder zeros, not a
+// "sync" signal — callers must check hasUpstream before treating 0/0 as in-sync.
+// Kept as a named type because explicit upstream refreshes can still fail for
+// reasons unrelated to working-tree status (e.g., no upstream is expected).
+export type GitUpstreamStatus = {
+  hasUpstream: boolean
+  upstreamName?: string
+  ahead: number
+  behind: number
 }
 
 export type GitBranchChangeStatus = 'modified' | 'added' | 'deleted' | 'renamed' | 'copied'
@@ -1113,6 +1824,8 @@ export type SearchMatch = {
   column: number
   matchLength: number
   lineContent: string
+  displayColumn?: number
+  displayMatchLength?: number
 }
 
 export type SearchFileResult = {
@@ -1147,4 +1860,64 @@ export type StatsSummary = {
   // For display formatting — sourced from aggregates, not the event log,
   // so it survives event trimming.
   firstEventAt: number | null // timestamp of first-ever event, for "tracking since..."
+}
+
+// ─── Memory dashboard ──────────────────────────────────────────────
+// Resource-metrics snapshot shared across main, preload, and renderer so
+// the IPC payload is the same shape everywhere. Memory is in bytes; CPU
+// is a percentage (can exceed 100 on multi-core).
+
+/** cpu is percent of a single core — can exceed 100 on multi-core. memory is in bytes. */
+export type UsageValues = {
+  cpu: number
+  memory: number
+}
+
+/** The top-level cpu/memory are the sum of main + renderer + other. */
+export type AppMemory = UsageValues & {
+  main: UsageValues
+  renderer: UsageValues
+  other: UsageValues
+  /** Oldest-first memory samples (bytes) for the whole Orca app, one per
+   *  successful collection. Used to render the sparkline in the dashboard.
+   *  Empty before the first snapshot is recorded. */
+  history: number[]
+}
+
+export type SessionMemory = UsageValues & {
+  sessionId: string
+  paneKey: string | null
+  pid: number
+}
+
+/** The top-level cpu/memory are the sum of sessions. */
+export type WorktreeMemory = UsageValues & {
+  worktreeId: string
+  worktreeName: string
+  repoId: string
+  repoName: string
+  sessions: SessionMemory[]
+  /** Oldest-first memory samples (bytes) for this worktree's tracked
+   *  subtrees, one per successful collection. */
+  history: number[]
+}
+
+export type HostMemory = {
+  totalMemory: number
+  freeMemory: number
+  usedMemory: number
+  memoryUsagePercent: number
+  cpuCoreCount: number
+  loadAverage1m: number
+}
+
+export type MemorySnapshot = {
+  app: AppMemory
+  worktrees: WorktreeMemory[]
+  host: HostMemory
+  /** Sum of app + all tracked worktree sessions. Percent of a single core, so may exceed 100 on multi-core machines. */
+  totalCpu: number
+  /** Sum of app + all tracked worktree sessions in bytes. NOT the same as host.totalMemory, which is physical RAM. */
+  totalMemory: number
+  collectedAt: number
 }

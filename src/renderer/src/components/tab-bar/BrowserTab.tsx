@@ -9,6 +9,7 @@ import {
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
 import { ORCA_BROWSER_BLANK_URL } from '../../../../shared/constants'
+import { redactKagiSessionToken } from '../../../../shared/browser-url'
 import type { BrowserTab as BrowserTabState } from '../../../../shared/types'
 import { CLOSE_ALL_CONTEXT_MENUS_EVENT } from './SortableTab'
 import { getLiveBrowserUrl } from '../browser-pane/browser-runtime'
@@ -82,7 +83,7 @@ export default function BrowserTab({
   // Why: about:blank and other non-http URLs should not be sent to the
   // system browser. Disable the context menu item instead of silently
   // calling shell.openUrl with an unsupported URL.
-  const openInBrowserUrl = getLiveBrowserUrl(tab.id) ?? tab.url
+  const openInBrowserUrl = redactKagiSessionToken(getLiveBrowserUrl(tab.id) ?? tab.url)
   let isHttpUrl = false
   try {
     const parsed = new URL(openInBrowserUrl)
@@ -96,6 +97,20 @@ export default function BrowserTab({
     window.addEventListener(CLOSE_ALL_CONTEXT_MENUS_EVENT, closeMenu)
     return () => window.removeEventListener(CLOSE_ALL_CONTEXT_MENUS_EVENT, closeMenu)
   }, [])
+
+  // Why: Electron <webview> elements run in a separate process, so clicking
+  // inside one never dispatches a pointerdown on the renderer document. Radix
+  // DropdownMenu relies on document pointerdown for outside-click detection,
+  // so it misses webview clicks. Listening for window blur catches the moment
+  // focus leaves the renderer (including into a webview).
+  useEffect(() => {
+    if (!menuOpen) {
+      return
+    }
+    const dismiss = (): void => setMenuOpen(false)
+    window.addEventListener('blur', dismiss)
+    return () => window.removeEventListener('blur', dismiss)
+  }, [menuOpen])
 
   return (
     <>
@@ -135,9 +150,14 @@ export default function BrowserTab({
           }}
         >
           {isActive && <span className={ACTIVE_TAB_INDICATOR_CLASSES} aria-hidden />}
-          <Globe
-            className={`w-3 h-3 mr-1 shrink-0 ${isActive ? 'text-foreground' : 'text-muted-foreground'}`}
-          />
+          {/* Why: the browser tab icon is the only non-terminal, non-editor
+              surface in the tab strip. Coloring the Globe blue (matching the
+              in-app browser's identity and the default tab insertion bar)
+              gives it a distinct, recognizable anchor so users can spot
+              browser tabs at a glance even when the strip is saturated. We
+              keep full color on both active and inactive tabs — dimming to
+              muted-foreground made the icon read as "disabled" in practice. */}
+          <Globe className="w-3 h-3 mr-1 shrink-0 text-blue-500" />
           <span className="truncate max-w-[100px] mr-1">{getBrowserTabLabel(tab)}</span>
           {tab.loading && !tab.loadError && !isBlankBrowserTab(tab) && (
             <span className="mr-1 size-1.5 rounded-full bg-sky-500/80 shrink-0" />

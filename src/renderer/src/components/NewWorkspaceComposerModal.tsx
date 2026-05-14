@@ -1,24 +1,29 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { useAppStore } from '@/store'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle
-} from '@/components/ui/dialog'
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import NewWorkspaceComposerCard from '@/components/NewWorkspaceComposerCard'
 import AgentSettingsDialog from '@/components/agent/AgentSettingsDialog'
 import { useComposerState } from '@/hooks/useComposerState'
 import { AGENT_CATALOG } from '@/lib/agent-catalog'
 import type { LinkedWorkItemSummary } from '@/lib/new-workspace'
-import { shouldSuppressEnterSubmit } from '@/lib/new-workspace-enter-guard'
-import type { TuiAgent } from '../../../shared/types'
+import {
+  shouldAllowComposerEnterSubmitTarget,
+  shouldSuppressEnterSubmit
+} from '@/lib/new-workspace-enter-guard'
+import type { TuiAgent, WorkspaceCreateTelemetrySource } from '../../../shared/types'
+
+const isMac = typeof navigator !== 'undefined' && navigator.userAgent.includes('Mac')
 
 type ComposerModalData = {
   prefilledName?: string
   initialRepoId?: string
   linkedWorkItem?: LinkedWorkItemSummary | null
+  initialBaseBranch?: string
+  /** Telemetry surface that opened the composer. Set by each
+   *  `openModal('new-workspace-composer', ...)` site so
+   *  `workspace_created.source` carries the right value. Falls back to
+   *  `unknown` when omitted. */
+  telemetrySource?: WorkspaceCreateTelemetrySource
 }
 
 export default function NewWorkspaceComposerModal(): React.JSX.Element | null {
@@ -60,6 +65,42 @@ function ComposerModalBody({
   onClose: () => void
   onOpenChange: (open: boolean) => void
 }): React.JSX.Element {
+  return (
+    <Dialog open onOpenChange={onOpenChange}>
+      <DialogContent
+        className="flex flex-col sm:max-w-lg"
+        onOpenAutoFocus={(event) => {
+          // Why: Radix's FocusScope fires this once the dialog has mounted.
+          // preventDefault stops it from focusing whatever first-tabbable it
+          // picks (close button), and we instead focus the repo picker so the
+          // keyboard flow starts at the top of the unified create form.
+          event.preventDefault()
+          const content = event.currentTarget as HTMLElement
+          const trigger = content.querySelector<HTMLElement>(
+            '[data-repo-combobox-root="true"][role="combobox"]'
+          )
+          trigger?.focus({ preventScroll: true })
+        }}
+      >
+        <DialogHeader className="gap-1">
+          <DialogTitle className="text-base font-semibold">Create Workspace</DialogTitle>
+        </DialogHeader>
+
+        <QuickTabBody modalData={modalData} onClose={onClose} active />
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function QuickTabBody({
+  modalData,
+  onClose,
+  active
+}: {
+  modalData: ComposerModalData
+  onClose: () => void
+  active: boolean
+}): React.JSX.Element {
   const settings = useAppStore((s) => s.settings)
   const { cardProps, composerRef, nameInputRef, submitQuick, createDisabled } = useComposerState({
     initialName: modalData.prefilledName ?? '',
@@ -68,8 +109,10 @@ function ComposerModalBody({
     initialPrompt: '',
     initialLinkedWorkItem: modalData.linkedWorkItem ?? null,
     initialRepoId: modalData.initialRepoId,
+    ...(modalData.initialBaseBranch ? { initialBaseBranch: modalData.initialBaseBranch } : {}),
     persistDraft: false,
-    onCreated: onClose
+    onCreated: onClose,
+    ...(modalData.telemetrySource ? { telemetrySource: modalData.telemetrySource } : {})
   })
   // Why: the composer's built-in `onOpenAgentSettings` handler navigates to
   // the settings page and closes the modal. For the quick-create flow we want
@@ -111,6 +154,9 @@ function ComposerModalBody({
 
   // Cmd/Ctrl+Enter submits, Esc first blurs the focused input (like the full page).
   useEffect(() => {
+    if (!active) {
+      return
+    }
     const onKeyDown = (event: KeyboardEvent): void => {
       if (event.key !== 'Enter' && event.key !== 'Escape') {
         return
@@ -140,11 +186,11 @@ function ComposerModalBody({
       // plain Enter inside fields (notes, repo search) doesn't accidentally
       // submit — users can type or confirm selections without triggering
       // workspace creation.
-      const hasModifier = event.metaKey || event.ctrlKey
+      const hasModifier = isMac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey
       if (!hasModifier) {
         return
       }
-      if (!composerRef.current?.contains(target)) {
+      if (!shouldAllowComposerEnterSubmitTarget(target, composerRef.current)) {
         return
       }
       if (createDisabled) {
@@ -158,46 +204,20 @@ function ComposerModalBody({
     }
     window.addEventListener('keydown', onKeyDown, { capture: true })
     return () => window.removeEventListener('keydown', onKeyDown, { capture: true })
-  }, [composerRef, createDisabled, handleCreate, onClose])
+  }, [active, composerRef, createDisabled, handleCreate, onClose])
 
   return (
-    <Dialog open onOpenChange={onOpenChange}>
-      <DialogContent
-        className="sm:max-w-md"
-        onOpenAutoFocus={(event) => {
-          // Why: Radix's FocusScope fires this once the dialog has mounted and
-          // the DOM is ready. preventDefault stops it from focusing the first
-          // tabbable (which would otherwise steal focus to whatever ships
-          // first in markup); we then focus the repo combobox trigger so the
-          // guessed value sits as a confirmed selection without opening its
-          // popover — matching the "default = selection, typing = search"
-          // combobox pattern. Doing it here (instead of a child rAF) avoids
-          // Strict-Mode effect double-invocation dropping the focus call.
-          event.preventDefault()
-          const content = event.currentTarget as HTMLElement
-          const trigger = content.querySelector<HTMLElement>(
-            '[data-repo-combobox-root="true"][role="combobox"]'
-          )
-          trigger?.focus({ preventScroll: true })
-        }}
-      >
-        <DialogHeader>
-          <DialogTitle className="text-sm">Create Workspace</DialogTitle>
-          <DialogDescription className="text-xs">
-            Pick a repository and agent to spin up a new workspace.
-          </DialogDescription>
-        </DialogHeader>
-        <NewWorkspaceComposerCard
-          composerRef={composerRef}
-          nameInputRef={nameInputRef}
-          quickAgent={quickAgent}
-          onQuickAgentChange={handleQuickAgentChange}
-          {...cardProps}
-          onOpenAgentSettings={() => setAgentSettingsOpen(true)}
-          onCreate={() => void handleCreate()}
-        />
-      </DialogContent>
+    <>
+      <NewWorkspaceComposerCard
+        composerRef={composerRef}
+        nameInputRef={nameInputRef}
+        quickAgent={quickAgent}
+        onQuickAgentChange={handleQuickAgentChange}
+        {...cardProps}
+        onOpenAgentSettings={() => setAgentSettingsOpen(true)}
+        onCreate={() => void handleCreate()}
+      />
       <AgentSettingsDialog open={agentSettingsOpen} onOpenChange={setAgentSettingsOpen} />
-    </Dialog>
+    </>
   )
 }

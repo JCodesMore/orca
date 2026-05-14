@@ -15,6 +15,7 @@ import type {
   TerminalPaneLayoutNode,
   WorkspaceSessionState
 } from './types'
+import { normalizeBrowserHistoryEntries } from './workspace-session-browser-history'
 
 // ─── Terminal pane layout (recursive) ───────────────────────────────
 
@@ -127,6 +128,16 @@ const browserLoadErrorSchema = z.object({
   validatedUrl: z.string()
 })
 
+const browserViewportPresetIdSchema = z.enum([
+  'mobile-s',
+  'mobile-m',
+  'mobile-l',
+  'tablet',
+  'laptop',
+  'laptop-l',
+  'desktop'
+])
+
 // Why: cast to WorkspaceSessionState's embedded BrowserWorkspace so future
 // additive fields in the type flow through without requiring a schema edit.
 const browserWorkspaceSchema: z.ZodType<BrowserWorkspace> = z.object({
@@ -157,7 +168,11 @@ const browserPageSchema = z.object({
   canGoBack: z.boolean(),
   canGoForward: z.boolean(),
   loadError: browserLoadErrorSchema.nullable(),
-  createdAt: z.number()
+  createdAt: z.number(),
+  // Why: optional+nullable so sessions persisted before viewport presets were
+  // added still validate; without this, zod would strip the field during
+  // restore and reset the user's chosen preset on every app restart.
+  viewportPresetId: browserViewportPresetIdSchema.nullable().optional()
 })
 
 const browserHistoryEntrySchema = z.object({
@@ -167,6 +182,10 @@ const browserHistoryEntrySchema = z.object({
   lastVisitedAt: z.number(),
   visitCount: z.number()
 })
+
+const browserHistoryEntriesSchema = z
+  .array(browserHistoryEntrySchema)
+  .transform((entries) => normalizeBrowserHistoryEntries(entries))
 
 // ─── Workspace session ──────────────────────────────────────────────
 
@@ -183,14 +202,39 @@ export const workspaceSessionStateSchema: z.ZodType<WorkspaceSessionState> = z.o
   browserPagesByWorkspace: z.record(z.string(), z.array(browserPageSchema)).optional(),
   activeBrowserTabIdByWorktree: z.record(z.string(), z.string().nullable()).optional(),
   activeTabTypeByWorktree: z.record(z.string(), workspaceVisibleTabTypeSchema).optional(),
-  browserUrlHistory: z.array(browserHistoryEntrySchema).optional(),
+  browserUrlHistory: browserHistoryEntriesSchema.optional(),
   activeTabIdByWorktree: z.record(z.string(), z.string().nullable()).optional(),
   unifiedTabs: z.record(z.string(), z.array(tabSchema)).optional(),
   tabGroups: z.record(z.string(), z.array(tabGroupSchema)).optional(),
   tabGroupLayouts: z.record(z.string(), tabGroupLayoutNodeSchema).optional(),
   activeGroupIdByWorktree: z.record(z.string(), z.string()).optional(),
   activeConnectionIdsAtShutdown: z.array(z.string()).optional(),
-  remoteSessionIdsByTabId: z.record(z.string(), z.string()).optional()
+  remoteSessionIdsByTabId: z.record(z.string(), z.string()).optional(),
+  // Why: the sort comparator in order-empty-query-worktrees.ts would produce
+  // NaN (undefined sort order) if a corrupted session file carried NaN or
+  // Infinity here. Parse leniently: drop individual bad entries rather than
+  // failing the entire session. A strict record() rejection here would cause
+  // parseWorkspaceSession to fall back to defaults for the ENTIRE session
+  // (terminals, editors, browsers, layouts) on a single corrupted timestamp
+  // — a blast radius far larger than "Cmd+J falls back to activity recency",
+  // which is all this field gates.
+  lastVisitedAtByWorktreeId: z
+    .preprocess(
+      (raw) => {
+        if (raw == null || typeof raw !== 'object') {
+          return raw
+        }
+        const cleaned: Record<string, number> = {}
+        for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+          if (typeof v === 'number' && Number.isFinite(v) && v >= 0) {
+            cleaned[k] = v
+          }
+        }
+        return cleaned
+      },
+      z.record(z.string(), z.number().finite().nonnegative())
+    )
+    .optional()
 })
 
 export type ParsedWorkspaceSession =

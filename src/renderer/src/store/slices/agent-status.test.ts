@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- Why: this file is the umbrella suite for the agent-status slice (freshness, tool/assistant fields, stateStartedAt, retention + prefix sweep). Splitting by sub-area would scatter shared helpers (createTestStore, fake timers); narrower edge-cases live in sibling agent-status-*.test.ts files already. */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   AGENT_STATUS_STALE_AFTER_MS,
@@ -146,6 +147,50 @@ describe('agent status tool + assistant fields', () => {
       .setAgentStatus('tab-1:1', { state: 'working', prompt: 'p2', agentType: 'cursor' })
     expect(store.getState().agentStatusByPaneKey['tab-1:1'].agentType).toBe('cursor')
   })
+
+  it('keeps global epochs stable for fresh same-state pings while updating the entry', () => {
+    vi.useFakeTimers()
+    const store = createTestStore()
+    store
+      .getState()
+      .setAgentStatus(
+        'tab-1:1',
+        { state: 'working', prompt: 'p1', agentType: 'claude', toolName: 'Read' },
+        'claude',
+        { updatedAt: 1_000, stateStartedAt: 1_000 }
+      )
+    const firstEpoch = store.getState().agentStatusEpoch
+    const firstSortEpoch = store.getState().sortEpoch
+
+    store
+      .getState()
+      .setAgentStatus(
+        'tab-1:1',
+        { state: 'working', prompt: 'p2', agentType: 'claude', toolName: 'Edit' },
+        'claude',
+        { updatedAt: 2_000, stateStartedAt: 1_000 }
+      )
+
+    const sameStateEntry = store.getState().agentStatusByPaneKey['tab-1:1']
+    expect(sameStateEntry.prompt).toBe('p2')
+    expect(sameStateEntry.toolName).toBe('Edit')
+    expect(sameStateEntry.updatedAt).toBe(2_000)
+    // Why: same-state hook pings are high-frequency and already update the
+    // owning row through agentStatusByPaneKey. The global epochs are reserved
+    // for state/freshness changes that can affect aggregate dashboard/sidebar
+    // calculations.
+    expect(store.getState().agentStatusEpoch).toBe(firstEpoch)
+    expect(store.getState().sortEpoch).toBe(firstSortEpoch)
+
+    store
+      .getState()
+      .setAgentStatus('tab-1:1', { state: 'done', prompt: 'p2', agentType: 'claude' }, 'claude', {
+        updatedAt: 3_000,
+        stateStartedAt: 3_000
+      })
+    expect(store.getState().agentStatusEpoch).toBe(firstEpoch + 1)
+    expect(store.getState().sortEpoch).toBe(firstSortEpoch + 1)
+  })
 })
 
 describe('agent status stateStartedAt', () => {
@@ -192,6 +237,54 @@ describe('agent status stateStartedAt', () => {
     expect(entry.stateHistory).toHaveLength(1)
     expect(entry.stateHistory[0].state).toBe('working')
     expect(entry.stateHistory[0].startedAt).toBe(workingStart)
+  })
+
+  it('uses IPC snapshot timing instead of restamping restored entries as fresh', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-04-09T12:00:00.000Z'))
+
+    const store = createTestStore()
+    store
+      .getState()
+      .setAgentStatus(
+        'tab-1:1',
+        { state: 'working', prompt: 'p1', agentType: 'claude' },
+        'claude',
+        {
+          updatedAt: new Date('2026-04-09T10:00:00.000Z').getTime(),
+          stateStartedAt: new Date('2026-04-09T09:55:00.000Z').getTime()
+        }
+      )
+
+    const entry = store.getState().agentStatusByPaneKey['tab-1:1']
+    expect(entry.updatedAt).toBe(new Date('2026-04-09T10:00:00.000Z').getTime())
+    expect(entry.stateStartedAt).toBe(new Date('2026-04-09T09:55:00.000Z').getTime())
+  })
+
+  it('ignores an older snapshot when a newer live event already updated the pane', () => {
+    vi.useFakeTimers()
+    const store = createTestStore()
+    store
+      .getState()
+      .setAgentStatus(
+        'tab-1:1',
+        { state: 'working', prompt: 'fresh', agentType: 'claude' },
+        'claude',
+        { updatedAt: 2_000, stateStartedAt: 2_000 }
+      )
+    store
+      .getState()
+      .setAgentStatus(
+        'tab-1:1',
+        { state: 'done', prompt: 'stale', agentType: 'claude' },
+        'claude',
+        { updatedAt: 1_000, stateStartedAt: 1_000 }
+      )
+
+    const entry = store.getState().agentStatusByPaneKey['tab-1:1']
+    expect(entry.state).toBe('working')
+    expect(entry.prompt).toBe('fresh')
+    expect(entry.updatedAt).toBe(2_000)
   })
 })
 
@@ -254,14 +347,69 @@ describe('agent status retention + prefix sweep', () => {
       startedAt: now
     }
 
-    store.getState().retainAgent(retainedA)
-    store.getState().retainAgent(retainedB)
+    store.getState().retainAgents([retainedA, retainedB])
     store.getState().dismissRetainedAgentsByWorktree('wt-a')
 
     const retained = store.getState().retainedAgentsByPaneKey
     expect(retained['tab-a:0']).toBeUndefined()
     expect(retained['tab-b:0']).toBeDefined()
     expect(retained['tab-b:0'].worktreeId).toBe('wt-b')
+  })
+
+  it('dismissRetainedAgentsByWorktree plants retention suppressors for paneKeys that also have a live entry', () => {
+    // Why: regression guard for the "Dismiss all" resurrection bug. If a
+    // dismissed paneKey still has a live entry in agentStatusByPaneKey, the
+    // retention sync (collectRetainedAgentsOnDisappear) would re-retain the
+    // row the next time the live agent disappears — silently undoing the
+    // user's bulk dismissal. Mirror dismissRetainedAgent's hasLive-gated
+    // suppressor logic so the next live→gone transition is ignored.
+    vi.useFakeTimers()
+    const store = createTestStore()
+    const now = Date.now()
+    const entryA: AgentStatusEntry = {
+      state: 'done',
+      prompt: '',
+      updatedAt: now,
+      stateStartedAt: now,
+      paneKey: 'tab-a:0',
+      stateHistory: []
+    }
+    const entryB: AgentStatusEntry = {
+      state: 'done',
+      prompt: '',
+      updatedAt: now,
+      stateStartedAt: now,
+      paneKey: 'tab-a:1',
+      stateHistory: []
+    }
+    const retainedA: RetainedAgentEntry = {
+      entry: entryA,
+      worktreeId: 'wt-a',
+      tab: { id: 'tab-a', title: 'claude' } as unknown as TerminalTab,
+      agentType: 'claude',
+      startedAt: now
+    }
+    const retainedB: RetainedAgentEntry = {
+      entry: entryB,
+      worktreeId: 'wt-a',
+      tab: { id: 'tab-a', title: 'claude' } as unknown as TerminalTab,
+      agentType: 'claude',
+      startedAt: now
+    }
+
+    // Set up a live entry for retainedA's paneKey only — retainedB is retained-only.
+    store
+      .getState()
+      .setAgentStatus('tab-a:0', { state: 'working', prompt: 'p', agentType: 'claude' })
+    store.getState().retainAgents([retainedA, retainedB])
+    store.getState().dismissRetainedAgentsByWorktree('wt-a')
+
+    const suppressed = store.getState().retentionSuppressedPaneKeys
+    // hasLive → suppressor planted, so the next live→gone will not re-retain.
+    expect(suppressed['tab-a:0']).toBe(true)
+    // retained-only (no live entry) → no suppressor, to avoid indefinite
+    // leaks when no live→gone transition will ever fire for this paneKey.
+    expect(suppressed['tab-a:1']).toBeUndefined()
   })
 
   it('pruneRetainedAgents keeps only entries whose worktreeId is in the valid set', () => {
@@ -298,8 +446,7 @@ describe('agent status retention + prefix sweep', () => {
       startedAt: now
     }
 
-    store.getState().retainAgent(retainedA)
-    store.getState().retainAgent(retainedB)
+    store.getState().retainAgents([retainedA, retainedB])
     store.getState().pruneRetainedAgents(new Set(['wt-a']))
 
     const retained = store.getState().retainedAgentsByPaneKey

@@ -1,16 +1,20 @@
+/* eslint-disable max-lines -- Why: this file is the central main-window IPC wiring point; splitting it during the mobile release compatibility rebase would increase release risk. */
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 
 import { app, clipboard, ipcMain, nativeImage, session } from 'electron'
 import type { BrowserWindow } from 'electron'
 import type { Store } from '../persistence'
-import type { CreateWorktreeResult } from '../../shared/types'
+import type { CreateWorktreeResult, WorktreeStartupLaunch } from '../../shared/types'
 import { ORCA_BROWSER_PARTITION } from '../../shared/constants'
 import { registerRepoHandlers } from '../ipc/repos'
 import { registerWorktreeHandlers } from '../ipc/worktrees'
 import { registerPtyHandlers } from '../ipc/pty'
+import { registerDaemonManagementHandlers } from '../ipc/pty-management'
 import { registerSshHandlers } from '../ipc/ssh'
 import { browserManager } from '../browser/browser-manager'
+import { hasSystemMediaAccess, requestSystemMediaAccess } from '../browser/browser-media-access'
 import type { OrcaRuntimeService } from '../runtime/orca-runtime'
 import {
   checkForUpdatesFromMenu,
@@ -21,8 +25,14 @@ import {
   dismissNudge
 } from '../updater'
 import { scheduleHistoryGc } from '../terminal-history'
-import { listRepoWorktrees } from '../repo-worktrees'
+import { hydrateLocalPtyRegistryAtBoot } from '../memory/hydrate-local-pty-registry'
 import type { ClaudeRuntimeAuthPreparation } from '../claude-accounts/runtime-auth-service'
+import { getKnownWorktreeIdsForHistoryGc } from './history-gc-worktree-ids'
+import type {
+  RuntimeMarkdownReadTabResult,
+  RuntimeMarkdownSaveTabResult
+} from '../../shared/mobile-markdown-document'
+import { requestMobileMarkdownFromRenderer } from './mobile-markdown-request-relay'
 
 export function attachMainWindowServices(
   mainWindow: BrowserWindow,
@@ -32,29 +42,39 @@ export function attachMainWindowServices(
   prepareClaudeAuth?: () => Promise<ClaudeRuntimeAuthPreparation>
 ): void {
   registerRepoHandlers(mainWindow, store)
-  registerWorktreeHandlers(mainWindow, store)
+  registerWorktreeHandlers(mainWindow, store, runtime)
   registerPtyHandlers(
     mainWindow,
     runtime,
     getSelectedCodexHomePath,
     () => store.getSettings(),
-    prepareClaudeAuth
+    prepareClaudeAuth,
+    store
   )
-  // Why: GC runs on a 10s delay so live worktree enumeration completes first.
-  // Uses git worktree list (not store.getWorktreeMeta) because untouched
-  // worktrees have no metadata entries — see design doc §7.6.
+  // Why: the Manage Sessions settings panel (docs/daemon-staleness-ux.md §Phase 1)
+  // uses a narrow `pty:management:*` IPC surface that reads the live
+  // DaemonPtyRouter via getDaemonProvider(). Registering here — after
+  // registerPtyHandlers — keeps this wiring alongside the rest of the PTY IPC
+  // and ensures the handlers are re-installed on macOS app re-activation when
+  // the main window is recreated.
+  registerDaemonManagementHandlers()
+  // Why: do not enumerate repo paths from background GC. `git worktree list`
+  // can re-touch protected folders on macOS and trigger folder-access prompts.
   scheduleHistoryGc(async () => {
-    const repos = store.getRepos()
-    const ids = new Set<string>()
-    for (const repo of repos) {
-      const worktrees = await listRepoWorktrees(repo)
-      for (const wt of worktrees) {
-        ids.add(`${repo.id}::${wt.path}`)
-      }
-    }
-    return ids
+    return getKnownWorktreeIdsForHistoryGc(store)
   })
-  registerSshHandlers(store, () => mainWindow)
+  // Why: warm-reattach gap.
+  // Daemon-hosted PTYs survive renderer restarts on purpose, so on a fresh
+  // Orca launch the daemon's `listSessions()` returns sessions that
+  // `pty:spawn` hasn't re-registered yet. Without this hydration, the
+  // memory snapshot omits those PTYs and the renderer mislabels their
+  // workspaces as `· REMOTE` while showing `—` for CPU/Memory.
+  // `hydrateLocalPtyRegistryAtBoot` is idempotent (no-op after the first
+  // call), so calling it on every macOS dock re-activation — when this
+  // function re-runs as the main window is recreated — does not redo the
+  // git I/O or daemon RPC.
+  void hydrateLocalPtyRegistryAtBoot(store)
+  registerSshHandlers(store, () => mainWindow, runtime)
   registerFileDropRelay(mainWindow)
   setupAutoUpdater(mainWindow, {
     getLastUpdateCheckAt: () => store.getUI().lastUpdateCheckAt,
@@ -85,16 +105,63 @@ export function attachMainWindowServices(
 
   const allowedPermissions = new Set(['media', 'fullscreen', 'pointerLock'])
   mainWindow.webContents.session.setPermissionRequestHandler(
-    (_webContents, permission, callback) => {
+    (_webContents, permission, callback, details) => {
+      if (permission === 'media') {
+        void requestSystemMediaAccess(details).then(callback, (error: unknown) => {
+          console.error('[permissions] Failed to request media access:', error)
+          callback(false)
+        })
+        return
+      }
       callback(allowedPermissions.has(permission))
+    }
+  )
+  mainWindow.webContents.session.setPermissionCheckHandler(
+    (_webContents, permission, _origin, details) => {
+      if (permission !== 'media') {
+        return allowedPermissions.has(permission)
+      }
+      return hasSystemMediaAccess(details?.mediaType)
     }
   )
 
   const browserSession = session.fromPartition(ORCA_BROWSER_PARTITION)
-  browserSession.setPermissionRequestHandler((webContents, permission, callback) => {
+  browserSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
     // Why: the in-app browser is for dev previews and lightweight browsing, not
     // trusted desktop-app privileges. Denying by default keeps arbitrary sites
     // from silently escalating into camera/mic/notification prompts inside Orca.
+    // Why `media` is allowed through: camera/mic are still gated by macOS TCC
+    // at the app-process level, so granting here only *permits* Chromium to
+    // use whatever the OS has already authorized for Orca. Denying at this
+    // layer would make pages inside the in-app browser throw NotAllowedError
+    // even after the user granted Camera/Microphone via Settings → Permissions
+    // or System Settings — the bug #1273 partially addressed.
+    if (permission === 'media') {
+      void requestSystemMediaAccess(
+        details as Electron.MediaAccessPermissionRequest | undefined
+      ).then(
+        (granted) => {
+          if (!granted) {
+            browserManager.notifyPermissionDenied({
+              guestWebContentsId: webContents.id,
+              permission,
+              rawUrl: webContents.getURL()
+            })
+          }
+          callback(granted)
+        },
+        (error: unknown) => {
+          console.error('[permissions] Browser media access failed:', error)
+          browserManager.notifyPermissionDenied({
+            guestWebContentsId: webContents.id,
+            permission,
+            rawUrl: webContents.getURL()
+          })
+          callback(false)
+        }
+      )
+      return
+    }
     const allowed = permission === 'fullscreen'
     if (!allowed) {
       browserManager.notifyPermissionDenied({
@@ -105,8 +172,14 @@ export function attachMainWindowServices(
     }
     callback(allowed)
   })
-  browserSession.setPermissionCheckHandler((_webContents, permission) => {
-    return permission === 'fullscreen'
+  browserSession.setPermissionCheckHandler((_webContents, permission, _origin, details) => {
+    if (permission === 'fullscreen') {
+      return true
+    }
+    if (permission === 'media') {
+      return hasSystemMediaAccess(details?.mediaType)
+    }
+    return false
   })
   browserSession.setDisplayMediaRequestHandler((_request, callback) => {
     // Why: arbitrary sites inside Orca should never be able to capture the
@@ -137,56 +210,101 @@ function registerRuntimeWindowLifecycle(
   runtime: OrcaRuntimeService
 ): void {
   runtime.attachWindow(mainWindow.id)
-  runtime.setNotifier({
-    worktreesChanged: (repoId) => {
-      if (!mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('worktrees:changed', { repoId })
-      }
-    },
-    reposChanged: () => {
-      if (!mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('repos:changed')
-      }
-    },
-    activateWorktree: (repoId, worktreeId, setup?: CreateWorktreeResult['setup']) => {
-      if (!mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('ui:activateWorktree', { repoId, worktreeId, setup })
-      }
-    },
-    createTerminal: (worktreeId, opts) => {
-      if (!mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('ui:createTerminal', {
-          worktreeId,
-          command: opts.command,
-          title: opts.title
-        })
-      }
-    },
-    splitTerminal: (tabId, paneRuntimeId, opts) => {
-      if (!mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('ui:splitTerminal', {
-          tabId,
-          paneRuntimeId,
-          direction: opts.direction,
-          command: opts.command
-        })
-      }
-    },
-    renameTerminal: (tabId, title) => {
-      if (!mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('ui:renameTerminal', { tabId, title })
-      }
-    },
-    focusTerminal: (tabId, worktreeId) => {
-      if (!mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('ui:focusTerminal', { tabId, worktreeId })
-      }
-    },
-    closeTerminal: (tabId, paneRuntimeId) => {
-      if (!mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('ui:closeTerminal', { tabId, paneRuntimeId })
-      }
+  const send = (channel: string, ...args: unknown[]): void => {
+    if (!mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(channel, ...args)
     }
+  }
+  runtime.setNotifier({
+    worktreesChanged: (repoId) => send('worktrees:changed', { repoId }),
+    worktreeBaseStatus: (event) => send('worktree:baseStatus', event),
+    worktreeRemoteBranchConflict: (event) => send('worktree:remoteBranchConflict', event),
+    reposChanged: () => send('repos:changed'),
+    activateWorktree: (
+      repoId,
+      worktreeId,
+      setup?: CreateWorktreeResult['setup'],
+      startup?: WorktreeStartupLaunch
+    ) => {
+      send('ui:activateWorktree', {
+        repoId,
+        worktreeId,
+        ...(setup ? { setup } : {}),
+        ...(startup ? { startup } : {})
+      })
+    },
+    createTerminal: (worktreeId, opts) =>
+      send('ui:createTerminal', { worktreeId, command: opts.command, title: opts.title }),
+    revealTerminalSession: (worktreeId, opts) =>
+      new Promise((resolve, reject) => {
+        const requestId = randomUUID()
+        const timer = setTimeout(() => {
+          ipcMain.removeListener('terminal:tabCreateReply', handler)
+          reject(new Error('Terminal reveal timed out'))
+        }, 10_000)
+        const handler = (
+          _event: Electron.IpcMainEvent,
+          reply: { requestId: string; tabId?: string; title?: string; error?: string }
+        ): void => {
+          if (reply.requestId !== requestId) {
+            return
+          }
+          clearTimeout(timer)
+          ipcMain.removeListener('terminal:tabCreateReply', handler)
+          if (reply.error) {
+            reject(new Error(reply.error))
+            return
+          }
+          resolve({ tabId: reply.tabId!, title: reply.title })
+        }
+        ipcMain.on('terminal:tabCreateReply', handler)
+        send('ui:createTerminal', {
+          requestId,
+          worktreeId,
+          ptyId: opts.ptyId,
+          title: opts.title ?? undefined,
+          activate: opts.activate !== false,
+          // Why: pre-minted tabId from main keeps the renderer's tab id aligned
+          // with the paneKey baked into the PTY env at spawn time, so hook
+          // events route to the right slot. See docs/cli-terminal-hook-pane-key.md.
+          ...(opts.tabId !== undefined ? { tabId: opts.tabId } : {})
+        })
+      }),
+    splitTerminal: (tabId, paneRuntimeId, opts) => {
+      send('ui:splitTerminal', {
+        tabId,
+        paneRuntimeId,
+        direction: opts.direction,
+        command: opts.command
+      })
+    },
+    renameTerminal: (tabId, title) => send('ui:renameTerminal', { tabId, title }),
+    focusTerminal: (tabId, worktreeId, leafId) =>
+      send('ui:focusTerminal', { tabId, worktreeId, leafId }),
+    focusEditorTab: (tabId, worktreeId) => send('ui:focusEditorTab', { tabId, worktreeId }),
+    closeSessionTab: (tabId, worktreeId) => send('ui:closeSessionTab', { tabId, worktreeId }),
+    openFile: (worktreeId, filePath, relativePath) =>
+      send('ui:openFileFromMobile', { worktreeId, filePath, relativePath }),
+    readMobileMarkdownTab: (worktreeId, tabId) =>
+      requestMobileMarkdownFromRenderer(mainWindow, {
+        operation: 'read',
+        worktreeId,
+        tabId
+      }) as Promise<RuntimeMarkdownReadTabResult>,
+    saveMobileMarkdownTab: (worktreeId, tabId, baseVersion, content) =>
+      requestMobileMarkdownFromRenderer(mainWindow, {
+        operation: 'save',
+        worktreeId,
+        tabId,
+        baseVersion,
+        content
+      }) as Promise<RuntimeMarkdownSaveTabResult>,
+    closeTerminal: (tabId, paneRuntimeId) => send('ui:closeTerminal', { tabId, paneRuntimeId }),
+    sleepWorktree: (worktreeId) => send('ui:sleepWorktree', { worktreeId }),
+    terminalFitOverrideChanged: (ptyId, mode, cols, rows) =>
+      send('runtime:terminalFitOverrideChanged', { ptyId, mode, cols, rows }),
+    terminalDriverChanged: (ptyId, driver) =>
+      send('runtime:terminalDriverChanged', { ptyId, driver })
   })
   // Why: the runtime must fail closed while the renderer graph is being torn
   // down or rebuilt, otherwise future CLI calls could act on stale terminal
@@ -207,7 +325,7 @@ function registerFileDropRelay(mainWindow: BrowserWindow): void {
       _event,
       args:
         | { paths: string[]; target: 'editor' }
-        | { paths: string[]; target: 'terminal' }
+        | { paths: string[]; target: 'terminal'; tabId?: string }
         | { paths: string[]; target: 'composer' }
         | { paths: string[]; target: 'file-explorer'; destinationDir: string }
     ) => {

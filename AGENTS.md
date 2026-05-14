@@ -1,5 +1,9 @@
 # AGENTS.md
 
+## Design System
+
+All UI work — layout, color, typography, spacing, component selection, UX behavior — must follow [`docs/STYLEGUIDE.md`](./docs/STYLEGUIDE.md). Use the tokens defined in `src/renderer/src/assets/main.css` (the canonical source) and the shadcn primitives in `src/renderer/src/components/ui/`. Don't invent new color values, font sizes, or shadow tiers when a documented one already covers the role. When STYLEGUIDE.md is silent, follow the resolution order in its final section.
+
 ## Code Comments: Document the "Why", Briefly
 
 When writing or modifying code driven by a design doc or non-obvious constraint, add a comment explaining **why** the code behaves the way it does.
@@ -22,6 +26,14 @@ Orca targets macOS, Linux, and Windows. Keep all platform-dependent behavior beh
 - **Shortcut labels in UI**: Display `⌘` / `⇧` on Mac and `Ctrl+` / `Shift+` on other platforms.
 - **File paths**: Use `path.join` or Electron/Node path utilities — never assume `/` or `\`.
 
+## SSH Use Case
+
+All changes must consider the SSH use case. Don't assume local-only execution.
+
 ## GitHub CLI Usage
 
 Be mindful of the user's `gh` CLI API rate limit — batch requests where possible and avoid unnecessary calls. All code, commands, and scripts must be compatible with macOS, Linux, and Windows.
+
+## Type Declarations: Prefer `.ts` Over `.d.ts`
+
+Project-owned type declarations belong in `.ts` files. `.d.ts` is reserved for ambient shims (e.g., `env.d.ts`, `vite/client.d.ts`). TypeScript's `skipLibCheck: true` setting applies globally, including to our own `.d.ts` files, which means any unresolved type reference in a `.d.ts` silently becomes `any` at its call sites. Write your types in `.ts` files so the compiler actually checks them. CI enforces this for `src/preload/` and `src/shared/` — see `docs/preload-typecheck-hole.md`.

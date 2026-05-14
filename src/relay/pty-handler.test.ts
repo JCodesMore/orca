@@ -127,14 +127,20 @@ describe('PtyHandler', () => {
   })
 
   it('terminates spawned PTY when request becomes stale before response', async () => {
-    const term = { ...mockPtyInstance, kill: vi.fn(), onData: vi.fn(), onExit: vi.fn() }
+    const killSpy = vi.fn()
+    const term = { ...mockPtyInstance, kill: killSpy, onData: vi.fn(), onExit: vi.fn() }
     mockPtySpawn.mockReturnValue(term)
 
     await dispatcher.callRequest('pty.spawn', {}, { isStale: () => true })
 
-    expect(term.kill).toHaveBeenCalledWith('SIGTERM')
+    // Why: assert via the captured spy reference rather than term.kill because
+    // disposeManagedPty() neutralizes managed.pty.kill (replaces it with a
+    // no-op) on POSIX to close the UnixTerminal.destroy() → socket-close →
+    // SIGHUP-to-recycled-pid race. After the 5s timer fires, term.kill is the
+    // neutralized function, not the original spy. killSpy retains call history.
+    expect(killSpy).toHaveBeenCalledWith('SIGTERM')
     vi.advanceTimersByTime(5000)
-    expect(term.kill).toHaveBeenCalledWith('SIGKILL')
+    expect(killSpy).toHaveBeenCalledWith('SIGKILL')
   })
 
   it('increments PTY ids on each spawn', async () => {
@@ -403,7 +409,92 @@ describe('PtyHandler', () => {
     })
   })
 
-  it('dispose kills all PTYs', async () => {
+  it('applies env augmenters after process.env and renderer-supplied env (augmenter wins on key conflict)', async () => {
+    handler.addEnvAugmenter(() => ({
+      ORCA_AGENT_HOOK_PORT: '12345',
+      ORCA_AGENT_HOOK_TOKEN: 'abc-uuid',
+      // Why: also override a key the renderer supplied below so the test pins
+      // the documented "augmenter wins on key conflict" invariant — see the
+      // doc-comment on addEnvAugmenter in pty-handler.ts.
+      ORCA_PANE_KEY: 'augmenter-wins'
+    }))
+
+    await dispatcher.callRequest('pty.spawn', {
+      cols: 80,
+      rows: 24,
+      env: { ORCA_PANE_KEY: 'tab-1:0', ORCA_TAB_ID: 'tab-1' }
+    })
+
+    expect(mockPtySpawn).toHaveBeenCalled()
+    const callArgs = mockPtySpawn.mock.calls[0][2] as { env: Record<string, string> }
+    expect(callArgs.env.ORCA_AGENT_HOOK_PORT).toBe('12345')
+    expect(callArgs.env.ORCA_AGENT_HOOK_TOKEN).toBe('abc-uuid')
+    // Augmenter override beats the renderer-supplied value:
+    expect(callArgs.env.ORCA_PANE_KEY).toBe('augmenter-wins')
+    // Renderer-supplied keys not in augmenter map flow through:
+    expect(callArgs.env.ORCA_TAB_ID).toBe('tab-1')
+  })
+
+  it('revive restores pane identity env alongside hook-server coordinates', async () => {
+    await dispatcher.callRequest('pty.spawn', {
+      cols: 90,
+      rows: 30,
+      cwd: '/tmp',
+      env: {
+        ORCA_PANE_KEY: 'tab-5:1',
+        ORCA_TAB_ID: 'tab-5',
+        ORCA_WORKTREE_ID: 'wt-5'
+      }
+    })
+    const state = (await dispatcher.callRequest('pty.serialize', { ids: ['pty-1'] })) as string
+
+    handler.dispose()
+    mockPtySpawn.mockClear()
+    dispatcher = createMockDispatcher()
+    handler = new PtyHandler(dispatcher as unknown as RelayDispatcher)
+    handler.addEnvAugmenter(() => ({
+      ORCA_AGENT_HOOK_PORT: '12345',
+      ORCA_AGENT_HOOK_TOKEN: 'abc-uuid'
+    }))
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true)
+    try {
+      await dispatcher.callRequest('pty.revive', { state })
+    } finally {
+      killSpy.mockRestore()
+    }
+
+    expect(mockPtySpawn).toHaveBeenCalledTimes(1)
+    const callArgs = mockPtySpawn.mock.calls[0][2] as { env: Record<string, string> }
+    expect(callArgs.env.ORCA_PANE_KEY).toBe('tab-5:1')
+    expect(callArgs.env.ORCA_TAB_ID).toBe('tab-5')
+    expect(callArgs.env.ORCA_WORKTREE_ID).toBe('wt-5')
+    expect(callArgs.env.ORCA_AGENT_HOOK_PORT).toBe('12345')
+    expect(callArgs.env.ORCA_AGENT_HOOK_TOKEN).toBe('abc-uuid')
+  })
+
+  it('invokes the exit listener with the spawn-time paneKey', async () => {
+    let onExitCb: ((evt: { exitCode: number }) => void) | undefined
+    mockPtySpawn.mockReturnValue({
+      ...mockPtyInstance,
+      onData: vi.fn(),
+      onExit: vi.fn((cb: (evt: { exitCode: number }) => void) => {
+        onExitCb = cb
+      })
+    })
+
+    const exits: { id: string; paneKey?: string }[] = []
+    handler.setExitListener((evt) => exits.push(evt))
+
+    await dispatcher.callRequest('pty.spawn', {
+      env: { ORCA_PANE_KEY: 'tab-2:1' }
+    })
+    expect(onExitCb).toBeDefined()
+    onExitCb!({ exitCode: 0 })
+
+    expect(exits).toEqual([{ id: 'pty-1', paneKey: 'tab-2:1' }])
+  })
+
+  it('dispose kills all PTYs with SIGKILL', async () => {
     const mockKill = vi.fn()
     mockPtySpawn.mockReturnValue({
       ...mockPtyInstance,
@@ -417,7 +508,11 @@ describe('PtyHandler', () => {
     expect(handler.activePtyCount).toBe(2)
 
     handler.dispose()
-    expect(mockKill).toHaveBeenCalledWith('SIGTERM')
+    // Why: dispose uses SIGKILL (not SIGTERM) because the relay process is
+    // exiting. A SIGTERM-ignoring remote shell (editor with unsaved buffers,
+    // wedged process, uninterruptible sleep) would survive SIGTERM + immediate
+    // destroy() as an orphan on the remote host. SIGKILL is not ignorable.
+    expect(mockKill).toHaveBeenCalledWith('SIGKILL')
     expect(handler.activePtyCount).toBe(0)
   })
 })

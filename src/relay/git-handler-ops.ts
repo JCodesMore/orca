@@ -73,7 +73,8 @@ export async function computeDiff(
   git: GitBufferExec,
   worktreePath: string,
   filePath: string,
-  staged: boolean
+  staged: boolean,
+  compareAgainstHead = false
 ) {
   let originalContent = ''
   let modifiedContent = ''
@@ -90,7 +91,9 @@ export async function computeDiff(
       modifiedContent = right.content
       modifiedIsBinary = right.isBinary
     } else {
-      const left = await readUnstagedLeft(git, worktreePath, filePath)
+      const left = compareAgainstHead
+        ? await readBlobAtOid(git, worktreePath, 'HEAD', filePath)
+        : await readUnstagedLeft(git, worktreePath, filePath)
       originalContent = left.content
       originalIsBinary = left.isBinary
 
@@ -214,8 +217,9 @@ export async function branchDiffEntries(
     return []
   }
 
+  // Why: see core.quotePath rationale in getStatusOp — keep UTF-8 paths intact.
   const { stdout } = await git(
-    ['diff', '--name-status', '-M', '-C', mergeBase, headOid],
+    ['-c', 'core.quotePath=false', 'diff', '--name-status', '-M', '-C', mergeBase, headOid],
     worktreePath
   )
   const allChanges = parseBranchDiff(stdout)

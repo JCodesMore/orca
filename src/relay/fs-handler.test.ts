@@ -76,7 +76,6 @@ describe('FsHandler', () => {
     tmpDir = mkdtempSync(path.join(tmpdir(), 'relay-fs-'))
     dispatcher = createMockDispatcher()
     const ctx = new RelayContext()
-    ctx.registerRoot(tmpDir)
     handler = new FsHandler(dispatcher as unknown as RelayDispatcher, ctx)
   })
 
@@ -120,6 +119,25 @@ describe('FsHandler', () => {
     expect(result.find((e) => e.name === 'aaa.txt')).toBeDefined()
   })
 
+  it('readDir reports symlinked directories as directories', async () => {
+    const targetDir = path.join(tmpDir, 'external-models')
+    const linkPath = path.join(tmpDir, 'Model')
+    mkdirSync(targetDir)
+    symlinkSync(targetDir, linkPath, process.platform === 'win32' ? 'junction' : 'dir')
+
+    const result = (await dispatcher.callRequest('fs.readDir', { dirPath: tmpDir })) as {
+      name: string
+      isDirectory: boolean
+      isSymlink: boolean
+    }[]
+
+    expect(result.find((e) => e.name === 'Model')).toEqual({
+      name: 'Model',
+      isDirectory: true,
+      isSymlink: true
+    })
+  })
+
   it('readFile returns text content for text files', async () => {
     const filePath = path.join(tmpDir, 'test.txt')
     writeFileSync(filePath, 'hello world')
@@ -130,6 +148,33 @@ describe('FsHandler', () => {
     }
     expect(result.content).toBe('hello world')
     expect(result.isBinary).toBe(false)
+  })
+
+  it('readFile returns text files larger than the old 5MB guard', async () => {
+    const filePath = path.join(tmpDir, 'large.json')
+    const content = 'a'.repeat(6 * 1024 * 1024)
+    writeFileSync(filePath, content)
+
+    const result = (await dispatcher.callRequest('fs.readFile', { filePath })) as {
+      content: string
+      isBinary: boolean
+    }
+    expect(result.content).toBe(content)
+    expect(result.isBinary).toBe(false)
+  })
+
+  it('readFile returns binary marker for large unknown binary files', async () => {
+    const filePath = path.join(tmpDir, 'archive.bin')
+    const content = Buffer.alloc(6 * 1024 * 1024, 0x61)
+    content[0] = 0x00
+    writeFileSync(filePath, content)
+
+    const result = (await dispatcher.callRequest('fs.readFile', { filePath })) as {
+      content: string
+      isBinary: boolean
+    }
+    expect(result.content).toBe('')
+    expect(result.isBinary).toBe(true)
   })
 
   it('readFile returns base64 for image files', async () => {
@@ -150,8 +195,7 @@ describe('FsHandler', () => {
 
   it('readFile throws for files exceeding size limit', async () => {
     const filePath = path.join(tmpDir, 'huge.txt')
-    // Write 6MB file
-    writeFileSync(filePath, Buffer.alloc(6 * 1024 * 1024))
+    writeFileSync(filePath, Buffer.alloc(11 * 1024 * 1024, 'a'))
 
     await expect(dispatcher.callRequest('fs.readFile', { filePath })).rejects.toThrow(
       'File too large'
@@ -184,6 +228,19 @@ describe('FsHandler', () => {
     const result = (await dispatcher.callRequest('fs.stat', { filePath: tmpDir })) as {
       type: string
     }
+    expect(result.type).toBe('directory')
+  })
+
+  it('stat returns directory type for symlinked directories', async () => {
+    const targetDir = path.join(tmpDir, 'external-models')
+    const linkPath = path.join(tmpDir, 'Model')
+    mkdirSync(targetDir)
+    symlinkSync(targetDir, linkPath, process.platform === 'win32' ? 'junction' : 'dir')
+
+    const result = (await dispatcher.callRequest('fs.stat', { filePath: linkPath })) as {
+      type: string
+    }
+
     expect(result.type).toBe('directory')
   })
 

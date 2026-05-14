@@ -10,8 +10,10 @@ const {
   readFileMock,
   writeFileMock,
   statMock,
+  openMock,
   realpathMock,
   lstatMock,
+  commitChangesMock,
   getStatusMock,
   getDiffMock,
   getBranchCompareMock,
@@ -22,7 +24,8 @@ const {
   bulkUnstageFilesMock,
   discardChangesMock,
   listWorktreesMock,
-  getSshFilesystemProviderMock
+  getSshFilesystemProviderMock,
+  getSshGitProviderMock
 } = vi.hoisted(() => ({
   handleMock: vi.fn(),
   trashItemMock: vi.fn(),
@@ -30,8 +33,10 @@ const {
   readFileMock: vi.fn(),
   writeFileMock: vi.fn(),
   statMock: vi.fn(),
+  openMock: vi.fn(),
   realpathMock: vi.fn(),
   lstatMock: vi.fn(),
+  commitChangesMock: vi.fn(),
   getStatusMock: vi.fn(),
   getDiffMock: vi.fn(),
   getBranchCompareMock: vi.fn(),
@@ -42,7 +47,8 @@ const {
   bulkUnstageFilesMock: vi.fn(),
   discardChangesMock: vi.fn(),
   listWorktreesMock: vi.fn(),
-  getSshFilesystemProviderMock: vi.fn()
+  getSshFilesystemProviderMock: vi.fn(),
+  getSshGitProviderMock: vi.fn()
 }))
 
 vi.mock('electron', () => ({
@@ -59,11 +65,13 @@ vi.mock('fs/promises', () => ({
   readFile: readFileMock,
   writeFile: writeFileMock,
   stat: statMock,
+  open: openMock,
   realpath: realpathMock,
   lstat: lstatMock
 }))
 
 vi.mock('../git/status', () => ({
+  commitChanges: commitChangesMock,
   getStatus: getStatusMock,
   getDiff: getDiffMock,
   getBranchCompare: getBranchCompareMock,
@@ -84,17 +92,38 @@ vi.mock('../providers/ssh-filesystem-dispatch', () => ({
 }))
 
 vi.mock('../providers/ssh-git-dispatch', () => ({
-  getSshGitProvider: vi.fn().mockReturnValue(null)
+  getSshGitProvider: getSshGitProviderMock
 }))
 
 import { registerFilesystemHandlers } from './filesystem'
-import { invalidateAuthorizedRootsCache } from './filesystem-auth'
+import { invalidateAuthorizedRootsCache, registerWorktreeRootsForRepo } from './filesystem-auth'
 
 // Why: paths are resolved via path.resolve() in production code, so test
 // data must use resolved paths to avoid Unix-vs-Windows mismatches.
 const REPO_PATH = path.resolve('/workspace/repo')
 const WORKSPACE_DIR = path.resolve('/workspace')
 const WORKTREE_FEATURE_PATH = path.resolve('/workspace/repo-feature')
+
+type MockDirEntry = {
+  name: string
+  directory?: boolean
+  file?: boolean
+  symlink?: boolean
+}
+
+function dirEntry({ name, directory, file, symlink }: MockDirEntry): {
+  name: string
+  isDirectory: () => boolean
+  isFile: () => boolean
+  isSymbolicLink: () => boolean
+} {
+  return {
+    name,
+    isDirectory: () => directory ?? false,
+    isFile: () => file ?? false,
+    isSymbolicLink: () => symlink ?? false
+  }
+}
 
 describe('registerFilesystemHandlers', () => {
   const store = {
@@ -121,8 +150,10 @@ describe('registerFilesystemHandlers', () => {
       readFileMock,
       writeFileMock,
       statMock,
+      openMock,
       realpathMock,
       lstatMock,
+      commitChangesMock,
       getStatusMock,
       getDiffMock,
       getBranchCompareMock,
@@ -133,7 +164,8 @@ describe('registerFilesystemHandlers', () => {
       bulkUnstageFilesMock,
       discardChangesMock,
       listWorktreesMock,
-      getSshFilesystemProviderMock
+      getSshFilesystemProviderMock,
+      getSshGitProviderMock
     ]) {
       mock.mockReset()
     }
@@ -157,7 +189,15 @@ describe('registerFilesystemHandlers', () => {
       }
     ])
     trashItemMock.mockResolvedValue(undefined)
+    getSshGitProviderMock.mockReturnValue(null)
     statMock.mockResolvedValue({ size: 10, isDirectory: () => false, mtimeMs: 123 })
+    openMock.mockResolvedValue({
+      read: vi.fn(async (buffer: Buffer) => {
+        buffer.fill(0x61)
+        return { bytesRead: buffer.length, buffer }
+      }),
+      close: vi.fn()
+    })
     lstatMock.mockRejectedValue(Object.assign(new Error('missing'), { code: 'ENOENT' }))
   })
 
@@ -177,6 +217,99 @@ describe('registerFilesystemHandlers', () => {
     )
 
     expect(readFileMock).not.toHaveBeenCalled()
+  })
+
+  it('allows readDir when a registered worktree resolves to a macOS canonical alias', async () => {
+    const aliasWorktreePath = path.resolve('/var/folders/orca/worktrees/feature')
+    const canonicalWorktreePath = path.resolve('/private/var/folders/orca/worktrees/feature')
+    registerWorktreeRootsForRepo(store as never, 'repo-1', [REPO_PATH, aliasWorktreePath])
+    realpathMock.mockImplementation(async (targetPath: string) => {
+      if (targetPath === aliasWorktreePath) {
+        return canonicalWorktreePath
+      }
+      return targetPath
+    })
+    readdirMock.mockResolvedValue([dirEntry({ name: 'README.md', file: true })])
+
+    registerFilesystemHandlers(store as never)
+
+    await expect(
+      handlers.get('fs:readDir')!(null, { dirPath: aliasWorktreePath })
+    ).resolves.toEqual([{ name: 'README.md', isDirectory: false, isSymlink: false }])
+
+    expect(readdirMock).toHaveBeenCalledWith(canonicalWorktreePath, { withFileTypes: true })
+    expect(listWorktreesMock).not.toHaveBeenCalled()
+  })
+
+  it('reports symlinked directories from readDir as directories', async () => {
+    const modelLinkPath = path.join(REPO_PATH, 'Model')
+    readdirMock.mockResolvedValue([
+      dirEntry({ name: 'README.md', file: true }),
+      dirEntry({ name: 'Model', symlink: true })
+    ])
+    statMock.mockImplementation(async (targetPath: string) => ({
+      size: 10,
+      isDirectory: () => targetPath === modelLinkPath,
+      mtimeMs: 123
+    }))
+
+    registerFilesystemHandlers(store as never)
+
+    await expect(handlers.get('fs:readDir')!(null, { dirPath: REPO_PATH })).resolves.toEqual([
+      { name: 'Model', isDirectory: true, isSymlink: true },
+      { name: 'README.md', isDirectory: false, isSymlink: false }
+    ])
+  })
+
+  it('allows deletePath when a registered worktree parent resolves to a macOS canonical alias', async () => {
+    const aliasWorktreePath = path.resolve('/var/folders/orca/worktrees/feature')
+    const canonicalWorktreePath = path.resolve('/private/var/folders/orca/worktrees/feature')
+    const aliasFilePath = path.join(aliasWorktreePath, 'README.md')
+    const canonicalFilePath = path.join(canonicalWorktreePath, 'README.md')
+    registerWorktreeRootsForRepo(store as never, 'repo-1', [REPO_PATH, aliasWorktreePath])
+    realpathMock.mockImplementation(async (targetPath: string) => {
+      if (targetPath === aliasWorktreePath) {
+        return canonicalWorktreePath
+      }
+      return targetPath
+    })
+
+    registerFilesystemHandlers(store as never)
+
+    await handlers.get('fs:deletePath')!(null, { targetPath: aliasFilePath })
+
+    expect(trashItemMock).toHaveBeenCalledWith(canonicalFilePath)
+    expect(listWorktreesMock).not.toHaveBeenCalled()
+  })
+
+  it('rejects readFile when a symlink in a canonical alias worktree escapes the registered root', async () => {
+    const aliasWorktreePath = path.resolve('/var/folders/orca/worktrees/feature')
+    const canonicalWorktreePath = path.resolve('/private/var/folders/orca/worktrees/feature')
+    const aliasLinkPath = path.join(aliasWorktreePath, 'link.txt')
+    registerWorktreeRootsForRepo(store as never, 'repo-1', [REPO_PATH, aliasWorktreePath])
+    realpathMock.mockImplementation(async (targetPath: string) => {
+      if (targetPath === aliasWorktreePath) {
+        return canonicalWorktreePath
+      }
+      if (targetPath === aliasLinkPath) {
+        return path.resolve('/private/secret.txt')
+      }
+      return targetPath
+    })
+
+    registerFilesystemHandlers(store as never)
+
+    await expect(handlers.get('fs:readFile')!(null, { filePath: aliasLinkPath })).rejects.toThrow(
+      'Access denied: path resolves outside allowed directories'
+    )
+
+    expect(readFileMock).not.toHaveBeenCalled()
+  })
+
+  it('does not enumerate worktrees when filesystem handlers register', () => {
+    registerFilesystemHandlers(store as never)
+
+    expect(listWorktreesMock).not.toHaveBeenCalled()
   })
 
   it('rejects writes to directories', async () => {
@@ -217,6 +350,55 @@ describe('registerFilesystemHandlers', () => {
     })
   })
 
+  it('opens text files larger than the old 5MB guard', async () => {
+    const content = 'a'.repeat(6 * 1024 * 1024)
+    statMock.mockResolvedValue({ size: content.length, isDirectory: () => false, mtimeMs: 123 })
+    readFileMock.mockResolvedValue(Buffer.from(content))
+
+    registerFilesystemHandlers(store as never)
+
+    await expect(
+      handlers.get('fs:readFile')!(null, { filePath: path.resolve('/workspace/repo/large.json') })
+    ).resolves.toEqual({
+      content,
+      isBinary: false
+    })
+  })
+
+  it('rejects text files beyond the editor read budget', async () => {
+    statMock.mockResolvedValue({ size: 51 * 1024 * 1024, isDirectory: () => false, mtimeMs: 123 })
+
+    registerFilesystemHandlers(store as never)
+
+    await expect(
+      handlers.get('fs:readFile')!(null, { filePath: path.resolve('/workspace/repo/huge.json') })
+    ).rejects.toThrow('exceeds 50MB limit')
+
+    expect(readFileMock).not.toHaveBeenCalled()
+  })
+
+  it('probes large unknown binaries without reading the full file', async () => {
+    statMock.mockResolvedValue({ size: 6 * 1024 * 1024, isDirectory: () => false, mtimeMs: 123 })
+    openMock.mockResolvedValue({
+      read: vi.fn(async (buffer: Buffer) => {
+        buffer[0] = 0x00
+        return { bytesRead: 1, buffer }
+      }),
+      close: vi.fn()
+    })
+
+    registerFilesystemHandlers(store as never)
+
+    await expect(
+      handlers.get('fs:readFile')!(null, { filePath: path.resolve('/workspace/repo/archive.bin') })
+    ).resolves.toEqual({
+      content: '',
+      isBinary: true
+    })
+
+    expect(readFileMock).not.toHaveBeenCalled()
+  })
+
   it('moves files to trash', async () => {
     registerFilesystemHandlers(store as never)
     const targetPath = path.resolve('/workspace/repo/file.txt')
@@ -253,6 +435,19 @@ describe('registerFilesystemHandlers', () => {
     // Why: validateGitRelativeFilePath uses path.relative() which produces
     // platform-specific separators (backslashes on Windows).
     expect(stageFileMock).toHaveBeenCalledWith(WORKTREE_FEATURE_PATH, path.join('src', 'file.ts'))
+  })
+
+  it('uses worktree roots seeded by worktrees:list without rebuilding the cache', async () => {
+    registerWorktreeRootsForRepo(store as never, 'repo-1', [REPO_PATH, WORKTREE_FEATURE_PATH])
+    getStatusMock.mockResolvedValue({ entries: [] })
+
+    registerFilesystemHandlers(store as never)
+
+    await handlers.get('git:status')!(null, { worktreePath: WORKTREE_FEATURE_PATH })
+
+    expect(listWorktreesMock).not.toHaveBeenCalled()
+    expect(realpathMock).not.toHaveBeenCalledWith(WORKTREE_FEATURE_PATH)
+    expect(getStatusMock).toHaveBeenCalledWith(WORKTREE_FEATURE_PATH)
   })
 
   it('rejects git file paths that escape the selected worktree', async () => {
@@ -311,6 +506,135 @@ describe('registerFilesystemHandlers', () => {
     expect(bulkUnstageFilesMock).not.toHaveBeenCalled()
   })
 
+  it('lists markdown documents recursively for a registered worktree', async () => {
+    readdirMock.mockImplementation(async (dirPath: string) => {
+      if (dirPath === WORKTREE_FEATURE_PATH) {
+        return [
+          dirEntry({ name: 'README.md', file: true }),
+          dirEntry({ name: 'docs', directory: true }),
+          dirEntry({ name: 'script.ts', file: true })
+        ]
+      }
+      if (dirPath === path.join(WORKTREE_FEATURE_PATH, 'docs')) {
+        return [
+          dirEntry({ name: 'Guide.MDX', file: true }),
+          dirEntry({ name: 'notes.markdown', file: true })
+        ]
+      }
+      return []
+    })
+
+    registerFilesystemHandlers(store as never)
+
+    await expect(
+      handlers.get('fs:listMarkdownDocuments')!(null, {
+        rootPath: WORKTREE_FEATURE_PATH
+      })
+    ).resolves.toEqual([
+      {
+        filePath: path.join(WORKTREE_FEATURE_PATH, 'docs', 'Guide.MDX'),
+        relativePath: 'docs/Guide.MDX',
+        basename: 'Guide.MDX',
+        name: 'Guide'
+      },
+      {
+        filePath: path.join(WORKTREE_FEATURE_PATH, 'docs', 'notes.markdown'),
+        relativePath: 'docs/notes.markdown',
+        basename: 'notes.markdown',
+        name: 'notes'
+      },
+      {
+        filePath: path.join(WORKTREE_FEATURE_PATH, 'README.md'),
+        relativePath: 'README.md',
+        basename: 'README.md',
+        name: 'README'
+      }
+    ])
+  })
+
+  it('skips ignored and symlinked directories when listing markdown documents', async () => {
+    readdirMock.mockImplementation(async (dirPath: string) => {
+      if (dirPath === WORKTREE_FEATURE_PATH) {
+        return [
+          dirEntry({ name: '.git', directory: true }),
+          dirEntry({ name: '.hidden', directory: true }),
+          dirEntry({ name: '.github', directory: true }),
+          dirEntry({ name: 'node_modules', directory: true }),
+          dirEntry({ name: 'linked-docs', directory: true, symlink: true }),
+          dirEntry({ name: 'visible.md', file: true })
+        ]
+      }
+      if (dirPath === path.join(WORKTREE_FEATURE_PATH, '.github')) {
+        return [dirEntry({ name: 'CONTRIBUTING.md', file: true })]
+      }
+      throw new Error(`Unexpected readdir: ${dirPath}`)
+    })
+
+    registerFilesystemHandlers(store as never)
+
+    await expect(
+      handlers.get('fs:listMarkdownDocuments')!(null, {
+        rootPath: WORKTREE_FEATURE_PATH
+      })
+    ).resolves.toEqual([
+      {
+        filePath: path.join(WORKTREE_FEATURE_PATH, '.github', 'CONTRIBUTING.md'),
+        relativePath: '.github/CONTRIBUTING.md',
+        basename: 'CONTRIBUTING.md',
+        name: 'CONTRIBUTING'
+      },
+      {
+        filePath: path.join(WORKTREE_FEATURE_PATH, 'visible.md'),
+        relativePath: 'visible.md',
+        basename: 'visible.md',
+        name: 'visible'
+      }
+    ])
+  })
+
+  it('rejects markdown document listing for authorized but unregistered roots', async () => {
+    registerFilesystemHandlers(store as never)
+
+    await expect(
+      handlers.get('fs:listMarkdownDocuments')!(null, {
+        rootPath: path.resolve('/workspace/unregistered')
+      })
+    ).rejects.toThrow('Access denied: unknown repository or worktree path')
+
+    expect(readdirMock).not.toHaveBeenCalled()
+  })
+
+  it('lists remote markdown documents through the SSH filesystem provider', async () => {
+    const provider = {
+      listFiles: vi
+        .fn()
+        .mockResolvedValue(['README.md', 'docs/guide.mdx', '../outside.md', 'src/app.ts'])
+    }
+    getSshFilesystemProviderMock.mockReturnValue(provider)
+
+    registerFilesystemHandlers(store as never)
+
+    await expect(
+      handlers.get('fs:listMarkdownDocuments')!(null, {
+        rootPath: '/home/user/project',
+        connectionId: 'ssh-1'
+      })
+    ).resolves.toEqual([
+      {
+        filePath: '/home/user/project/docs/guide.mdx',
+        relativePath: 'docs/guide.mdx',
+        basename: 'guide.mdx',
+        name: 'guide'
+      },
+      {
+        filePath: '/home/user/project/README.md',
+        relativePath: 'README.md',
+        basename: 'README.md',
+        name: 'README'
+      }
+    ])
+  })
+
   it('routes branch compare queries through the git compare helper', async () => {
     getBranchCompareMock.mockResolvedValue({
       summary: {
@@ -333,6 +657,95 @@ describe('registerFilesystemHandlers', () => {
     })
 
     expect(getBranchCompareMock).toHaveBeenCalledWith(WORKTREE_FEATURE_PATH, 'origin/main')
+  })
+
+  it('routes local git:commit through commitChanges and returns success', async () => {
+    commitChangesMock.mockResolvedValue({ success: true })
+
+    registerFilesystemHandlers(store as never)
+
+    await expect(
+      handlers.get('git:commit')!(null, {
+        worktreePath: WORKTREE_FEATURE_PATH,
+        message: 'feat: ship commit'
+      })
+    ).resolves.toEqual({ success: true })
+
+    expect(commitChangesMock).toHaveBeenCalledWith(WORKTREE_FEATURE_PATH, 'feat: ship commit')
+  })
+
+  it('returns local commit hook failure payload from git:commit', async () => {
+    commitChangesMock.mockResolvedValue({ success: false, error: 'hook failed' })
+
+    registerFilesystemHandlers(store as never)
+
+    await expect(
+      handlers.get('git:commit')!(null, {
+        worktreePath: WORKTREE_FEATURE_PATH,
+        message: 'feat: ship commit'
+      })
+    ).resolves.toEqual({ success: false, error: 'hook failed' })
+  })
+
+  it('routes ssh git:commit through the SSH provider instead of local commitChanges', async () => {
+    const sshCommitMock = vi.fn().mockResolvedValue({ success: true })
+    getSshGitProviderMock.mockReturnValue({ commit: sshCommitMock })
+
+    registerFilesystemHandlers(store as never)
+
+    await expect(
+      handlers.get('git:commit')!(null, {
+        worktreePath: '/remote/repo',
+        message: 'feat: remote commit',
+        connectionId: 'conn-1'
+      })
+    ).resolves.toEqual({ success: true })
+
+    expect(sshCommitMock).toHaveBeenCalledWith('/remote/repo', 'feat: remote commit')
+    expect(commitChangesMock).not.toHaveBeenCalled()
+  })
+
+  it('rejects git:commit with empty message and does not call commitChanges', async () => {
+    registerFilesystemHandlers(store as never)
+
+    await expect(
+      handlers.get('git:commit')!(null, {
+        worktreePath: WORKTREE_FEATURE_PATH,
+        message: ''
+      })
+    ).rejects.toThrow('Commit message is required')
+
+    expect(commitChangesMock).not.toHaveBeenCalled()
+  })
+
+  it('rejects git:commit with whitespace-only message and does not call commitChanges', async () => {
+    registerFilesystemHandlers(store as never)
+
+    await expect(
+      handlers.get('git:commit')!(null, {
+        worktreePath: WORKTREE_FEATURE_PATH,
+        message: '   '
+      })
+    ).rejects.toThrow('Commit message is required')
+
+    expect(commitChangesMock).not.toHaveBeenCalled()
+  })
+
+  it('rejects git:commit with whitespace-only message before SSH dispatch', async () => {
+    const sshCommitMock = vi.fn().mockResolvedValue({ success: true })
+    getSshGitProviderMock.mockReturnValue({ commit: sshCommitMock })
+
+    registerFilesystemHandlers(store as never)
+
+    await expect(
+      handlers.get('git:commit')!(null, {
+        worktreePath: '/remote/repo',
+        message: '\n',
+        connectionId: 'conn-1'
+      })
+    ).rejects.toThrow('Commit message is required')
+
+    expect(sshCommitMock).not.toHaveBeenCalled()
   })
 
   it('allows git operations on worktrees outside repo/workspace roots', async () => {

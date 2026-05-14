@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto'
 import { writeFileSync, chmodSync, unlinkSync } from 'fs'
 import { encodeNdjson, createNdjsonParser } from './ndjson'
 import { TerminalHost } from './terminal-host'
+import { DaemonStreamDataBatcher } from './daemon-stream-data-batcher'
 import type { SubprocessHandle } from './session'
 import {
   PROTOCOL_VERSION,
@@ -22,6 +23,7 @@ export type DaemonServerOptions = {
     cwd?: string
     env?: Record<string, string>
     command?: string
+    shellOverride?: string
   }) => SubprocessHandle
 }
 
@@ -39,6 +41,7 @@ export class DaemonServer {
   private tokenPath: string
 
   private clients = new Map<string, ConnectedClient>()
+  private streamDataBatcher = new DaemonStreamDataBatcher((clientId) => this.clients.get(clientId))
 
   constructor(opts: DaemonServerOptions) {
     this.socketPath = opts.socketPath
@@ -69,6 +72,7 @@ export class DaemonServer {
 
   async shutdown(): Promise<void> {
     this.host.dispose()
+    this.streamDataBatcher.clear()
 
     for (const [, client] of this.clients) {
       client.controlSocket.destroy()
@@ -157,6 +161,7 @@ export class DaemonServer {
     socket.on('data', (chunk) => parser.feed(chunk.toString()))
 
     socket.on('close', () => {
+      this.streamDataBatcher.clear(clientId)
       this.clients.delete(clientId)
     })
   }
@@ -199,21 +204,17 @@ export class DaemonServer {
           cwd: p.cwd,
           env: p.env,
           command: p.command,
+          shellOverride: p.shellOverride,
+          terminalWindowsPowerShellImplementation: p.terminalWindowsPowerShellImplementation,
           shellReadySupported: p.shellReadySupported,
           streamClient: {
             onData: (data) => {
-              if (client?.streamSocket) {
-                client.streamSocket.write(
-                  encodeNdjson({
-                    type: 'event',
-                    event: 'data',
-                    sessionId: p.sessionId,
-                    payload: { data }
-                  })
-                )
-              }
+              this.streamDataBatcher.enqueue(clientId, p.sessionId, data)
             },
             onExit: (code) => {
+              // Why: exit tears down renderer handlers; flush final output first
+              // so the last few milliseconds of PTY data are not stranded.
+              this.streamDataBatcher.flush(clientId)
               if (client?.streamSocket) {
                 client.streamSocket.write(
                   encodeNdjson({
@@ -271,7 +272,7 @@ export class DaemonServer {
         return {}
 
       case 'getCwd':
-        return { cwd: this.host.getCwd(request.payload.sessionId) }
+        return { cwd: await this.host.getCwd(request.payload.sessionId) }
 
       case 'clearScrollback':
         this.host.clearScrollback(request.payload.sessionId)
@@ -279,6 +280,9 @@ export class DaemonServer {
 
       case 'listSessions':
         return { sessions: this.host.listSessions() }
+
+      case 'getSnapshot':
+        return { snapshot: this.host.getSnapshot(request.payload.sessionId) }
 
       case 'ping':
         return { pong: true }

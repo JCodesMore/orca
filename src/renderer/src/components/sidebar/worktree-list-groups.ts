@@ -2,7 +2,7 @@ import {
   CircleCheckBig,
   CircleDot,
   CircleX,
-  FolderGit2,
+  Folder,
   GitPullRequest,
   LayoutList,
   Pin
@@ -62,7 +62,7 @@ export const PR_GROUP_META: Record<
 
 export const REPO_GROUP_META = {
   tone: 'text-foreground',
-  icon: FolderGit2
+  icon: Folder
 } as const
 
 export const PINNED_GROUP_KEY = 'pinned'
@@ -150,7 +150,8 @@ export function buildRows(
   worktrees: Worktree[],
   repoMap: Map<string, Repo>,
   prCache: Record<string, unknown> | null,
-  collapsedGroups: Set<string>
+  collapsedGroups: Set<string>,
+  repoOrder?: Map<string, number>
 ): Row[] {
   const result: Row[] = []
 
@@ -210,7 +211,28 @@ export function buildRows(
       }
     }
   } else {
-    orderedGroups.push(...Array.from(grouped.entries()))
+    // Why: header order must follow the canonical state.repos array order, not
+    // first-encounter from the smart-sorted worktree stream — otherwise sorting
+    // or filtering side effects could shuffle which repo header appears first,
+    // and manual reorder would have nothing to bind to. Unknown ids (no entry
+    // in repoOrder) sort last by label so they remain deterministic.
+    const entries = Array.from(grouped.entries())
+    if (repoOrder) {
+      const rankFor = (key: string): number => {
+        const repoId = key.startsWith('repo:') ? key.slice('repo:'.length) : key
+        const rank = repoOrder.get(repoId)
+        return rank === undefined ? Number.POSITIVE_INFINITY : rank
+      }
+      entries.sort((a, b) => {
+        const ra = rankFor(a[0])
+        const rb = rankFor(b[0])
+        if (ra !== rb) {
+          return ra - rb
+        }
+        return a[1].label.localeCompare(b[1].label)
+      })
+    }
+    orderedGroups.push(...entries)
   }
 
   for (const [key, group] of orderedGroups) {
@@ -249,73 +271,6 @@ export function buildRows(
   }
 
   return result
-}
-
-/**
- * Returns true when the worktree matches the search query against any of:
- * displayName, branch, repo name, comment, PR number/title, issue number/title.
- * `q` must already be lowercased by the caller.
- */
-export function matchesSearch(
-  w: Worktree,
-  q: string,
-  repoMap: Map<string, Repo>,
-  prCache: Record<string, { data?: { number: number; title: string } | null }> | null,
-  issueCache: Record<string, { data?: { number: number; title: string } | null }> | null
-): boolean {
-  // Cheap field checks first
-  if (w.displayName.toLowerCase().includes(q)) {
-    return true
-  }
-  if (branchName(w.branch).toLowerCase().includes(q)) {
-    return true
-  }
-  if ((repoMap.get(w.repoId)?.displayName ?? '').toLowerCase().includes(q)) {
-    return true
-  }
-  if (w.comment && w.comment.toLowerCase().includes(q)) {
-    return true
-  }
-
-  // Strip leading '#' so that searching "#304" matches number 304.
-  // Guard against bare '#' which would produce an empty string and match everything.
-  const numQuery = q.startsWith('#') ? q.slice(1) : q
-  if (!numQuery) {
-    return false
-  }
-
-  // PR: check auto-detected PR from cache, then manual linkedPR as fallback
-  const repo = repoMap.get(w.repoId)
-  const branch = branchName(w.branch)
-  const prKey = repo && branch ? `${repo.path}::${branch}` : ''
-  const pr = prKey && prCache ? prCache[prKey]?.data : undefined
-
-  if (pr) {
-    if (String(pr.number).includes(numQuery)) {
-      return true
-    }
-    if (pr.title.toLowerCase().includes(q)) {
-      return true
-    }
-  } else if (w.linkedPR != null) {
-    if (String(w.linkedPR).includes(numQuery)) {
-      return true
-    }
-  }
-
-  // Issue: check linkedIssue number and cached title
-  if (w.linkedIssue != null) {
-    if (String(w.linkedIssue).includes(numQuery)) {
-      return true
-    }
-    const issueKey = repo ? `${repo.path}::${w.linkedIssue}` : ''
-    const issue = issueKey && issueCache ? issueCache[issueKey]?.data : undefined
-    if (issue?.title.toLowerCase().includes(q)) {
-      return true
-    }
-  }
-
-  return false
 }
 
 export function getGroupKeyForWorktree(

@@ -33,9 +33,21 @@ export default function globalSetup(): void {
     execSync('npx electron-vite build --mode e2e', {
       cwd: root,
       stdio: 'inherit',
-      timeout: 120_000,
+      timeout: 120_000
     })
     console.log('[e2e] Build complete.')
+  }
+
+  if (process.env.ORCA_E2E_SSH_LOCALHOST === '1') {
+    // Why: the localhost SSH spec deploys Orca's relay from out/relay. The
+    // normal Electron E2E build does not produce that bundle, so build it only
+    // for the explicit local-machine SSH run.
+    console.log('[e2e] Building SSH relay bundle for localhost SSH E2E...')
+    execSync('pnpm run build:relay', {
+      cwd: root,
+      stdio: 'inherit',
+      timeout: 120_000
+    })
   }
 
   // ── 2. Create a seeded test git repo ───────────────────────────────
@@ -53,10 +65,7 @@ export default function globalSetup(): void {
     path.join(testRepoDir, 'README.md'),
     '# Orca E2E Test Repo\n\nThis repo was created automatically for Playwright tests.\n'
   )
-  writeFileSync(
-    path.join(testRepoDir, 'CLAUDE.md'),
-    '# CLAUDE.md\n\nTest instructions for E2E.\n'
-  )
+  writeFileSync(path.join(testRepoDir, 'CLAUDE.md'), '# CLAUDE.md\n\nTest instructions for E2E.\n')
   writeFileSync(
     path.join(testRepoDir, 'package.json'),
     `${JSON.stringify({ name: 'orca-e2e-test', version: '0.0.0', private: true }, null, 2)}\n`
@@ -74,7 +83,7 @@ export default function globalSetup(): void {
   const worktreeDir = path.join(testRepoDir, '..', `orca-e2e-worktree-${Date.now()}`)
   execSync(`git worktree add "${worktreeDir}" -b e2e-secondary`, {
     cwd: testRepoDir,
-    stdio: 'pipe',
+    stdio: 'pipe'
   })
   console.log(`[e2e] Secondary worktree created at ${worktreeDir}`)
 

@@ -5,6 +5,8 @@ import type {
   GitDiffResult,
   GitBranchCompareResult,
   GitConflictOperation,
+  GitPushTarget,
+  GitUpstreamStatus,
   GitWorktreeInfo,
   SearchOptions,
   SearchResult
@@ -25,10 +27,27 @@ export type PtySpawnOptions = {
   /** Daemon session ID for reattach. When provided, the daemon reconnects
    *  to an existing session instead of creating a new one. */
   sessionId?: string
+  /** Why: allows the renderer to request a specific shell for a single new
+   *  terminal tab (e.g. "open this tab in WSL" from the "+" submenu) without
+   *  changing the user's persistent default shell setting. Only consulted on
+   *  Windows; ignored on macOS/Linux where shell selection is not exposed. */
+  shellOverride?: string
+  /** Why: PowerShell is the top-level shell family in product terms, but on
+   *  Windows we may need to choose between inbox Windows PowerShell 5.1 and
+   *  pwsh.exe at spawn time. Threading the persisted implementation choice
+   *  through spawn options keeps local PTY and daemon PTY semantics aligned
+   *  without promoting pwsh into a separate shell family. */
+  terminalWindowsPowerShellImplementation?: 'auto' | 'powershell.exe' | 'pwsh.exe'
 }
 
 export type PtySpawnResult = {
   id: string
+  /** OS-level pid of the shell process, when available at spawn time.
+   *  Why: the memory collector needs this to walk each PTY's process
+   *  subtree. Daemon-backed providers return it from the RPC result;
+   *  local providers read it from node-pty. Null when the underlying
+   *  provider could not publish a pid (e.g., race during spawn). */
+  pid?: number | null
   /** ANSI snapshot of the terminal screen, present when reattaching to an
    *  existing daemon session. Write this to xterm.js to restore visual state. */
   snapshot?: string
@@ -62,7 +81,7 @@ export type IPtyProvider = {
   attach(id: string): Promise<void>
   write(id: string, data: string): void
   resize(id: string, cols: number, rows: number): void
-  shutdown(id: string, immediate: boolean): Promise<void>
+  shutdown(id: string, opts: { immediate?: boolean; keepHistory?: boolean }): Promise<void>
   sendSignal(id: string, signal: string): Promise<void>
   getCwd(id: string): Promise<string>
   getInitialCwd(id: string): Promise<string>
@@ -115,7 +134,13 @@ export type IFilesystemProvider = {
 
 export type IGitProvider = {
   getStatus(worktreePath: string): Promise<GitStatusResult>
-  getDiff(worktreePath: string, filePath: string, staged: boolean): Promise<GitDiffResult>
+  commit(worktreePath: string, message: string): Promise<{ success: boolean; error?: string }>
+  getDiff(
+    worktreePath: string,
+    filePath: string,
+    staged: boolean,
+    compareAgainstHead?: boolean
+  ): Promise<GitDiffResult>
   stageFile(worktreePath: string, filePath: string): Promise<void>
   unstageFile(worktreePath: string, filePath: string): Promise<void>
   bulkStageFiles(worktreePath: string, filePaths: string[]): Promise<void>
@@ -123,6 +148,10 @@ export type IGitProvider = {
   discardChanges(worktreePath: string, filePath: string): Promise<void>
   detectConflictOperation(worktreePath: string): Promise<GitConflictOperation>
   getBranchCompare(worktreePath: string, baseRef: string): Promise<GitBranchCompareResult>
+  getUpstreamStatus(worktreePath: string): Promise<GitUpstreamStatus>
+  pushBranch(worktreePath: string, publish?: boolean, pushTarget?: GitPushTarget): Promise<void>
+  pullBranch(worktreePath: string): Promise<void>
+  fetchRemote(worktreePath: string): Promise<void>
   getBranchDiff(
     worktreePath: string,
     baseRef: string,
@@ -133,7 +162,7 @@ export type IGitProvider = {
     repoPath: string,
     branchName: string,
     targetDir: string,
-    options?: { base?: string; track?: boolean }
+    options?: { base?: string }
   ): Promise<void>
   removeWorktree(worktreePath: string, force?: boolean): Promise<void>
   isGitRepo(path: string): boolean

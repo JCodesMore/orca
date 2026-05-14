@@ -1,10 +1,67 @@
 import type { Worktree, Repo, TerminalTab } from '../../../../shared/types'
-import type { AppState } from '@/store/types'
-import { AGENT_DASHBOARD_ENABLED } from '../../../../shared/constants'
-import { matchesSearch } from './worktree-list-groups'
 import { buildWorktreeComparator, sortWorktreesSmart } from './smart-sort'
+import { tabHasLivePty } from '@/lib/tab-has-live-pty'
 import { useAppStore } from '@/store'
 import { getAllWorktreesFromState, getRepoMapFromState } from '@/store/selectors'
+
+/**
+ * Whether a worktree represents the repo's default-branch row that the
+ * "Hide Default Branch Workspace" setting targets. Folder-mode projects are
+ * main worktrees with branch === '' and are intentionally preserved.
+ *
+ * Why a shared helper: this predicate gates visibility in both the sidebar
+ * pipeline (computeVisibleWorktreeIds) and the Cmd+J jump palette. Keeping
+ * the definition in one place prevents the two surfaces from drifting.
+ */
+export function isDefaultBranchWorkspace(worktree: Worktree): boolean {
+  return worktree.isMainWorktree && worktree.branch.trim() !== ''
+}
+
+/** Inputs describing every sidebar filter that can leave the list empty. */
+export type SidebarFilterState = {
+  showActiveOnly: boolean
+  filterRepoIds: readonly string[]
+  hideDefaultBranchWorkspace: boolean
+}
+
+/**
+ * Whether at least one sidebar filter is active — drives the "Clear Filters"
+ * escape hatch in the empty-state message. Kept pure so it can be unit-tested
+ * alongside the sorting pipeline.
+ *
+ * Why include hideDefaultBranchWorkspace here: without it, a user whose only
+ * worktree is the default-branch row and who toggles hide-on would see the
+ * "No worktrees found" message with no in-sidebar recovery path.
+ */
+export function sidebarHasActiveFilters(state: SidebarFilterState): boolean {
+  return state.showActiveOnly || state.filterRepoIds.length > 0 || state.hideDefaultBranchWorkspace
+}
+
+/** Describes which mutators the Clear Filters button must invoke, separated
+ *  from the mutators themselves so the decision logic is testable. */
+export type ClearFilterActions = {
+  resetShowActiveOnly: boolean
+  resetFilterRepoIds: boolean
+  resetHideDefaultBranchWorkspace: boolean
+}
+
+/**
+ * Determines which sidebar filters the Clear Filters button needs to reset.
+ * Returning an explicit action plan (rather than just calling the setters)
+ * keeps the pure decision separate from the impure mutations, so tests can
+ * verify the logic without mounting the component.
+ *
+ * Why reset only the ones that are set: keeps Clear Filters from churning
+ * UI state (and the debounced ui.set write-back) on every click when the
+ * flag was already off.
+ */
+export function computeClearFilterActions(state: SidebarFilterState): ClearFilterActions {
+  return {
+    resetShowActiveOnly: state.showActiveOnly,
+    resetFilterRepoIds: state.filterRepoIds.length > 0,
+    resetHideDefaultBranchWorkspace: state.hideDefaultBranchWorkspace
+  }
+}
 
 /**
  * Shared pure utility that computes the ordered list of visible (non-archived,
@@ -21,14 +78,17 @@ export function computeVisibleWorktreeIds(
   sortedIds: string[],
   opts: {
     filterRepoIds: string[]
-    searchQuery: string
     showActiveOnly: boolean
     tabsByWorktree: Record<string, TerminalTab[]> | null
+    ptyIdsByTabId: Record<string, string[]> | null
     browserTabsByWorktree?: Record<string, { id: string }[]> | null
     activeWorktreeId?: string | null
+    // Why required: every caller (WorktreeList, getVisibleWorktreeIds
+    // fallback, tests) reads the flag from the UI store. Making the field
+    // required prevents a future caller from silently dropping the filter by
+    // forgetting to pass it.
+    hideDefaultBranchWorkspace: boolean
     repoMap: Map<string, Repo>
-    prCache: AppState['prCache'] | null
-    issueCache: AppState['issueCache'] | null
   }
 ): string[] {
   let all: Worktree[] = getAllWorktreesFromState({ worktreesByRepo })
@@ -36,24 +96,23 @@ export function computeVisibleWorktreeIds(
   // Filter archived
   all = all.filter((w) => !w.isArchived)
 
+  if (opts.hideDefaultBranchWorkspace) {
+    all = all.filter((w) => !isDefaultBranchWorkspace(w))
+  }
+
   // Filter by repo
   if (opts.filterRepoIds.length > 0) {
     const selectedRepoIds = new Set(opts.filterRepoIds)
     all = all.filter((w) => selectedRepoIds.has(w.repoId))
   }
 
-  // Filter by search — matches against displayName, branch, repo, comment,
-  // PR number/title, and issue number/title (see matchesSearch).
-  if (opts.searchQuery) {
-    const q = opts.searchQuery.toLowerCase()
-    all = all.filter((w) => matchesSearch(w, q, opts.repoMap, opts.prCache, opts.issueCache))
-  }
-
   // Filter active only
   if (opts.showActiveOnly) {
     all = all.filter((w) => {
       const tabs = opts.tabsByWorktree?.[w.id] ?? []
-      const hasLiveTerminal = tabs.some((t) => t.ptyId)
+      const hasLiveTerminal = tabs.some((tab) =>
+        opts.ptyIdsByTabId ? tabHasLivePty(opts.ptyIdsByTabId, tab.id) : false
+      )
       const hasBrowserTabs = (opts.browserTabsByWorktree?.[w.id] ?? []).length > 0
       // Why: "Active only" should reflect the surfaces Orca can actually
       // restore into, not just PTY-backed terminals. A browser-tab worktree is
@@ -120,14 +179,14 @@ export function getVisibleWorktreeIds(): string[] {
 
   let sortedIds: string[]
 
-  const agentStatusForSort = AGENT_DASHBOARD_ENABLED ? state.agentStatusByPaneKey : undefined
   if (state.sortBy === 'smart') {
     sortedIds = sortWorktreesSmart(
       allWorktrees,
       state.tabsByWorktree,
       repoMap,
       state.prCache,
-      agentStatusForSort
+      state.agentStatusByPaneKey,
+      state.ptyIdsByTabId
     ).map((w) => w.id)
   } else {
     const sorted = [...allWorktrees].sort(
@@ -138,7 +197,10 @@ export function getVisibleWorktreeIds(): string[] {
         state.prCache,
         Date.now(),
         null,
-        agentStatusForSort
+        state.agentStatusByPaneKey,
+        undefined,
+        undefined,
+        state.ptyIdsByTabId
       )
     )
     sortedIds = sorted.map((w) => w.id)
@@ -146,13 +208,12 @@ export function getVisibleWorktreeIds(): string[] {
 
   return computeVisibleWorktreeIds(state.worktreesByRepo, sortedIds, {
     filterRepoIds: state.filterRepoIds,
-    searchQuery: state.searchQuery,
     showActiveOnly: state.showActiveOnly,
     tabsByWorktree: state.tabsByWorktree,
+    ptyIdsByTabId: state.ptyIdsByTabId,
     browserTabsByWorktree: state.browserTabsByWorktree,
     activeWorktreeId: state.activeWorktreeId,
-    repoMap,
-    prCache: state.prCache,
-    issueCache: state.issueCache
+    hideDefaultBranchWorkspace: state.hideDefaultBranchWorkspace,
+    repoMap
   })
 }

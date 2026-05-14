@@ -29,6 +29,7 @@ function createMockSubprocess(): SubprocessHandle & {
     onExit(cb) {
       onExitCb = cb
     },
+    dispose: vi.fn(),
     _simulateData(data: string) {
       onDataCb?.(data)
     },
@@ -130,7 +131,7 @@ describe('DaemonPtyProvider', () => {
   describe('shutdown (kill session)', () => {
     it('kills the session in the daemon', async () => {
       await provider.spawn({ cols: 80, rows: 24, sessionId: 's1' })
-      await provider.shutdown('s1', false)
+      await provider.shutdown('s1', { immediate: false })
 
       expect(lastSubprocess.kill).toHaveBeenCalled()
     })

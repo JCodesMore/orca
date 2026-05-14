@@ -3,32 +3,30 @@ import type { ITerminalOptions } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 // Upstream packaging bug: @xterm/addon-ligatures declares `"main":
 // "lib/addon-ligatures.js"` but ships only the `.mjs` entry, so Vite fails to
-// resolve the bare import. Fixed locally via patches/@xterm__addon-ligatures*.
+// resolve the bare import. Fixed locally via config/patches/@xterm__addon-ligatures*.
 // Tracking upstream: https://github.com/xtermjs/xterm.js/issues/5822 — drop
 // the patch once that lands.
 import { LigaturesAddon } from '@xterm/addon-ligatures'
 import { SearchAddon } from '@xterm/addon-search'
 import { Unicode11Addon } from '@xterm/addon-unicode11'
 import { WebLinksAddon } from '@xterm/addon-web-links'
-import { WebglAddon } from '@xterm/addon-webgl'
 import { SerializeAddon } from '@xterm/addon-serialize'
 
 import type { PaneManagerOptions, ManagedPaneInternal } from './pane-manager-types'
 import type { DragReorderState } from './pane-drag-reorder'
 import type { DragReorderCallbacks } from './pane-drag-reorder'
 import { attachPaneDrag } from './pane-drag-reorder'
-import { safeFit, captureScrollState, restoreScrollState } from './pane-tree-ops'
+import { safeFit } from './pane-tree-ops'
 import {
   attachPaneFitResizeObserver,
   detachPaneFitResizeObserver
 } from './pane-fit-resize-observer'
 import { buildDefaultTerminalOptions } from './pane-terminal-options'
+import { ENABLE_WEBGL_RENDERER, attachWebgl, disposeWebgl } from './pane-webgl-renderer'
 
 // ---------------------------------------------------------------------------
 // Pane creation, terminal open/close, addon management
 // ---------------------------------------------------------------------------
-
-const ENABLE_WEBGL_RENDERER = true
 
 function getTerminalUrlOpenHint(): string {
   return navigator.userAgent.includes('Mac')
@@ -108,9 +106,11 @@ export function createPaneDOM(
     container,
     xtermContainer,
     linkTooltip,
+    terminalGpuAcceleration: options.terminalGpuAcceleration ?? 'auto',
     gpuRenderingEnabled: ENABLE_WEBGL_RENDERER,
     webglAttachmentDeferred: false,
     webglDisabledAfterContextLoss: false,
+    hasComplexScriptOutput: false,
     fitAddon,
     fitResizeObserver: null,
     pendingObservedFitRafId: null,
@@ -122,7 +122,7 @@ export function createPaneDOM(
     ligaturesAddon: null,
     compositionHandler: null,
     pendingSplitScrollState: null,
-    pendingDragScrollState: null
+    debugLabel: options.debugLabel ?? null
   }
 
   // Focus handler: clicking a pane makes it active and explicitly focuses
@@ -169,7 +169,15 @@ export function openTerminal(pane: ManagedPaneInternal): void {
   terminal.loadAddon(unicode11Addon)
   terminal.loadAddon(webLinksAddon)
 
-  // Activate unicode 11
+  // Activate Unicode 11 widths *before* any caller-driven write. CJK / emoji /
+  // ZWJ codepoints get baked into the buffer at the active unicode version on
+  // write — if a restore (snapshot, scrollback, cold-restore) writes bytes
+  // through xterm while the default v6 width tables are still active, wide
+  // chars lay out as single cells and any subsequent re-measurement breaks
+  // pairing (visible as broken `?`-style glyphs). All restore paths
+  // (replayTerminalLayout → splitPane/createInitialPane → openTerminal,
+  // restoreScrollbackBuffers, handleReattachResult) run after openTerminal,
+  // so the activation must stay at this position.
   terminal.unicode.activeVersion = '11'
 
   // Why: the OS reads the focused textarea's screen rect at compositionstart to
@@ -266,83 +274,6 @@ export function setLigaturesEnabled(pane: ManagedPaneInternal, enabled: boolean)
       disposeWebgl(pane)
       attachWebgl(pane)
     }
-  }
-}
-
-export function disposeWebgl(pane: ManagedPaneInternal): void {
-  if (pane.webglAddon) {
-    try {
-      pane.webglAddon.dispose()
-    } catch {
-      /* ignore */
-    }
-    pane.webglAddon = null
-  }
-}
-
-export function attachWebgl(pane: ManagedPaneInternal): void {
-  if (
-    !ENABLE_WEBGL_RENDERER ||
-    !pane.gpuRenderingEnabled ||
-    pane.webglAttachmentDeferred ||
-    pane.webglDisabledAfterContextLoss
-  ) {
-    pane.webglAddon = null
-    return
-  }
-  try {
-    const webglAddon = new WebglAddon()
-    webglAddon.onContextLoss(() => {
-      console.warn(
-        '[terminal] WebGL context lost for pane',
-        pane.id,
-        '— falling back to DOM renderer'
-      )
-      // Why: Chromium starts reclaiming terminal contexts under pressure.
-      // Recreating WebGL for this pane can loop context loss and leave xterm
-      // visually blank, so keep the pane on the DOM renderer until remount.
-      pane.webglDisabledAfterContextLoss = true
-      webglAddon.dispose()
-      pane.webglAddon = null
-      // Why: when the WebGL context is lost (GPU memory pressure, Chromium
-      // context limit, driver hiccup), the GPU-rendered canvas goes blank
-      // instantly — this is standard browser behaviour. After disposing the
-      // addon, xterm.js falls back to the DOM renderer, but it may not
-      // redraw the viewport unprompted.  Without an explicit
-      // refresh + refit, the scrollback area appears as blank space at the
-      // top of the terminal while only the most recent output is visible at
-      // the bottom. Deferring to the next frame gives the DOM renderer time
-      // to initialise before we ask it to repaint.
-      //
-      // Why content-match instead of wasAtBottom: context loss often fires
-      // during splitPane when a new WebGL canvas is created and Chromium
-      // reclaims the old one. The fit() here triggers a reflow that changes
-      // line numbering; the simple wasAtBottom check can't track partially-
-      // scrolled positions and would undo scroll restoration from splitPane.
-      requestAnimationFrame(() => {
-        try {
-          if (pane.pendingSplitScrollState) {
-            pane.fitAddon.fit()
-          } else if (pane.pendingDragScrollState) {
-            pane.fitAddon.fit()
-            restoreScrollState(pane.terminal, pane.pendingDragScrollState)
-          } else {
-            const scrollState = captureScrollState(pane.terminal)
-            pane.fitAddon.fit()
-            restoreScrollState(pane.terminal, scrollState)
-          }
-          pane.terminal.refresh(0, pane.terminal.rows - 1)
-        } catch {
-          /* ignore — pane may have been disposed in the meantime */
-        }
-      })
-    })
-    pane.terminal.loadAddon(webglAddon)
-    pane.webglAddon = webglAddon
-  } catch (err) {
-    // WebGL not available — default DOM renderer is fine, but log it for debugging
-    console.warn('[terminal] WebGL unavailable for pane', pane.id, '— using DOM renderer:', err)
-    pane.webglAddon = null
   }
 }
 

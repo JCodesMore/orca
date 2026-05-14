@@ -6,8 +6,11 @@ describe('detectLanguage', () => {
     expect(detectLanguage('src/components/App.vue')).toBe('vue')
   })
 
-  it('keeps .astro and .svelte mapped to html until their grammars ship', () => {
-    expect(detectLanguage('src/routes/index.astro')).toBe('html')
-    expect(detectLanguage('src/components/Widget.svelte')).toBe('html')
+  it('maps .svelte files to the custom svelte language id', () => {
+    expect(detectLanguage('src/components/Widget.svelte')).toBe('svelte')
+  })
+
+  it('maps .astro files to the custom astro language id', () => {
+    expect(detectLanguage('src/routes/index.astro')).toBe('astro')
   })
 })

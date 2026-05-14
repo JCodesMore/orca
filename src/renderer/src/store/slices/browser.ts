@@ -8,11 +8,19 @@ import type {
   BrowserLoadError,
   BrowserPage,
   BrowserSessionProfile,
+  BrowserViewportPresetId,
   BrowserWorkspace,
   WorkspaceSessionState
 } from '../../../../shared/types'
 import { ORCA_BROWSER_BLANK_URL } from '../../../../shared/constants'
+import { redactKagiSessionToken } from '../../../../shared/browser-url'
+import {
+  MAX_BROWSER_HISTORY_ENTRIES,
+  normalizeBrowserHistoryEntries,
+  normalizeBrowserHistoryUrl
+} from '../../../../shared/workspace-session-browser-history'
 import { pickNeighbor } from './tab-group-state'
+import { destroyWorkspaceWebviews } from './browser-webview-cleanup'
 
 type CreateBrowserTabOptions = {
   activate?: boolean
@@ -64,6 +72,7 @@ export type BrowserSlice = {
     options?: CreateBrowserTabOptions
   ) => BrowserWorkspace
   closeBrowserTab: (tabId: string) => void
+  shutdownWorktreeBrowsers: (worktreeId: string) => Promise<void>
   reopenClosedBrowserTab: (worktreeId: string) => BrowserWorkspace | null
   setActiveBrowserTab: (tabId: string) => void
   createBrowserPage: (
@@ -74,11 +83,28 @@ export type BrowserSlice = {
   closeBrowserPage: (pageId: string) => void
   reopenClosedBrowserPage: (workspaceId: string) => BrowserPage | null
   setActiveBrowserPage: (workspaceId: string, pageId: string) => void
+  // Why: scoped sibling of setActiveBrowserTab+setActiveBrowserPage that
+  // never yanks the user across worktrees. Multiple agents can drive
+  // browsers in parallel worktrees; a global focus call from agent X would
+  // steal the screen from the user reading agent Y. Updates per-worktree
+  // active tab/page unconditionally; updates the GLOBAL active tab and (if
+  // surfacePane) global activeTabType only when worktreeId === active
+  // worktree. Cross-worktree calls pre-stage the targeted worktree's view
+  // for whenever the user next switches to it.
+  focusBrowserTabInWorktree: (
+    worktreeId: string,
+    browserPageId: string,
+    options?: { surfacePane?: boolean }
+  ) => void
   consumeAddressBarFocusRequest: (pageId: string) => boolean
   updateBrowserTabPageState: (pageId: string, updates: BrowserTabPageState) => void
   updateBrowserPageState: (pageId: string, updates: BrowserTabPageState) => void
   setBrowserTabUrl: (pageId: string, url: string) => void
   setBrowserPageUrl: (pageId: string, url: string) => void
+  setBrowserPageViewportPreset: (
+    pageId: string,
+    viewportPresetId: BrowserViewportPresetId | null
+  ) => void
   hydrateBrowserSession: (session: WorkspaceSessionState) => void
   switchBrowserTabProfile: (workspaceId: string, profileId: string | null) => void
   browserSessionProfiles: BrowserSessionProfile[]
@@ -102,6 +128,7 @@ export type BrowserSlice = {
     profiles: { name: string; directory: string }[]
     selectedProfile: string
   }[]
+  detectedBrowsersLoaded: boolean
   fetchDetectedBrowsers: () => Promise<void>
   importCookiesFromBrowser: (
     profileId: string,
@@ -116,43 +143,16 @@ export type BrowserSlice = {
   setDefaultBrowserSessionProfileId: (profileId: string | null) => void
 }
 
-const MAX_BROWSER_HISTORY_ENTRIES = 200
-
-function normalizeHistoryUrl(url: string): string {
-  try {
-    const parsed = new URL(url)
-    parsed.hostname = parsed.hostname.toLowerCase()
-    parsed.protocol = parsed.protocol.toLowerCase()
-    let normalized = parsed.toString()
-    if (normalized.endsWith('/')) {
-      normalized = normalized.slice(0, -1)
-    }
-    return normalized
-  } catch {
-    return url.toLowerCase()
-  }
-}
-
-function deduplicateHistory(entries: BrowserHistoryEntry[]): BrowserHistoryEntry[] {
-  const seen = new Set<string>()
-  const deduped: BrowserHistoryEntry[] = []
-  for (const entry of entries) {
-    const key = entry.normalizedUrl || normalizeHistoryUrl(entry.url)
-    if (seen.has(key)) {
-      continue
-    }
-    seen.add(key)
-    deduped.push(entry.normalizedUrl ? entry : { ...entry, normalizedUrl: key })
-  }
-  return deduped.slice(0, MAX_BROWSER_HISTORY_ENTRIES)
-}
-
 function normalizeUrl(url: string): string {
   const trimmed = url.trim()
   if (trimmed.length === 0) {
     return 'about:blank'
   }
-  return trimmed
+  // Why: setBrowserPageUrl is the single sink for URL updates from did-navigate,
+  // CDP navigation-update IPC, and direct address-bar submits. Redact at this
+  // boundary so the Kagi bearer token cannot reach BrowserPage.url, which is
+  // persisted to disk via the workspace session writer.
+  return redactKagiSessionToken(trimmed)
 }
 
 function normalizeBrowserTitle(title: string | null | undefined, url: string): string {
@@ -520,6 +520,37 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
     }
   },
 
+  shutdownWorktreeBrowsers: async (worktreeId) => {
+    const workspaces = get().browserTabsByWorktree[worktreeId] ?? []
+    // Why: snapshot pre-loop so the post-loop set() can reproduce the original
+    // `hadBrowserTabs` semantics. Reading `s.browserTabsByWorktree[worktreeId]`
+    // inside set() would always be empty here because each closeBrowserTab call
+    // above has already removed the workspace from that array.
+    const hadBrowserTabs = workspaces.length > 0
+    for (const workspace of workspaces) {
+      destroyWorkspaceWebviews(get().browserPagesByWorkspace, workspace.id)
+      get().closeBrowserTab(workspace.id)
+    }
+    set((s) => {
+      const nextBrowserTabsByWorktree = { ...s.browserTabsByWorktree }
+      delete nextBrowserTabsByWorktree[worktreeId]
+      const nextActiveBrowserTabIdByWorktree = { ...s.activeBrowserTabIdByWorktree }
+      delete nextActiveBrowserTabIdByWorktree[worktreeId]
+      // Why: mirror shutdownWorktreeTerminals' `hadBrowserTabs && isActive`
+      // guard. Only reset the globally-visible active browser surface when the
+      // worktree being shut down is the one the user is looking at AND it
+      // actually had browser tabs to tear down.
+      const shouldResetGlobalBrowser = s.activeWorktreeId === worktreeId && hadBrowserTabs
+      return {
+        browserTabsByWorktree: nextBrowserTabsByWorktree,
+        activeBrowserTabIdByWorktree: nextActiveBrowserTabIdByWorktree,
+        ...(shouldResetGlobalBrowser
+          ? { activeBrowserTabId: null, activeTabType: 'terminal' as const }
+          : {})
+      }
+    })
+  },
+
   reopenClosedBrowserTab: (worktreeId) => {
     // Why: read and pop atomically inside set() to prevent a TOCTOU race
     // where two rapid Cmd+Shift+T presses both restore the same entry.
@@ -837,6 +868,78 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
     }
   },
 
+  focusBrowserTabInWorktree: (worktreeId, browserPageId, options) => {
+    // Why: bridge identifies the target by browserPageId (CDP page id stored
+    // on BrowserPage.id), but the renderer's tab strip activates a workspace
+    // (BrowserWorkspace.id, a local UUID). They diverge whenever a workspace
+    // owns more than one page. Walk pageIds in the targeted worktree's tab
+    // list to find the owning workspace.
+    const tabsForWorktree = get().browserTabsByWorktree[worktreeId] ?? []
+    const workspace = tabsForWorktree.find((tab) => (tab.pageIds ?? []).includes(browserPageId))
+    if (!workspace) {
+      // Best-effort: state for this worktree may not be hydrated yet, or the
+      // page closed between the bridge switching and this IPC arriving.
+      return
+    }
+    // Default to true: the only caller (`tab switch --focus` IPC listener)
+    // wants the pane surfaced when targeting the active worktree. `false` is
+    // an opt-out for hypothetical pure-pre-staging callers.
+    const surfacePane = options?.surfacePane ?? true
+    const pages = get().browserPagesByWorkspace[workspace.id] ?? []
+    const nextWorkspace = mirrorWorkspaceFromActivePage(
+      { ...workspace, activePageId: browserPageId },
+      pages
+    )
+    // TODO: per-worktree writes below duplicate setActiveBrowserTab /
+    // setActiveBrowserPage. We can't reuse those because they touch globals
+    // unconditionally (the very behavior --focus is avoiding). If they ever
+    // grow side-effects (analytics, persistence) those will silently diverge
+    // here. Consider extracting a private per-worktree-only helper that
+    // both call paths share.
+    set((s) => {
+      const isActiveWorktree = s.activeWorktreeId === worktreeId
+      // Per-worktree slots: always update (safe pre-staging; only visible
+      // when user navigates to this worktree).
+      const nextTabsByWorktree = {
+        ...s.browserTabsByWorktree,
+        [worktreeId]: tabsForWorktree.map((tab) => (tab.id === workspace.id ? nextWorkspace : tab))
+      }
+      const nextActiveTabIdByWorktree = {
+        ...s.activeBrowserTabIdByWorktree,
+        [worktreeId]: workspace.id
+      }
+      const nextActiveTabTypeByWorktree = surfacePane
+        ? { ...s.activeTabTypeByWorktree, [worktreeId]: 'browser' as const }
+        : s.activeTabTypeByWorktree
+      // Globals: only mutate when the targeted worktree is currently active.
+      // This is the line that keeps cross-worktree --focus calls silent.
+      return {
+        browserTabsByWorktree: nextTabsByWorktree,
+        activeBrowserTabIdByWorktree: nextActiveTabIdByWorktree,
+        activeTabTypeByWorktree: nextActiveTabTypeByWorktree,
+        activeBrowserTabId: isActiveWorktree ? workspace.id : s.activeBrowserTabId,
+        activeTabType: isActiveWorktree && surfacePane ? 'browser' : s.activeTabType
+      }
+    })
+
+    // Why: notify the CDP bridge which guest webContents is now active so
+    // subsequent agent commands target the correct page. Mirrors the
+    // notifyActiveTabChanged calls in setActiveBrowserTab/setActiveBrowserPage.
+    if (typeof window !== 'undefined' && window.api?.browser) {
+      window.api.browser.notifyActiveTabChanged({ browserPageId }).catch(() => {})
+    }
+
+    // Why: keep the unified-tab strip's active entry in sync within the
+    // targeted worktree. activateTab only mutates per-worktree slices, so
+    // it's safe to call cross-worktree without yanking the user.
+    const item = (get().unifiedTabsByWorktree[worktreeId] ?? []).find(
+      (entry) => entry.contentType === 'browser' && entry.entityId === workspace.id
+    )
+    if (item) {
+      get().activateTab(item.id)
+    }
+  },
+
   consumeAddressBarFocusRequest: (pageId) => {
     const state = get()
     if (
@@ -954,9 +1057,59 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
       }
     }),
 
-  hydrateBrowserSession: (session) => {
+  // viewportPresetId is a per-page setting on BrowserPage and is intentionally not
+  // mirrored onto BrowserWorkspace: the outer tab strip doesn't surface the preset,
+  // so there's no UI consumer at the workspace layer. Keeping it page-local avoids
+  // cross-layer plumbing; do NOT add mirrorWorkspaceFromActivePage here.
+  setBrowserPageViewportPreset: (pageId, viewportPresetId) =>
     set((s) => {
-      const persistedTabsByWorktree = session.browserTabsByWorktree ?? {}
+      const page = findPage(s.browserPagesByWorkspace, pageId)
+      if (!page) {
+        return s
+      }
+      const workspace = findWorkspace(s.browserTabsByWorktree, page.workspaceId)
+      if (!workspace) {
+        return s
+      }
+      const nextPages = (s.browserPagesByWorkspace[workspace.id] ?? []).map((entry) =>
+        entry.id === pageId ? { ...entry, viewportPresetId } : entry
+      )
+      return {
+        browserPagesByWorkspace: {
+          ...s.browserPagesByWorkspace,
+          [workspace.id]: nextPages
+        }
+      }
+    }),
+
+  hydrateBrowserSession: (session) => {
+    const persistedTabsByWorktree = session.browserTabsByWorktree ?? {}
+    const currentState = get()
+    const validWorktreeIdsForCleanup = new Set(
+      Object.values(currentState.worktreesByRepo)
+        .flat()
+        .map((worktree) => worktree.id)
+    )
+
+    // Why: mirror closeBrowserTab's contract — reducers are pure, imperative
+    // side effects bracket them. Compute dropped workspaces first, destroy
+    // their webviews, then run the state reducer unchanged. hydrate is called
+    // once at boot (App.tsx) when the webview registry is empty, so this loop
+    // is a no-op today; it's defense-in-depth for any future caller that
+    // re-hydrates after webviews are live.
+    const droppedWorkspaceIds: string[] = []
+    for (const [worktreeId, tabs] of Object.entries(persistedTabsByWorktree)) {
+      if (!validWorktreeIdsForCleanup.has(worktreeId)) {
+        for (const tab of tabs) {
+          droppedWorkspaceIds.push(tab.id)
+        }
+      }
+    }
+    for (const workspaceId of droppedWorkspaceIds) {
+      destroyWorkspaceWebviews(currentState.browserPagesByWorkspace, workspaceId)
+    }
+
+    set((s) => {
       const persistedPagesByWorkspace = session.browserPagesByWorkspace ?? {}
       const persistedActiveBrowserTabIdByWorktree = session.activeBrowserTabIdByWorktree ?? {}
       const persistedActiveTabTypeByWorktree = session.activeTabTypeByWorktree ?? {}
@@ -1088,7 +1241,7 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
         activeBrowserTabId,
         activeTabTypeByWorktree: nextActiveTabTypeByWorktree,
         activeTabType,
-        browserUrlHistory: deduplicateHistory(session.browserUrlHistory ?? [])
+        browserUrlHistory: normalizeBrowserHistoryEntries(session.browserUrlHistory ?? [])
       }
     })
 
@@ -1225,8 +1378,12 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
   },
 
   detectedBrowsers: [],
+  detectedBrowsersLoaded: false,
 
   fetchDetectedBrowsers: async () => {
+    if (get().detectedBrowsersLoaded) {
+      return
+    }
     try {
       const browsers = (await window.api.browser.sessionDetectBrowsers()) as {
         family: string
@@ -1234,9 +1391,10 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
         profiles: { name: string; directory: string }[]
         selectedProfile: string
       }[]
-      set({ detectedBrowsers: browsers })
+      set({ detectedBrowsers: browsers, detectedBrowsersLoaded: true })
     } catch {
       /* best-effort — empty list is acceptable fallback */
+      set({ detectedBrowsersLoaded: true })
     }
   },
 
@@ -1305,10 +1463,11 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
   },
 
   addBrowserHistoryEntry: (url, title) => {
-    if (url === ORCA_BROWSER_BLANK_URL || url === 'about:blank' || !url) {
+    const safeUrl = redactKagiSessionToken(url)
+    if (safeUrl === ORCA_BROWSER_BLANK_URL || safeUrl === 'about:blank' || !safeUrl) {
       return
     }
-    const normalized = normalizeHistoryUrl(url)
+    const normalized = normalizeBrowserHistoryUrl(safeUrl)
     set((s) => {
       const existing = s.browserUrlHistory.find((entry) => entry.normalizedUrl === normalized)
       let next: BrowserHistoryEntry[] = existing
@@ -1318,7 +1477,13 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
               : entry
           )
         : [
-            { url, normalizedUrl: normalized, title, lastVisitedAt: Date.now(), visitCount: 1 },
+            {
+              url: safeUrl,
+              normalizedUrl: normalized,
+              title,
+              lastVisitedAt: Date.now(),
+              visitCount: 1
+            },
             ...s.browserUrlHistory
           ]
       if (next.length > MAX_BROWSER_HISTORY_ENTRIES) {

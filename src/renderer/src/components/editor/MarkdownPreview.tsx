@@ -23,12 +23,19 @@ import { toast } from 'sonner'
 import { computeEditorFontSize } from '@/lib/editor-font-zoom'
 import { scrollTopCache, setWithLRU } from '@/lib/scroll-cache'
 import { detectLanguage } from '@/lib/language-detect'
-import type { Worktree } from '../../../../shared/types'
+import type { MarkdownDocument, Worktree } from '../../../../shared/types'
 import {
   fileUrlToAbsolutePath,
   getMarkdownPreviewLinkTarget,
+  isMarkdownPreviewOpenModifier,
   resolveMarkdownPreviewHref
 } from './markdown-preview-links'
+import {
+  createMarkdownDocumentIndex,
+  parseMarkdownDocLinkHref,
+  remarkMarkdownDocLinks,
+  resolveMarkdownDocLink
+} from './markdown-doc-links'
 import { absolutePathToFileUri, resolveMarkdownLinkTarget } from './markdown-internal-links'
 import { useLocalImageSrc } from './useLocalImageSrc'
 import CodeBlockCopyButton from './CodeBlockCopyButton'
@@ -41,17 +48,28 @@ import {
 } from './markdown-preview-search'
 import { usePreserveSectionDuringExternalEdit } from './usePreserveSectionDuringExternalEdit'
 import { openHttpLink } from '@/lib/http-link-routing'
+import { markdownPreviewUrlTransform } from './markdown-preview-url-transform'
 
 type MarkdownPreviewProps = {
   content: string
   filePath: string
   scrollCacheKey: string
   initialAnchor?: string | null
+  markdownDocuments?: MarkdownDocument[]
+  onOpenDocument?: (document: MarkdownDocument) => void | Promise<void>
 }
 
 const markdownPreviewSanitizeSchema = {
   ...defaultSchema,
   tagNames: [...(defaultSchema.tagNames ?? []), 'details', 'summary', 'kbd', 'sub', 'sup', 'ins'],
+  protocols: {
+    ...defaultSchema.protocols,
+    // Why: markdown preview owns file:// click routing and authorizes the
+    // user-selected path before opening it in Orca. Sanitization must preserve
+    // the target so the click handler can make that security decision.
+    href: [...(defaultSchema.protocols?.href ?? []), 'file'],
+    src: [...(defaultSchema.protocols?.src ?? []), 'file']
+  },
   attributes: {
     ...defaultSchema.attributes,
     '*': [...(defaultSchema.attributes?.['*'] ?? []), 'id'],
@@ -144,7 +162,9 @@ export default function MarkdownPreview({
   content,
   filePath,
   scrollCacheKey,
-  initialAnchor = null
+  initialAnchor = null,
+  markdownDocuments = [],
+  onOpenDocument
 }: MarkdownPreviewProps): React.JSX.Element {
   const rootRef = useRef<HTMLDivElement>(null)
   const bodyRef = useRef<HTMLDivElement>(null)
@@ -157,11 +177,13 @@ export default function MarkdownPreview({
   const [activeMatchIndex, setActiveMatchIndex] = useState(-1)
   const isMac = navigator.userAgent.includes('Mac')
   const openFile = useAppStore((s) => s.openFile)
+  const activateMarkdownLink = useAppStore((s) => s.activateMarkdownLink)
   const openMarkdownPreview = useAppStore((s) => s.openMarkdownPreview)
   const setMarkdownViewMode = useAppStore((s) => s.setMarkdownViewMode)
   const setPendingEditorReveal = useAppStore((s) => s.setPendingEditorReveal)
   const worktreesByRepo = useAppStore((s) => s.worktreesByRepo)
-  const worktreeRoot = findWorktreeForMarkdownPreviewPath(worktreesByRepo, filePath)?.path ?? null
+  const sourceWorktree = findWorktreeForMarkdownPreviewPath(worktreesByRepo, filePath)
+  const worktreeRoot = sourceWorktree?.path ?? null
   const settings = useAppStore((s) => s.settings)
   const editorFontZoomLevel = useAppStore((s) => s.editorFontZoomLevel)
   const editorFontSize = computeEditorFontSize(14, editorFontZoomLevel)
@@ -172,6 +194,10 @@ export default function MarkdownPreview({
   const renderedContent = usePreserveSectionDuringExternalEdit(content, bodyRef)
 
   const frontMatter = useMemo(() => extractFrontMatter(renderedContent), [renderedContent])
+  const markdownDocumentIndex = useMemo(
+    () => createMarkdownDocumentIndex(markdownDocuments),
+    [markdownDocuments]
+  )
   const frontMatterInner = useMemo(() => {
     if (!frontMatter) {
       return ''
@@ -410,7 +436,36 @@ export default function MarkdownPreview({
     sluggerRef.current.reset()
     const slugger = sluggerRef.current
     return {
-      a: ({ href, children, ...props }) => {
+      a: ({ href, children, className, ...props }) => {
+        const docLinkTarget = parseMarkdownDocLinkHref(href)
+        if (docLinkTarget !== null) {
+          const resolution = resolveMarkdownDocLink(docLinkTarget, markdownDocumentIndex)
+          const resolvedDocument = resolution.status === 'resolved' ? resolution.document : null
+          const title =
+            resolution.status === 'ambiguous' ? 'Document link is ambiguous' : 'Document not found'
+
+          const handleDocLinkClick = (event: React.MouseEvent<HTMLAnchorElement>): void => {
+            event.preventDefault()
+            if (resolvedDocument && onOpenDocument) {
+              void onOpenDocument(resolvedDocument)
+            }
+          }
+
+          return (
+            <a
+              {...props}
+              href={href}
+              className={`${className ?? ''} ${
+                resolvedDocument ? 'markdown-doc-link' : 'markdown-doc-link-broken'
+              }`.trim()}
+              title={resolvedDocument ? undefined : title}
+              onClick={handleDocLinkClick}
+            >
+              {children}
+            </a>
+          )
+        }
+
         const handleClick = (event: React.MouseEvent<HTMLAnchorElement>): void => {
           if (!href) {
             return
@@ -489,6 +544,14 @@ export default function MarkdownPreview({
 
           const targetWorktree = findWorktreeForMarkdownPreviewPath(worktreesByRepo, absolutePath)
           if (!targetWorktree) {
+            if (sourceWorktree) {
+              void activateMarkdownLink(href, {
+                sourceFilePath: filePath,
+                worktreeId: sourceWorktree.id,
+                worktreeRoot: sourceWorktree.path
+              })
+              return
+            }
             void window.api.shell.openFileUri(target.toString())
             return
           }
@@ -547,7 +610,13 @@ export default function MarkdownPreview({
         }
 
         return (
-          <a {...props} href={href} onClick={handleClick} style={{ cursor: 'pointer' }}>
+          <a
+            {...props}
+            href={href}
+            className={className}
+            onClick={handleClick}
+            style={{ cursor: 'pointer' }}
+          >
             {children}
           </a>
         )
@@ -557,7 +626,28 @@ export default function MarkdownPreview({
         // instantiates component overrides as regular React components, so hooks
         // are valid here despite the lowercase function name.
         const resolvedSrc = useLocalImageSrc(src, filePath)
-        return <img {...props} src={resolvedSrc} alt={alt ?? ''} />
+        const handleImageClick = (event: React.MouseEvent<HTMLImageElement>): void => {
+          if (!isMarkdownPreviewOpenModifier(event, isMac)) {
+            return
+          }
+
+          if (!src || !sourceWorktree) {
+            return
+          }
+
+          event.preventDefault()
+          event.stopPropagation()
+          void activateMarkdownLink(src, {
+            sourceFilePath: filePath,
+            worktreeId: sourceWorktree.id,
+            worktreeRoot: sourceWorktree.path
+          })
+        }
+
+        // Why: display uses IPC-backed blob URLs, but Cmd/Ctrl-click should open
+        // the original markdown target so local and SSH worktree images route
+        // through the same editor path as normal file links.
+        return <img {...props} src={resolvedSrc} alt={alt ?? ''} onClick={handleImageClick} />
       },
       // Why: Intercept code elements to detect mermaid fenced blocks. rehype-highlight
       // sets className="language-mermaid" on the <code> inside <pre> for ```mermaid blocks.
@@ -642,13 +732,17 @@ export default function MarkdownPreview({
     // cover every value the overrides actually close over; slugger is a ref.
   }, [
     filePath,
+    activateMarkdownLink,
     isDark,
     isMac,
+    markdownDocumentIndex,
+    onOpenDocument,
     openFile,
     openMarkdownPreview,
     scrollToAnchor,
     setMarkdownViewMode,
     setPendingEditorReveal,
+    sourceWorktree,
     worktreeRoot,
     worktreesByRepo
   ])
@@ -748,7 +842,16 @@ export default function MarkdownPreview({
         )}
         <Markdown
           components={components}
-          remarkPlugins={[remarkGfm, remarkBreaks, remarkFrontmatter, remarkMath]}
+          // Why: react-markdown filters file:// after rehype-sanitize; preview
+          // click handlers need the target so they can authorize and open it.
+          urlTransform={markdownPreviewUrlTransform}
+          remarkPlugins={[
+            remarkGfm,
+            remarkBreaks,
+            remarkFrontmatter,
+            remarkMath,
+            remarkMarkdownDocLinks
+          ]}
           // Why: raw HTML must be sanitized before any trusted renderer expands
           // it into richer DOM. Running KaTeX and syntax highlighting after
           // sanitize preserves VS Code-style math/code rendering without having

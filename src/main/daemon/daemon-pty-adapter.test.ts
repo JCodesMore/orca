@@ -31,6 +31,7 @@ function createMockSubprocess(): SubprocessHandle & {
     onExit(cb) {
       onExitCb = cb
     },
+    dispose: vi.fn(),
     _simulateData(data: string) {
       onDataCb?.(data)
     },
@@ -128,7 +129,7 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
   describe('shutdown', () => {
     it('kills the session', async () => {
       const { id } = await adapter.spawn({ cols: 80, rows: 24 })
-      await adapter.shutdown(id, false)
+      await adapter.shutdown(id, { immediate: false })
       expect(lastSubprocess.kill).toHaveBeenCalled()
     })
   })
@@ -181,6 +182,19 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
 
       await waitFor(() => dataPayloads.length > 0)
       expect(dataPayloads[0]).toEqual({ id, data: 'hello' })
+    })
+
+    it('coalesces burst data events before serializing daemon stream output', async () => {
+      const dataPayloads: { id: string; data: string }[] = []
+      adapter.onData((payload) => dataPayloads.push(payload))
+
+      const { id } = await adapter.spawn({ cols: 80, rows: 24 })
+      lastSubprocess._simulateData('a')
+      lastSubprocess._simulateData('b')
+      lastSubprocess._simulateData('c')
+
+      await waitFor(() => dataPayloads.length > 0)
+      expect(dataPayloads).toEqual([{ id, data: 'abc' }])
     })
   })
 
@@ -311,7 +325,7 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
     it('prevents spawn after shutdown for same sessionId', async () => {
       const sessionId = 'tombstone-test'
       await adapter.spawn({ cols: 80, rows: 24, sessionId })
-      await adapter.shutdown(sessionId, true)
+      await adapter.shutdown(sessionId, { immediate: true })
 
       await expect(adapter.spawn({ cols: 80, rows: 24, sessionId })).rejects.toThrow(
         'was explicitly killed'
@@ -320,7 +334,7 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
 
     it('allows spawn for different sessionId after shutdown', async () => {
       await adapter.spawn({ cols: 80, rows: 24, sessionId: 'kill-me' })
-      await adapter.shutdown('kill-me', true)
+      await adapter.shutdown('kill-me', { immediate: true })
 
       const result = await adapter.spawn({ cols: 80, rows: 24, sessionId: 'fresh-one' })
       expect(result.id).toBe('fresh-one')
@@ -329,7 +343,7 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
     it('clearTombstone allows re-spawn', async () => {
       const sessionId = 'cleared-tombstone'
       await adapter.spawn({ cols: 80, rows: 24, sessionId })
-      await adapter.shutdown(sessionId, true)
+      await adapter.shutdown(sessionId, { immediate: true })
 
       adapter.clearTombstone(sessionId)
 
@@ -348,7 +362,7 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
         const id = `evict-${i}`
         ids.push(id)
         await adapter.spawn({ cols: 80, rows: 24, sessionId: id })
-        await adapter.shutdown(id, true)
+        await adapter.shutdown(id, { immediate: true })
       }
 
       // All 5 should be tombstoned
@@ -361,7 +375,7 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
       // clearTombstone the first one, then re-kill it — it should still work
       adapter.clearTombstone(ids[0])
       await adapter.spawn({ cols: 80, rows: 24, sessionId: ids[0] })
-      await adapter.shutdown(ids[0], true)
+      await adapter.shutdown(ids[0], { immediate: true })
 
       // First tombstone was re-added at the end of the Map, so eviction
       // order is now [evict-1, evict-2, evict-3, evict-4, evict-0]
@@ -373,28 +387,32 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
 
   describe('reconcileOnStartup', () => {
     it('returns alive sessions for valid worktrees', async () => {
-      await adapter.spawn({ cols: 80, rows: 24, worktreeId: 'wt-active' })
+      const wt = 'repo-a::/wt/active'
+      await adapter.spawn({ cols: 80, rows: 24, worktreeId: wt })
 
-      const { alive, killed } = await adapter.reconcileOnStartup(new Set(['wt-active']))
+      const { alive, killed } = await adapter.reconcileOnStartup(new Set([wt]))
       expect(alive).toHaveLength(1)
-      expect(alive[0]).toContain('wt-active')
+      expect(alive[0]).toContain(wt)
       expect(killed).toHaveLength(0)
     })
 
     it('kills sessions for removed worktrees', async () => {
-      await adapter.spawn({ cols: 80, rows: 24, worktreeId: 'wt-removed' })
+      const wt = 'repo-a::/wt/removed'
+      await adapter.spawn({ cols: 80, rows: 24, worktreeId: wt })
 
-      const { alive, killed } = await adapter.reconcileOnStartup(new Set(['wt-other']))
+      const { alive, killed } = await adapter.reconcileOnStartup(new Set(['repo-a::/wt/other']))
       expect(alive).toHaveLength(0)
       expect(killed).toHaveLength(1)
-      expect(killed[0]).toContain('wt-removed')
+      expect(killed[0]).toContain(wt)
     })
 
     it('handles mix of valid and orphaned sessions', async () => {
-      await adapter.spawn({ cols: 80, rows: 24, worktreeId: 'wt-keep' })
-      await adapter.spawn({ cols: 80, rows: 24, worktreeId: 'wt-delete' })
+      const keep = 'repo-a::/wt/keep'
+      const drop = 'repo-a::/wt/delete'
+      await adapter.spawn({ cols: 80, rows: 24, worktreeId: keep })
+      await adapter.spawn({ cols: 80, rows: 24, worktreeId: drop })
 
-      const { alive, killed } = await adapter.reconcileOnStartup(new Set(['wt-keep']))
+      const { alive, killed } = await adapter.reconcileOnStartup(new Set([keep]))
       expect(alive).toHaveLength(1)
       expect(killed).toHaveLength(1)
     })
@@ -406,6 +424,22 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
       const { alive, killed } = await adapter.reconcileOnStartup(new Set([complexId]))
       expect(alive).toHaveLength(1)
       expect(killed).toHaveLength(0)
+    })
+
+    it('kills sessions whose id does not match the minted format, even if id is in valid set', async () => {
+      // Why: parsePtySessionId rejects bare UUIDs (no `@@`) and ids without
+      // the `::` worktree shape. Such sessions can't be attributed to any
+      // current worktree and must be treated as orphans regardless of
+      // valid-set membership. Passing the bare-uuid as a member of
+      // validWorktreeIds proves the new strict parser short-circuits the
+      // membership check — under the old loose parser this session would
+      // have been kept.
+      const sessionId = 'bare-uuid-no-separators'
+      await adapter.spawn({ cols: 80, rows: 24, sessionId })
+
+      const { alive, killed } = await adapter.reconcileOnStartup(new Set([sessionId]))
+      expect(alive).toHaveLength(0)
+      expect(killed).toHaveLength(1)
     })
   })
 
@@ -434,7 +468,7 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
       historyAdapter?.dispose()
     })
 
-    it('writes scrollback to disk on data events', async () => {
+    it('does not write to disk on individual data events (checkpoint-based)', async () => {
       historyAdapter = new DaemonPtyAdapter({ socketPath, tokenPath, historyPath: historyDir })
 
       const { id } = await historyAdapter.spawn({
@@ -447,11 +481,46 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
       lastSubprocess._simulateData('hello from pty\r\n')
       await new Promise((r) => setTimeout(r, 50))
 
-      const scrollback = readFileSync(
-        join(historyDir, getHistorySessionDirName(id), 'scrollback.bin'),
-        'utf-8'
+      // Why: checkpoint-based persistence does not write on every data event.
+      // No scrollback.bin should exist — checkpoints write checkpoint.json on a timer.
+      expect(existsSync(join(historyDir, getHistorySessionDirName(id), 'scrollback.bin'))).toBe(
+        false
       )
-      expect(scrollback).toContain('hello from pty')
+    })
+
+    it('checkpoints only dirty sessions on the periodic timer', async () => {
+      const adapterClass = DaemonPtyAdapter as unknown as { CHECKPOINT_INTERVAL_MS: number }
+      const previousInterval = adapterClass.CHECKPOINT_INTERVAL_MS
+      adapterClass.CHECKPOINT_INTERVAL_MS = 25
+
+      try {
+        historyAdapter = new DaemonPtyAdapter({ socketPath, tokenPath, historyPath: historyDir })
+        const { id } = await historyAdapter.spawn({
+          cols: 80,
+          rows: 24,
+          cwd: '/home/user',
+          sessionId: 'dirty-checkpoint'
+        })
+        const checkpointSpy = vi.spyOn(historyAdapter.getHistoryManager()!, 'checkpoint')
+
+        await new Promise((r) => setTimeout(r, 80))
+
+        // Why: idle terminals can be numerous. A periodic pass with no data
+        // must not serialize every live daemon session just because it exists.
+        expect(checkpointSpy).not.toHaveBeenCalled()
+
+        lastSubprocess._simulateData('new output\r\n')
+        await waitFor(() => checkpointSpy.mock.calls.length === 1)
+        expect(checkpointSpy).toHaveBeenCalledWith(
+          id,
+          expect.objectContaining({ snapshotAnsi: expect.stringContaining('new output') })
+        )
+
+        await new Promise((r) => setTimeout(r, 80))
+        expect(checkpointSpy).toHaveBeenCalledTimes(1)
+      } finally {
+        adapterClass.CHECKPOINT_INTERVAL_MS = previousInterval
+      }
     })
 
     it('writes meta.json with endedAt on exit', async () => {
@@ -487,7 +556,7 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
 
       expect(existsSync(join(historyDir, getHistorySessionDirName(id)))).toBe(true)
 
-      await historyAdapter.shutdown(id, true)
+      await historyAdapter.shutdown(id, { immediate: true })
       await new Promise((r) => setTimeout(r, 50))
 
       expect(existsSync(join(historyDir, getHistorySessionDirName(id)))).toBe(false)
@@ -559,7 +628,7 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
       expect(third.coldRestore).toBeUndefined()
     })
 
-    it('records post-cold-restore data to disk for future restores', async () => {
+    it('opens session for checkpointing after cold restore', async () => {
       const sessionId = 'post-restore-data'
       const sessionDir = join(historyDir, getHistorySessionDirName(sessionId))
       mkdirSync(sessionDir, { recursive: true })
@@ -581,24 +650,17 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
       const result = await historyAdapter.spawn({ cols: 80, rows: 24, sessionId })
       expect(result.coldRestore).toBeDefined()
 
-      // Restored scrollback is seeded into the new history file immediately
-      const seeded = readFileSync(
-        join(historyDir, getHistorySessionDirName(sessionId), 'scrollback.bin'),
-        'utf-8'
-      )
-      expect(seeded).toContain('old output')
-
-      // Simulate new data arriving after cold restore
-      lastSubprocess._simulateData('new post-restore output\r\n')
       await new Promise((r) => setTimeout(r, 50))
 
-      // History should now contain both the seeded and new data
-      const scrollback = readFileSync(
-        join(historyDir, getHistorySessionDirName(sessionId), 'scrollback.bin'),
-        'utf-8'
+      // Why: checkpoint-based persistence opens the session for future
+      // checkpointing but does not seed scrollback.bin. New data is persisted
+      // via periodic checkpoint timer, not per-chunk appendData.
+      const meta = JSON.parse(
+        readFileSync(join(historyDir, getHistorySessionDirName(sessionId), 'meta.json'), 'utf-8')
       )
-      expect(scrollback).toContain('old output')
-      expect(scrollback).toContain('new post-restore output')
+      expect(meta.cwd).toBe('/tmp')
+      expect(meta.cols).toBe(80)
+      expect(meta.rows).toBe(24)
     })
 
     it('does not cold-restore for clean shutdown (endedAt set)', async () => {
@@ -733,6 +795,72 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
       )
 
       respawnAdapter.dispose()
+    })
+  })
+
+  // Why: the restart flow (docs/daemon-staleness-ux.md §Phase 1 step 1) relies
+  // on these two primitives to fan synthetic pty:exit out to every attached
+  // session *before* tearing the adapter down. The design doc calls out
+  // session.ts:246-252 as the reason — the daemon's kill-all-and-shutdown
+  // explicitly does NOT fan exits back through onExit. Without the fanout the
+  // renderer would black-hole writes against a disposed adapter.
+  describe('fanoutSyntheticExits / getActiveSessionIds (restart primitives)', () => {
+    it('reports every live spawn in getActiveSessionIds', async () => {
+      const { id: id1 } = await adapter.spawn({ cols: 80, rows: 24 })
+      const { id: id2 } = await adapter.spawn({ cols: 80, rows: 24 })
+      const active = adapter.getActiveSessionIds()
+      expect(active).toContain(id1)
+      expect(active).toContain(id2)
+      expect(active).toHaveLength(2)
+    })
+
+    it('emits a synthetic exit for every active id with the supplied code', () => {
+      const exits: { id: string; code: number }[] = []
+      adapter.onExit((payload) => exits.push(payload))
+
+      const ids = ['sess-a', 'sess-b', 'sess-c']
+      const internals = adapter as unknown as { activeSessionIds: Set<string> }
+      for (const id of ids) {
+        internals.activeSessionIds.add(id)
+      }
+
+      adapter.fanoutSyntheticExits(-1)
+
+      expect(exits).toHaveLength(3)
+      expect(exits.map((e) => e.id).sort()).toEqual([...ids].sort())
+      for (const { code } of exits) {
+        expect(code).toBe(-1)
+      }
+    })
+
+    it('clears activeSessionIds after fanout so a second call is a no-op', () => {
+      const exits: { id: string; code: number }[] = []
+      adapter.onExit((payload) => exits.push(payload))
+
+      const internals = adapter as unknown as { activeSessionIds: Set<string> }
+      internals.activeSessionIds.add('sess-a')
+
+      adapter.fanoutSyntheticExits(-1)
+      expect(exits).toHaveLength(1)
+      expect(adapter.getActiveSessionIds()).toEqual([])
+
+      adapter.fanoutSyntheticExits(-1)
+      expect(exits).toHaveLength(1)
+    })
+
+    it('propagates to every registered exit listener in order', () => {
+      const aExits: { id: string; code: number }[] = []
+      const bExits: { id: string; code: number }[] = []
+      adapter.onExit((payload) => aExits.push(payload))
+      adapter.onExit((payload) => bExits.push(payload))
+
+      const internals = adapter as unknown as { activeSessionIds: Set<string> }
+      internals.activeSessionIds.add('sess-a')
+
+      adapter.fanoutSyntheticExits(-1)
+
+      expect(aExits).toEqual([{ id: 'sess-a', code: -1 }])
+      expect(bExits).toEqual([{ id: 'sess-a', code: -1 }])
     })
   })
 })

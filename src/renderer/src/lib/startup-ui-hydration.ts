@@ -37,6 +37,7 @@ export function getStartupErrorFallbackUI(uiHydrated: boolean): PersistedUIState
     groupBy: 'none',
     sortBy: 'name',
     showActiveOnly: false,
+    hideDefaultBranchWorkspace: false,
     filterRepoIds: [],
     collapsedGroups: [],
     uiZoomLevel: 0,

@@ -108,6 +108,33 @@ describe('createEditorSlice openDiff', () => {
 })
 
 describe('createEditorSlice markdown view state', () => {
+  it('updates stale language metadata when reopening an existing file', () => {
+    const store = createEditorStore()
+
+    store.getState().openFile({
+      filePath: '/repo/notebooks/example.ipynb',
+      relativePath: 'notebooks/example.ipynb',
+      worktreeId: 'wt-1',
+      language: 'json',
+      mode: 'edit'
+    })
+
+    store.getState().openFile({
+      filePath: '/repo/notebooks/example.ipynb',
+      relativePath: 'notebooks/example.ipynb',
+      worktreeId: 'wt-1',
+      language: 'notebook',
+      mode: 'edit'
+    })
+
+    expect(store.getState().openFiles).toEqual([
+      expect.objectContaining({
+        filePath: '/repo/notebooks/example.ipynb',
+        language: 'notebook'
+      })
+    ])
+  })
+
   it('drops markdown view mode for a replaced preview tab', () => {
     const store = createEditorStore()
 
@@ -141,6 +168,50 @@ describe('createEditorSlice markdown view state', () => {
         isPreview: true
       })
     ])
+  })
+})
+
+describe('createEditorSlice editor view mode', () => {
+  it('stores changes mode as an explicit entry keyed by fileId', () => {
+    const store = createEditorStore()
+
+    store.getState().setEditorViewMode('/repo/app.ts', 'changes')
+
+    expect(store.getState().editorViewMode).toEqual({ '/repo/app.ts': 'changes' })
+  })
+
+  it('deletes the entry when mode resets to edit', () => {
+    const store = createEditorStore()
+    store.getState().setEditorViewMode('/repo/app.ts', 'changes')
+
+    store.getState().setEditorViewMode('/repo/app.ts', 'edit')
+
+    expect(store.getState().editorViewMode).toEqual({})
+  })
+
+  it('is a no-op when resetting a file that was never in changes mode', () => {
+    const store = createEditorStore()
+    const before = store.getState().editorViewMode
+
+    store.getState().setEditorViewMode('/repo/app.ts', 'edit')
+
+    expect(store.getState().editorViewMode).toBe(before)
+  })
+
+  it('drops editor view mode when the file is closed', () => {
+    const store = createEditorStore()
+    store.getState().openFile({
+      filePath: '/repo/app.ts',
+      relativePath: 'app.ts',
+      worktreeId: 'wt-1',
+      language: 'typescript',
+      mode: 'edit'
+    })
+    store.getState().setEditorViewMode('/repo/app.ts', 'changes')
+
+    store.getState().closeFile('/repo/app.ts')
+
+    expect(store.getState().editorViewMode).toEqual({})
   })
 })
 
@@ -538,16 +609,451 @@ describe('createEditorSlice combined diff exclusions', () => {
   })
 })
 
+describe('createEditorSlice remote branch actions', () => {
+  const gitStatusMock = vi.fn()
+  const gitUpstreamStatusMock = vi.fn()
+  const gitPushMock = vi.fn()
+  const gitPullMock = vi.fn()
+  const gitFetchMock = vi.fn()
+
+  beforeEach(() => {
+    toastErrorMock.mockReset()
+    gitStatusMock.mockReset()
+    gitUpstreamStatusMock.mockReset()
+    gitPushMock.mockReset()
+    gitPullMock.mockReset()
+    gitFetchMock.mockReset()
+
+    gitStatusMock.mockResolvedValue({ entries: [], conflictOperation: 'unknown' })
+    gitUpstreamStatusMock.mockResolvedValue({
+      hasUpstream: true,
+      upstreamName: 'origin/main',
+      ahead: 1,
+      behind: 0
+    })
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(globalThis as any).window = (globalThis as any).window ?? {}
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(globalThis as any).window.api = {
+      git: {
+        status: gitStatusMock,
+        upstreamStatus: gitUpstreamStatusMock,
+        push: gitPushMock,
+        pull: gitPullMock,
+        fetch: gitFetchMock
+      }
+    }
+  })
+
+  it('stores upstream status per worktree', () => {
+    const store = createEditorStore()
+
+    store.getState().setUpstreamStatus('wt-1', {
+      hasUpstream: true,
+      upstreamName: 'origin/main',
+      ahead: 2,
+      behind: 1
+    })
+
+    expect(store.getState().remoteStatusesByWorktree['wt-1']).toEqual({
+      hasUpstream: true,
+      upstreamName: 'origin/main',
+      ahead: 2,
+      behind: 1
+    })
+  })
+
+  it('runs pull and refreshes status + upstream on success', async () => {
+    const store = createEditorStore()
+    store.getState().setGitStatus('wt-1', {
+      conflictOperation: 'unknown',
+      entries: [{ path: 'src/app.ts', status: 'modified', area: 'unstaged' }]
+    })
+
+    await store.getState().pullBranch('wt-1', '/repo')
+
+    expect(gitPullMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      connectionId: undefined
+    })
+    expect(toastErrorMock).not.toHaveBeenCalled()
+  })
+
+  it('surfaces a readable toast when pull reports local changes would be overwritten', async () => {
+    const store = createEditorStore()
+    gitPullMock.mockRejectedValueOnce(
+      new Error(
+        'error: Your local changes to the following files would be overwritten by merge:\n\tsrc/app.ts\nPlease commit your changes or stash them before you merge.\nAborting'
+      )
+    )
+
+    await expect(store.getState().pullBranch('wt-1', '/repo')).rejects.toThrow()
+
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      'Pull blocked — commit or stash your local changes first.'
+    )
+  })
+
+  it('runs publish branch through push with publish=true', async () => {
+    // Why: pushBranch no longer awaits a post-op git status / upstream
+    // refresh. The 3s git-status poll and the upstream-status effect in the
+    // sidebar reconcile state shortly after the IPC returns; keeping the
+    // mutation tight stops compound flows from stalling between commit and
+    // push.
+    const store = createEditorStore()
+
+    await store.getState().pushBranch('wt-1', '/repo', true)
+
+    expect(gitPushMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      publish: true,
+      connectionId: undefined
+    })
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+  })
+
+  it('preserves actionable publish errors and avoids refresh on failure', async () => {
+    const store = createEditorStore()
+    const publishError = new Error(
+      'Push rejected: remote has newer commits (non-fast-forward). Please pull or sync first.'
+    )
+    gitPushMock.mockRejectedValueOnce(publishError)
+
+    await expect(store.getState().pushBranch('wt-1', '/repo', true)).rejects.toThrow(
+      publishError.message
+    )
+
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      'Push rejected — remote has changes. Pull first, then try again.'
+    )
+    expect(gitStatusMock).not.toHaveBeenCalled()
+    expect(gitUpstreamStatusMock).not.toHaveBeenCalled()
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+  })
+
+  it('maps publish updates-were-rejected into a clean actionable toast', async () => {
+    const store = createEditorStore()
+    const publishError = new Error(
+      'Updates were rejected because the tip of your current branch is behind its remote counterpart.'
+    )
+    gitPushMock.mockRejectedValueOnce(publishError)
+
+    await expect(store.getState().pushBranch('wt-1', '/repo', true)).rejects.toThrow(
+      publishError.message
+    )
+
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      'Push rejected — remote has changes. Pull first, then try again.'
+    )
+    expect(gitStatusMock).not.toHaveBeenCalled()
+    expect(gitUpstreamStatusMock).not.toHaveBeenCalled()
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+  })
+
+  it('maps raw publish wrapper errors into a cleaner actionable toast', async () => {
+    const store = createEditorStore()
+    const rawPublishError = new Error(
+      'git push failed: Command failed: git push --set-upstream origin feature-branch\nremote: Repository not found.\nfatal: Authentication failed for https://github.com/acme/private-repo.git'
+    )
+    gitPushMock.mockRejectedValueOnce(rawPublishError)
+
+    await expect(store.getState().pushBranch('wt-1', '/repo', true)).rejects.toThrow(
+      rawPublishError.message
+    )
+
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      'Publish Branch failed. Authentication failed for https://github.com/acme/private-repo.git. Check your remote access and try again.'
+    )
+  })
+
+  it('uses a fallback message for generic publish errors', async () => {
+    const store = createEditorStore()
+    const publishError = new Error('error: RPC failed; curl 56 GnuTLS recv error')
+    gitPushMock.mockRejectedValueOnce(publishError)
+
+    await expect(store.getState().pushBranch('wt-1', '/repo', true)).rejects.toThrow(
+      publishError.message
+    )
+
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      'Publish Branch failed. Check your remote access and try again.'
+    )
+    expect(gitStatusMock).not.toHaveBeenCalled()
+    expect(gitUpstreamStatusMock).not.toHaveBeenCalled()
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+  })
+
+  it('maps non-fast-forward push errors into a clean actionable toast', async () => {
+    const store = createEditorStore()
+    const pushError = new Error(
+      'Updates were rejected because the tip of your current branch is behind its remote counterpart.'
+    )
+    gitPushMock.mockRejectedValueOnce(pushError)
+
+    await expect(store.getState().pushBranch('wt-1', '/repo', false)).rejects.toThrow(
+      pushError.message
+    )
+
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      'Push rejected — remote has changes. Pull first, then try again.'
+    )
+    expect(gitStatusMock).not.toHaveBeenCalled()
+    expect(gitUpstreamStatusMock).not.toHaveBeenCalled()
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+  })
+
+  it('maps non-fast-forward keyword push errors into a clean actionable toast', async () => {
+    const store = createEditorStore()
+    const pushError = new Error('Push rejected: remote has newer commits (non-fast-forward).')
+    gitPushMock.mockRejectedValueOnce(pushError)
+
+    await expect(store.getState().pushBranch('wt-1', '/repo', false)).rejects.toThrow(
+      pushError.message
+    )
+
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      'Push rejected — remote has changes. Pull first, then try again.'
+    )
+    expect(gitStatusMock).not.toHaveBeenCalled()
+    expect(gitUpstreamStatusMock).not.toHaveBeenCalled()
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+  })
+
+  it('uses a fallback message for generic push errors', async () => {
+    const store = createEditorStore()
+    const pushError = new Error('network timeout')
+    gitPushMock.mockRejectedValueOnce(pushError)
+
+    await expect(store.getState().pushBranch('wt-1', '/repo', false)).rejects.toThrow(
+      pushError.message
+    )
+
+    expect(toastErrorMock).toHaveBeenCalledWith('Push failed. Check your connection and try again.')
+    expect(gitStatusMock).not.toHaveBeenCalled()
+    expect(gitUpstreamStatusMock).not.toHaveBeenCalled()
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+  })
+
+  it('uses a fallback remote failure message when push rejects without Error', async () => {
+    const store = createEditorStore()
+    gitPushMock.mockRejectedValueOnce('failure')
+
+    await expect(store.getState().pushBranch('wt-1', '/repo', false)).rejects.toBe('failure')
+
+    expect(toastErrorMock).toHaveBeenCalledWith('Remote operation failed')
+  })
+
+  it('runs fetchBranch and clears the busy flag on success', async () => {
+    // Why: fetchBranch no longer awaits a post-op upstream refresh.
+    // useGitStatusPolling and the sidebar's upstream effect handle the
+    // reconcile, keeping the mutation focused on the single IPC.
+    const store = createEditorStore()
+    await store.getState().fetchBranch('wt-1', '/repo')
+
+    expect(gitFetchMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      connectionId: undefined
+    })
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+    expect(toastErrorMock).not.toHaveBeenCalled()
+  })
+
+  it('surfaces a toast and clears the busy flag when fetch fails', async () => {
+    const store = createEditorStore()
+    gitFetchMock.mockRejectedValueOnce(new Error('network timeout'))
+
+    await expect(store.getState().fetchBranch('wt-1', '/repo')).rejects.toThrow('network timeout')
+
+    expect(toastErrorMock).toHaveBeenCalledWith('network timeout')
+    expect(gitUpstreamStatusMock).not.toHaveBeenCalled()
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+  })
+
+  it('preserves prior upstream status when fetch fails', async () => {
+    // Why: a transient upstream fetch failure (network blip, auth prompt
+    // timeout) must not erase the last-known ahead/behind counts — doing so
+    // would briefly flip the UI to an unknown/no-upstream state that
+    // misrepresents the branch's relationship to its remote.
+    const store = createEditorStore()
+    store.getState().setUpstreamStatus('wt-1', {
+      hasUpstream: true,
+      upstreamName: 'origin/main',
+      ahead: 2,
+      behind: 1
+    })
+    gitUpstreamStatusMock.mockRejectedValueOnce(new Error('transient failure'))
+
+    await store.getState().fetchUpstreamStatus('wt-1', '/repo')
+
+    expect(store.getState().remoteStatusesByWorktree['wt-1']).toEqual({
+      hasUpstream: true,
+      upstreamName: 'origin/main',
+      ahead: 2,
+      behind: 1
+    })
+  })
+
+  it('keeps isRemoteOperationActive true while any remote op is in flight', async () => {
+    // Why: a bare boolean races across worktrees — if push A finishes while
+    // pull B is still running, flipping the flag off would prematurely
+    // re-enable B's button. The refcount-derived boolean must stay true
+    // until every in-flight remote op has finished.
+    const store = createEditorStore()
+
+    let resolveA: () => void = () => {}
+    let resolveB: () => void = () => {}
+    gitPushMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveA = resolve
+          })
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveB = resolve
+          })
+      )
+
+    const pushA = store.getState().pushBranch('wt-1', '/a')
+    // Kick microtasks so pushA has begun and flipped the flag on.
+    await Promise.resolve()
+    expect(store.getState().isRemoteOperationActive).toBe(true)
+
+    const pushB = store.getState().pushBranch('wt-2', '/b')
+    await Promise.resolve()
+    expect(store.getState().isRemoteOperationActive).toBe(true)
+
+    resolveA()
+    await pushA.catch(() => {})
+    // B is still running, so the busy flag must remain true.
+    expect(store.getState().isRemoteOperationActive).toBe(true)
+
+    resolveB()
+    await pushB.catch(() => {})
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+  })
+
+  it('runs syncBranch end-to-end (fetch+pull+push) on success', async () => {
+    // Why: syncBranch no longer awaits a post-op git status / upstream
+    // refresh. The polling layer reconciles state after the mutation
+    // returns; the in-mutation upstream-status read remains because it
+    // gates whether the inner push stage runs.
+    const store = createEditorStore()
+
+    await store.getState().syncBranch('wt-1', '/repo')
+
+    expect(gitFetchMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      connectionId: undefined
+    })
+    expect(gitPullMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      connectionId: undefined
+    })
+    // ahead=1 in the default mock, so sync pushes.
+    expect(gitPushMock).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      connectionId: undefined
+    })
+    expect(toastErrorMock).not.toHaveBeenCalled()
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+  })
+
+  it('skips the inner push when syncBranch sees ahead=0', async () => {
+    // Why: guards against a no-op push round-trip after a pure fast-forward
+    // pull. See syncBranch's ahead>0 guard in editor.ts.
+    const store = createEditorStore()
+    gitUpstreamStatusMock.mockResolvedValueOnce({
+      hasUpstream: true,
+      upstreamName: 'origin/main',
+      ahead: 0,
+      behind: 0
+    })
+
+    await store.getState().syncBranch('wt-1', '/repo')
+
+    expect(gitFetchMock).toHaveBeenCalled()
+    expect(gitPullMock).toHaveBeenCalled()
+    expect(gitPushMock).not.toHaveBeenCalled()
+    expect(toastErrorMock).not.toHaveBeenCalled()
+  })
+
+  it('surfaces a sync-labeled toast when syncBranch inner push fails with auth error', async () => {
+    // Why: the user invoked Sync — the toast must read "Sync failed..." even
+    // though the underlying step is push. Detail extraction still surfaces
+    // the actionable fatal/remote line so auth/protected-branch reasons stay
+    // visible.
+    const store = createEditorStore()
+    const authError = new Error(
+      'git push failed: Command failed: git push origin feature\nremote: Repository not found.\nfatal: Authentication failed for https://github.com/acme/private-repo.git'
+    )
+    gitPushMock.mockRejectedValueOnce(authError)
+
+    await expect(store.getState().syncBranch('wt-1', '/repo')).rejects.toThrow(authError.message)
+
+    expect(toastErrorMock).toHaveBeenCalledTimes(1)
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      'Sync failed. Authentication failed for https://github.com/acme/private-repo.git. Check your remote access and try again.'
+    )
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+  })
+
+  it('surfaces a single sync-labeled toast when syncBranch inner push is non-fast-forward', async () => {
+    // Why: under sync, NFF means the remote raced ahead between fetch and
+    // push — sync just pulled, so the bare "Pull first" guidance is wrong.
+    // Surface a sync-shaped retry hint instead.
+    const store = createEditorStore()
+    const pushError = new Error(
+      'Updates were rejected because the tip of your current branch is behind its remote counterpart.'
+    )
+    gitPushMock.mockRejectedValueOnce(pushError)
+
+    await expect(store.getState().syncBranch('wt-1', '/repo')).rejects.toThrow(pushError.message)
+
+    // No double-toast from the outer catch.
+    expect(toastErrorMock).toHaveBeenCalledTimes(1)
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      'Sync failed — remote moved while syncing. Try again.'
+    )
+  })
+
+  it('surfaces the pull-blocked toast when syncBranch pull stage fails', async () => {
+    // Why: failures in sync's fetch/pull/status stages flow through the
+    // outer catch's generic path; push-specific framing only applies to
+    // the inner push stage.
+    const store = createEditorStore()
+    gitPullMock.mockRejectedValueOnce(
+      new Error(
+        'error: Your local changes to the following files would be overwritten by merge:\n\tsrc/app.ts\nPlease commit your changes or stash them before you merge.\nAborting'
+      )
+    )
+
+    await expect(store.getState().syncBranch('wt-1', '/repo')).rejects.toThrow()
+
+    expect(toastErrorMock).toHaveBeenCalledTimes(1)
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      'Pull blocked — commit or stash your local changes first.'
+    )
+    expect(gitPushMock).not.toHaveBeenCalled()
+    expect(store.getState().isRemoteOperationActive).toBe(false)
+  })
+})
+
 describe('createEditorSlice activateMarkdownLink', () => {
   const openUrlMock = vi.fn()
   const openFileUriMock = vi.fn()
   const pathExistsMock = vi.fn()
+  const authorizeExternalPathMock = vi.fn()
 
   beforeEach(() => {
     toastErrorMock.mockReset()
     openUrlMock.mockReset()
     openFileUriMock.mockReset()
     pathExistsMock.mockReset()
+    authorizeExternalPathMock.mockReset()
     openHttpLinkMock.mockReset()
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ;(globalThis as any).window = (globalThis as any).window ?? {}
@@ -557,6 +1063,9 @@ describe('createEditorSlice activateMarkdownLink', () => {
         openUrl: openUrlMock,
         openFileUri: openFileUriMock,
         pathExists: pathExistsMock
+      },
+      fs: {
+        authorizeExternalPath: authorizeExternalPathMock
       }
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -637,15 +1146,59 @@ describe('createEditorSlice activateMarkdownLink', () => {
     expect(store.getState().openFiles).toEqual([])
   })
 
-  it('delegates outside-worktree files to shell.openFileUri', async () => {
+  it('opens in-worktree file links in Orca', async () => {
     const store = createEditorStore()
     await store.getState().activateMarkdownLink('./image.png', {
       sourceFilePath: '/repo/docs/note.md',
       worktreeId: 'wt-1',
       worktreeRoot: '/repo'
     })
-    expect(openFileUriMock).toHaveBeenCalledTimes(1)
-    expect(store.getState().openFiles).toEqual([])
+    expect(store.getState().openFiles).toEqual([
+      expect.objectContaining({
+        filePath: '/repo/docs/image.png',
+        relativePath: 'docs/image.png',
+        mode: 'edit',
+        isPreview: true
+      })
+    ])
+    expect(openFileUriMock).not.toHaveBeenCalled()
+  })
+
+  it('opens explicit file URLs inside the worktree in Orca', async () => {
+    const store = createEditorStore()
+    await store.getState().activateMarkdownLink('file:///repo/docs/image.png', {
+      sourceFilePath: '/repo/docs/note.md',
+      worktreeId: 'wt-1',
+      worktreeRoot: '/repo'
+    })
+    expect(store.getState().openFiles).toEqual([
+      expect.objectContaining({
+        filePath: '/repo/docs/image.png',
+        relativePath: 'docs/image.png',
+        mode: 'edit',
+        isPreview: true
+      })
+    ])
+    expect(openFileUriMock).not.toHaveBeenCalled()
+  })
+
+  it('opens explicit file URLs outside the worktree in Orca after authorizing them', async () => {
+    const store = createEditorStore()
+    await store.getState().activateMarkdownLink('file:///tmp/image.png', {
+      sourceFilePath: '/repo/docs/note.md',
+      worktreeId: 'wt-1',
+      worktreeRoot: '/repo'
+    })
+    expect(authorizeExternalPathMock).toHaveBeenCalledWith({ targetPath: '/tmp/image.png' })
+    expect(store.getState().openFiles).toEqual([
+      expect.objectContaining({
+        filePath: '/tmp/image.png',
+        relativePath: '/tmp/image.png',
+        mode: 'edit',
+        isPreview: true
+      })
+    ])
+    expect(openFileUriMock).not.toHaveBeenCalled()
   })
 
   it('activates same-file line anchors via setActiveFile without opening a new tab', async () => {

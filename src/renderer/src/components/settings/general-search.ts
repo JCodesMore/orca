@@ -15,6 +15,11 @@ export const GENERAL_WORKSPACE_SEARCH_ENTRIES: SettingsSearchEntry[] = [
     title: 'Skip Delete Worktree Confirmation',
     description: 'Delete worktrees from the context menu without a confirmation dialog.',
     keywords: ['delete', 'worktree', 'confirm', 'dialog', 'skip', 'prompt']
+  },
+  {
+    title: 'Skip Delete Automation Confirmation',
+    description: 'Delete automations without a confirmation dialog.',
+    keywords: ['delete', 'automation', 'confirm', 'dialog', 'skip', 'prompt']
   }
 ]
 
@@ -33,6 +38,11 @@ export const GENERAL_EDITOR_SEARCH_ENTRIES: SettingsSearchEntry[] = [
     title: 'Default Diff View',
     description: 'Preferred presentation format for showing git diffs by default.',
     keywords: ['diff', 'view', 'inline', 'side-by-side', 'split']
+  },
+  {
+    title: 'Minimap',
+    description: 'Show the minimap overview when editing a file.',
+    keywords: ['minimap', 'overview', 'code', 'scroll']
   }
 ]
 
@@ -62,27 +72,6 @@ export const GENERAL_CACHE_TIMER_SEARCH_ENTRIES: SettingsSearchEntry[] = [
     title: 'Prompt Cache Timer',
     description: 'Countdown timer showing time until prompt cache expires (Claude agents).',
     keywords: ['cache', 'timer', 'prompt', 'ttl', 'claude', 'cost', 'tokens']
-  }
-]
-
-export const GENERAL_CLAUDE_ACCOUNTS_SEARCH_ENTRIES: SettingsSearchEntry[] = [
-  {
-    title: 'Claude Accounts',
-    description: 'Manage which Claude account Orca uses while preserving shared chat context.',
-    keywords: ['claude', 'account', 'switch', 'active', 'status bar', 'quota']
-  }
-]
-
-export const GENERAL_CODEX_ACCOUNTS_SEARCH_ENTRIES: SettingsSearchEntry[] = [
-  {
-    title: 'Codex Accounts',
-    description: 'Manage which Codex account Orca uses for live rate limit fetching.',
-    keywords: ['codex', 'account', 'rate limit', 'status bar', 'quota']
-  },
-  {
-    title: 'Active Codex Account',
-    description: 'Choose which saved Codex account powers live quota reads.',
-    keywords: ['codex', 'account', 'switch', 'active', 'status bar']
   }
 ]
 
@@ -117,8 +106,6 @@ export const GENERAL_PANE_SEARCH_ENTRIES: SettingsSearchEntry[] = [
   ...GENERAL_EDITOR_SEARCH_ENTRIES,
   ...GENERAL_CLI_SEARCH_ENTRIES,
   ...GENERAL_CACHE_TIMER_SEARCH_ENTRIES,
-  ...GENERAL_CLAUDE_ACCOUNTS_SEARCH_ENTRIES,
-  ...GENERAL_CODEX_ACCOUNTS_SEARCH_ENTRIES,
   ...GENERAL_UPDATE_SEARCH_ENTRIES,
   ...GENERAL_SUPPORT_SEARCH_ENTRIES
 ]

@@ -41,6 +41,19 @@ describe('SshGitProvider', () => {
     expect(result).toEqual(statusResult)
   })
 
+  it('commit sends git.commit request', async () => {
+    const commitResult = { success: true }
+    mux.request.mockResolvedValue(commitResult)
+
+    const result = await provider.commit('/home/user/repo', 'feat: add source control commit')
+
+    expect(mux.request).toHaveBeenCalledWith('git.commit', {
+      worktreePath: '/home/user/repo',
+      message: 'feat: add source control commit'
+    })
+    expect(result).toEqual(commitResult)
+  })
+
   it('getDiff sends git.diff request', async () => {
     const diffResult = { kind: 'text', originalContent: '', modifiedContent: 'hello' }
     mux.request.mockResolvedValue(diffResult)
@@ -113,6 +126,46 @@ describe('SshGitProvider', () => {
       baseRef: 'main'
     })
     expect(result).toEqual(compareResult)
+  })
+
+  it('getUpstreamStatus sends git.upstreamStatus request', async () => {
+    const upstreamResult = { hasUpstream: true, upstreamName: 'origin/main', ahead: 1, behind: 0 }
+    mux.request.mockResolvedValue(upstreamResult)
+
+    const result = await provider.getUpstreamStatus('/home/user/repo')
+    expect(mux.request).toHaveBeenCalledWith('git.upstreamStatus', {
+      worktreePath: '/home/user/repo'
+    })
+    expect(result).toEqual(upstreamResult)
+  })
+
+  it('pushBranch sends git.push request and forwards publish mode and target', async () => {
+    await provider.pushBranch('/home/user/repo', true, {
+      remoteName: 'pr-fork-orca',
+      branchName: 'contributor/fix'
+    })
+    expect(mux.request).toHaveBeenCalledWith('git.push', {
+      worktreePath: '/home/user/repo',
+      publish: true,
+      pushTarget: {
+        remoteName: 'pr-fork-orca',
+        branchName: 'contributor/fix'
+      }
+    })
+  })
+
+  it('pullBranch sends git.pull request', async () => {
+    await provider.pullBranch('/home/user/repo')
+    expect(mux.request).toHaveBeenCalledWith('git.pull', {
+      worktreePath: '/home/user/repo'
+    })
+  })
+
+  it('fetchRemote sends git.fetch request', async () => {
+    await provider.fetchRemote('/home/user/repo')
+    expect(mux.request).toHaveBeenCalledWith('git.fetch', {
+      worktreePath: '/home/user/repo'
+    })
   })
 
   it('getBranchDiff sends git.branchDiff request', async () => {
