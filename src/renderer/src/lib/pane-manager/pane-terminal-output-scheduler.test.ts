@@ -1,19 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 function createTerminal() {
-  const classes = new Set<string>()
   return {
-    classes,
-    element: {
-      classList: {
-        add: vi.fn((className: string) => {
-          classes.add(className)
-        }),
-        remove: vi.fn((className: string) => {
-          classes.delete(className)
-        })
-      }
-    },
     write: vi.fn((_data: string, callback?: () => void) => {
       callback?.()
     })
@@ -30,67 +18,13 @@ describe('pane terminal output scheduler', () => {
     vi.useRealTimers()
   })
 
-  it('coalesces foreground output until the next frame flush', async () => {
-    vi.useFakeTimers()
+  it('writes foreground output immediately', async () => {
     const { writeTerminalOutput } = await loadScheduler()
-    const terminal = createTerminal()
-
-    writeTerminalOutput(terminal, 'a', { foreground: true })
-    writeTerminalOutput(terminal, 'b', { foreground: true })
-
-    expect(terminal.write).not.toHaveBeenCalled()
-    vi.advanceTimersByTime(16)
-
-    expect(terminal.write).toHaveBeenCalledTimes(1)
-    expect(terminal.write).toHaveBeenCalledWith('ab', expect.any(Function))
-  })
-
-  it('hides the foreground cursor until output parsing has gone quiet', async () => {
-    vi.useFakeTimers()
-    const { writeTerminalOutput } = await loadScheduler()
-    const terminal = createTerminal()
-
-    writeTerminalOutput(terminal, 'frame', { foreground: true })
-
-    expect(terminal.classes.has('terminal-foreground-write-pending')).toBe(true)
-
-    vi.advanceTimersByTime(16)
-
-    expect(terminal.write).toHaveBeenCalledWith('frame', expect.any(Function))
-    expect(terminal.classes.has('terminal-foreground-write-pending')).toBe(true)
-
-    vi.advanceTimersByTime(63)
-    expect(terminal.classes.has('terminal-foreground-write-pending')).toBe(true)
-
-    vi.advanceTimersByTime(1)
-    expect(terminal.classes.has('terminal-foreground-write-pending')).toBe(false)
-  })
-
-  it('can hide the cursor immediately while input waits for echoed output', async () => {
-    vi.useFakeTimers()
-    const { suppressTerminalCursorUntilOutputSettles } = await loadScheduler()
-    const terminal = createTerminal()
-
-    suppressTerminalCursorUntilOutputSettles(terminal)
-
-    expect(terminal.classes.has('terminal-foreground-write-pending')).toBe(true)
-
-    vi.advanceTimersByTime(499)
-    expect(terminal.classes.has('terminal-foreground-write-pending')).toBe(true)
-
-    vi.advanceTimersByTime(1)
-    expect(terminal.classes.has('terminal-foreground-write-pending')).toBe(false)
-  })
-
-  it('flushes foreground output synchronously when requested', async () => {
-    vi.useFakeTimers()
-    const { flushTerminalOutput, writeTerminalOutput } = await loadScheduler()
     const terminal = createTerminal()
 
     writeTerminalOutput(terminal, 'foreground', { foreground: true })
-    flushTerminalOutput(terminal)
 
-    expect(terminal.write).toHaveBeenCalledWith('foreground', expect.any(Function))
+    expect(terminal.write).toHaveBeenCalledWith('foreground')
   })
 
   it('coalesces background output until the shared drain runs', async () => {
@@ -157,8 +91,6 @@ describe('pane terminal output scheduler', () => {
     writeTerminalOutput(terminal, 'old', { foreground: false })
     writeTerminalOutput(terminal, 'new', { foreground: true })
 
-    expect(terminal.write.mock.calls.map(([data]) => data)).toEqual(['old'])
-    vi.advanceTimersByTime(16)
     expect(terminal.write.mock.calls.map(([data]) => data)).toEqual(['old', 'new'])
   })
 

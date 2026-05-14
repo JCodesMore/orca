@@ -6,6 +6,10 @@ describe('createIpcPtyTransport', () => {
   let onData: ((payload: { id: string; data: string }) => void) | null = null
   let onExit: ((payload: { id: string; code: number }) => void) | null = null
 
+  function flushPtySideEffects(): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, 0))
+  }
+
   beforeEach(() => {
     vi.resetModules()
     onData = null
@@ -58,6 +62,27 @@ describe('createIpcPtyTransport', () => {
     transport.disconnect()
   })
 
+  it('defers title side effects until after terminal data is delivered', async () => {
+    const { createIpcPtyTransport } = await import('./pty-transport')
+    const onTitleChange = vi.fn()
+    const onDataCallback = vi.fn(() => {
+      expect(onTitleChange).not.toHaveBeenCalled()
+    })
+    const transport = createIpcPtyTransport({ onTitleChange })
+
+    await transport.connect({ url: '', callbacks: { onData: onDataCallback } })
+
+    onData?.({ id: 'pty-1', data: ']0;title-onebody' })
+
+    expect(onDataCallback).toHaveBeenCalledWith(']0;title-onebody')
+    expect(onTitleChange).not.toHaveBeenCalled()
+
+    await flushPtySideEffects()
+
+    expect(onTitleChange).toHaveBeenCalledWith('title-one', 'title-one')
+    transport.disconnect()
+  })
+
   it('suppresses attention side effects when replaying eager-buffered data during attach', async () => {
     // Why: eager PTY buffers capture output produced before the pane mounted —
     // typically catch-up bytes from a previous app session. A BEL or
@@ -87,6 +112,7 @@ describe('createIpcPtyTransport', () => {
     })
 
     expect(handle.flush()).toBe('')
+    await flushPtySideEffects()
     expect(onTitleChange).toHaveBeenCalledWith('* Claude done', '* Claude done')
     expect(onBell).not.toHaveBeenCalled()
     expect(onAgentBecameIdle).not.toHaveBeenCalled()
@@ -127,10 +153,12 @@ describe('createIpcPtyTransport', () => {
     onData?.({ id: 'pty-1', data: ']0;title-one' })
     onData?.({ id: 'pty-1', data: ']0;title-two' })
     onData?.({ id: 'pty-1', data: ']0;title-three' })
+    await flushPtySideEffects()
     expect(onBell).not.toHaveBeenCalled()
 
     // Bare BEL outside any OSC: fires once.
     onData?.({ id: 'pty-1', data: '' })
+    await flushPtySideEffects()
     expect(onBell).toHaveBeenCalledTimes(1)
   })
 
@@ -385,6 +413,7 @@ describe('createIpcPtyTransport', () => {
 
     // Agent starts working
     onData?.({ id: 'pty-1', data: ']0;. Claude working' })
+    await flushPtySideEffects()
     expect(onAgentBecameWorking).toHaveBeenCalledTimes(1)
 
     // Simulate shutdownWorktreeTerminals: unregister data handlers before kill.
@@ -420,10 +449,12 @@ describe('createIpcPtyTransport', () => {
 
       // Agent starts working — sets the title to a working indicator
       onData?.({ id: 'pty-1', data: ']0;. Claude working' })
+      vi.advanceTimersByTime(0)
       expect(onAgentBecameWorking).toHaveBeenCalledTimes(1)
 
       // Data arrives without a title change — starts the 3 s staleTitleTimer
       onData?.({ id: 'pty-1', data: 'some output without title\r\n' })
+      vi.advanceTimersByTime(0)
 
       // Simulate shutdownWorktreeTerminals: unregister handlers which should
       // cancel the pending staleTitleTimer AND reset the agent tracker so the

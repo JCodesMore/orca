@@ -75,6 +75,12 @@ export function createIpcPtyTransport(opts: IpcPtyTransportOptions = {}): PtyTra
   const processAgentStatusChunk = createAgentStatusOscProcessor()
   let lastEmittedTitle: string | null = null
   let staleTitleTimer: ReturnType<typeof setTimeout> | null = null
+  let sideEffectDrainTimer: ReturnType<typeof setTimeout> | null = null
+  const pendingSideEffects: {
+    data: string
+    payloads: ReturnType<typeof processAgentStatusChunk>['payloads']
+    suppressAttentionEvents: boolean
+  }[] = []
   const agentTracker =
     onAgentBecameIdle || onAgentBecameWorking || onAgentExited
       ? createAgentStatusTracker(
@@ -103,7 +109,7 @@ export function createIpcPtyTransport(opts: IpcPtyTransportOptions = {}): PtyTra
     ptyReplayHandlers.delete(id)
   }
 
-  function applyObservedTerminalTitle(title: string): void {
+  function applyObservedTerminalTitle(title: string, suppressAgentTracker = false): void {
     // Why: cursor-agent's native OSC title is the literal string "Cursor Agent"
     // and it re-emits that title many times per turn (on every internal redraw)
     // even while it's actively working. Orca drives the cursor spinner/unread
@@ -121,7 +127,9 @@ export function createIpcPtyTransport(opts: IpcPtyTransportOptions = {}): PtyTra
     }
     lastEmittedTitle = normalizeTerminalTitle(title)
     onTitleChange?.(lastEmittedTitle, title)
-    agentTracker?.handleTitle(title)
+    if (!suppressAgentTracker) {
+      agentTracker?.handleTitle(title)
+    }
   }
 
   // Why: true while we're replaying buffered/attach-time bytes into the
@@ -129,6 +137,83 @@ export function createIpcPtyTransport(opts: IpcPtyTransportOptions = {}): PtyTra
   // engage the replay guard — otherwise xterm auto-replies to embedded
   // query sequences leak into the shell as stray input.
   let replayingBufferedData = false
+
+  function schedulePtySideEffects(
+    data: string,
+    payloads: ReturnType<typeof processAgentStatusChunk>['payloads'],
+    suppressAttentionEventsForChunk: boolean
+  ): void {
+    pendingSideEffects.push({
+      data,
+      payloads,
+      suppressAttentionEvents: suppressAttentionEventsForChunk
+    })
+    if (sideEffectDrainTimer !== null) {
+      return
+    }
+    // Why: xterm.write() buffers parsing onto its own timer. Defer Orca's
+    // title/status/BEL store work so live terminal rendering gets the next turn.
+    sideEffectDrainTimer = setTimeout(drainPtySideEffects, 0)
+  }
+
+  function drainPtySideEffects(): void {
+    sideEffectDrainTimer = null
+    if (destroyed) {
+      pendingSideEffects.length = 0
+      return
+    }
+    while (pendingSideEffects.length > 0) {
+      const next = pendingSideEffects.shift()
+      if (!next) {
+        continue
+      }
+      const shouldSuppressAttention = next.suppressAttentionEvents
+      if (onAgentStatus && !shouldSuppressAttention) {
+        for (const payload of next.payloads) {
+          onAgentStatus(payload)
+        }
+      }
+      if (onTitleChange) {
+        processObservedTitles(next.data, shouldSuppressAttention)
+      }
+      if (onBell && bellDetector.chunkContainsBell(next.data) && !shouldSuppressAttention) {
+        onBell()
+      }
+    }
+  }
+
+  function processObservedTitles(data: string, suppressAgentTracker: boolean): void {
+    // Why: feed EVERY OSC title in the chunk through the observer, not just
+    // the last one. node-pty + the main-process 8ms batch window commonly
+    // coalesce multiple title updates into a single IPC payload.
+    const titles = extractAllOscTitles(data)
+    if (titles.length > 0) {
+      if (staleTitleTimer) {
+        clearTimeout(staleTitleTimer)
+        staleTitleTimer = null
+      }
+      for (const title of titles) {
+        applyObservedTerminalTitle(title, suppressAgentTracker)
+      }
+    } else if (
+      !suppressAgentTracker &&
+      lastEmittedTitle &&
+      detectAgentStatusFromTitle(lastEmittedTitle) === 'working'
+    ) {
+      if (staleTitleTimer) {
+        clearTimeout(staleTitleTimer)
+      }
+      staleTitleTimer = setTimeout(() => {
+        staleTitleTimer = null
+        if (lastEmittedTitle && detectAgentStatusFromTitle(lastEmittedTitle) === 'working') {
+          const cleared = clearWorkingIndicators(lastEmittedTitle)
+          lastEmittedTitle = cleared
+          onTitleChange?.(cleared, cleared)
+          agentTracker?.handleTitle(cleared)
+        }
+      }, STALE_TITLE_TIMEOUT)
+    }
+  }
 
   // Why: shared by connect() and attach() to avoid duplicating title/bell/exit
   // logic across the two code paths that register a PTY.
@@ -153,63 +238,21 @@ export function createIpcPtyTransport(opts: IpcPtyTransportOptions = {}): PtyTra
       // replay we must not surface stale agent-status payloads from a prior app
       // session into the live store. The parser still consumes the bytes so they
       // do not leak into xterm, we just suppress the callback.
-      if (onAgentStatus && !suppressAttentionEvents) {
-        for (const payload of processed.payloads) {
-          onAgentStatus(payload)
-        }
-      }
       if (replayingBufferedData && storedCallbacks.onReplayData) {
         storedCallbacks.onReplayData(data)
       } else {
         storedCallbacks.onData?.(data)
       }
-      if (onTitleChange) {
-        // Why: feed EVERY OSC title in the chunk through the observer, not just
-        // the last one. node-pty + the main-process 8ms batch window commonly
-        // coalesce multiple title updates into a single IPC payload — for Pi's
-        // 80ms spinner + agent_end idle cycle, the last title in the chunk is
-        // the idle one and the intermediate working frames were silently
-        // dropped, so the worktree card never observed the working state.
-        // Processing titles in order preserves the working→idle transition
-        // that detectAgentStatusFromTitle and agentTracker both key off.
-        const titles = extractAllOscTitles(data)
-        if (titles.length > 0) {
-          if (staleTitleTimer) {
-            clearTimeout(staleTitleTimer)
-            staleTitleTimer = null
-          }
-          for (const title of titles) {
-            applyObservedTerminalTitle(title)
-          }
-        } else if (lastEmittedTitle && detectAgentStatusFromTitle(lastEmittedTitle) === 'working') {
-          if (staleTitleTimer) {
-            clearTimeout(staleTitleTimer)
-          }
-          staleTitleTimer = setTimeout(() => {
-            staleTitleTimer = null
-            if (lastEmittedTitle && detectAgentStatusFromTitle(lastEmittedTitle) === 'working') {
-              const cleared = clearWorkingIndicators(lastEmittedTitle)
-              lastEmittedTitle = cleared
-              onTitleChange(cleared, cleared)
-              agentTracker?.handleTitle(cleared)
-            }
-          }, STALE_TITLE_TIMEOUT)
-        }
-      }
-      // Why: BEL is the attention signal. The detector is
-      // stateful across chunks so a BEL sitting inside an OSC sequence
-      // (e.g. Claude's `\e]0;title\a`) is correctly ignored — only true
-      // terminal bells raise attention. suppressAttentionEvents gates this
-      // during the synchronous eager-buffer replay so a historical BEL
-      // captured from the prior session does not produce a fresh alert on
-      // cold reattach.
-      if (onBell && bellDetector.chunkContainsBell(data) && !suppressAttentionEvents) {
-        onBell()
-      }
+      schedulePtySideEffects(data, processed.payloads, suppressAttentionEvents)
     })
   }
 
   function clearAccumulatedState(): void {
+    if (sideEffectDrainTimer) {
+      clearTimeout(sideEffectDrainTimer)
+      sideEffectDrainTimer = null
+    }
+    pendingSideEffects.length = 0
     if (staleTitleTimer) {
       clearTimeout(staleTitleTimer)
       staleTitleTimer = null

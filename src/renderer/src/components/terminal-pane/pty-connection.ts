@@ -23,7 +23,6 @@ import { registerPtySerializer, registerPtyTitleSource } from './pty-buffer-seri
 import {
   discardTerminalOutput,
   flushTerminalOutput,
-  suppressTerminalCursorUntilOutputSettles,
   waitForTerminalOutputParsed,
   writeTerminalOutput
 } from '@/lib/pane-manager/pane-terminal-output-scheduler'
@@ -409,10 +408,6 @@ export function connectPanePty(
     // auto-replies never count as interaction.
     deps.clearTerminalTabUnread(deps.tabId)
     deps.clearWorktreeUnread(deps.worktreeId)
-    flushTerminalOutput(pane.terminal)
-    // Why: on Windows, key-repeat can leave xterm's old visual cursor painted
-    // until the TUI echoes its next repaint. Hide that stale frame immediately.
-    suppressTerminalCursorUntilOutputSettles(pane.terminal)
     transport.sendInput(data)
   })
 
