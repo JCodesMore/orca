@@ -873,7 +873,10 @@ describe('connectPanePty', () => {
         fn()
       }
 
-      expect(pane.terminal.write).toHaveBeenCalledWith('visible split output\r\n')
+      expect(pane.terminal.write).toHaveBeenCalledWith(
+        'visible split output\r\n',
+        expect.any(Function)
+      )
     } finally {
       globalThis.setTimeout = originalSetTimeout
     }
@@ -916,7 +919,10 @@ describe('connectPanePty', () => {
         fn()
       }
 
-      expect(pane.terminal.write).toHaveBeenCalledWith('Arabic: السلام عليكم\r\n')
+      expect(pane.terminal.write).toHaveBeenCalledWith(
+        'Arabic: السلام عليكم\r\n',
+        expect.any(Function)
+      )
     } finally {
       globalThis.setTimeout = originalSetTimeout
     }

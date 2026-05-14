@@ -1,6 +1,13 @@
 import { e2eConfig } from '@/lib/e2e-config'
+import {
+  FOREGROUND_CURSOR_RESTORE_SAFETY_DELAY_MS,
+  restoreForegroundTerminalCursor,
+  scheduleForegroundTerminalCursorRestore,
+  suppressForegroundTerminalCursor,
+  type TerminalCursorSuppressionTarget
+} from './pane-terminal-cursor-suppression'
 
-type TerminalOutputTarget = {
+type TerminalOutputTarget = TerminalCursorSuppressionTarget & {
   write(data: string, callback?: () => void): void
 }
 
@@ -127,13 +134,23 @@ function takeQueuedChunk(entry: QueueEntry, limit: number): string {
   return data
 }
 
-function writeAllQueuedChunks(entry: QueueEntry): void {
+function writeForegroundQueuedChunks(entry: QueueEntry): void {
   let data = takeQueuedChunk(entry, Number.POSITIVE_INFINITY)
   while (data) {
+    suppressForegroundTerminalCursor(entry.terminal)
+    // Why: xterm's write callback marks parser completion, but a disposed
+    // terminal may never call it. The safety restore avoids a stuck hidden cursor.
+    scheduleForegroundTerminalCursorRestore(
+      entry.terminal,
+      FOREGROUND_CURSOR_RESTORE_SAFETY_DELAY_MS
+    )
     try {
-      entry.terminal.write(data)
+      entry.terminal.write(data, () => {
+        scheduleForegroundTerminalCursorRestore(entry.terminal)
+      })
     } catch {
       entry.chunks.length = 0
+      restoreForegroundTerminalCursor(entry.terminal)
       return
     }
     data = takeQueuedChunk(entry, Number.POSITIVE_INFINITY)
@@ -166,7 +183,7 @@ function drainForegroundOutput(): void {
     if (debugEnabled) {
       debugState.foregroundBatchedWriteCount++
     }
-    writeAllQueuedChunks(entry)
+    writeForegroundQueuedChunks(entry)
   }
 }
 
@@ -221,6 +238,10 @@ export function writeTerminalOutput(
       foregroundQueuedByTerminal.set(terminal, entry)
     }
     entry.chunks.push(data)
+    // Why: Windows can paint xterm's cursor at intermediate TUI repaint
+    // positions before the foreground batch drains. Hide only the cursor layer;
+    // terminal bytes still parse normally and the cursor returns after quiet.
+    suppressForegroundTerminalCursor(terminal)
     scheduleForegroundDrain()
     return
   }
@@ -272,7 +293,7 @@ export function flushTerminalOutput(terminal: TerminalOutputTarget): void {
     if (debugEnabled) {
       debugState.flushWriteCount++
     }
-    writeAllQueuedChunks(foregroundEntry)
+    writeForegroundQueuedChunks(foregroundEntry)
   }
 
   flushBackgroundTerminalOutput(terminal)
@@ -307,6 +328,7 @@ export function discardTerminalOutput(terminal: TerminalOutputTarget): void {
   exposeDebugApi()
   foregroundQueuedByTerminal.delete(terminal)
   queuedByTerminal.delete(terminal)
+  restoreForegroundTerminalCursor(terminal)
 }
 
 exposeDebugApi()

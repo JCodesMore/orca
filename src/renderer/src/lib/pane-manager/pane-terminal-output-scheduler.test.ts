@@ -1,7 +1,19 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 function createTerminal() {
+  const classes = new Set<string>()
   return {
+    classes,
+    element: {
+      classList: {
+        add: vi.fn((className: string) => {
+          classes.add(className)
+        }),
+        remove: vi.fn((className: string) => {
+          classes.delete(className)
+        })
+      }
+    },
     write: vi.fn((_data: string, callback?: () => void) => {
       callback?.()
     })
@@ -30,7 +42,28 @@ describe('pane terminal output scheduler', () => {
     vi.advanceTimersByTime(16)
 
     expect(terminal.write).toHaveBeenCalledTimes(1)
-    expect(terminal.write).toHaveBeenCalledWith('ab')
+    expect(terminal.write).toHaveBeenCalledWith('ab', expect.any(Function))
+  })
+
+  it('hides the foreground cursor until output parsing has gone quiet', async () => {
+    vi.useFakeTimers()
+    const { writeTerminalOutput } = await loadScheduler()
+    const terminal = createTerminal()
+
+    writeTerminalOutput(terminal, 'frame', { foreground: true })
+
+    expect(terminal.classes.has('terminal-foreground-write-pending')).toBe(true)
+
+    vi.advanceTimersByTime(16)
+
+    expect(terminal.write).toHaveBeenCalledWith('frame', expect.any(Function))
+    expect(terminal.classes.has('terminal-foreground-write-pending')).toBe(true)
+
+    vi.advanceTimersByTime(63)
+    expect(terminal.classes.has('terminal-foreground-write-pending')).toBe(true)
+
+    vi.advanceTimersByTime(1)
+    expect(terminal.classes.has('terminal-foreground-write-pending')).toBe(false)
   })
 
   it('flushes foreground output synchronously when requested', async () => {
@@ -41,7 +74,7 @@ describe('pane terminal output scheduler', () => {
     writeTerminalOutput(terminal, 'foreground', { foreground: true })
     flushTerminalOutput(terminal)
 
-    expect(terminal.write).toHaveBeenCalledWith('foreground')
+    expect(terminal.write).toHaveBeenCalledWith('foreground', expect.any(Function))
   })
 
   it('coalesces background output until the shared drain runs', async () => {
