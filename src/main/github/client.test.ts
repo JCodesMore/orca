@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- Why: PR lookup tests share gh/git mocks and branch fallback fixtures; splitting would duplicate setup without making the GitHub query contract clearer. */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
