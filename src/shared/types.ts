@@ -1101,6 +1101,13 @@ export type TerminalColorOverrides = {
   bold?: string
 }
 
+export type TerminalQuickCommand = {
+  id: string
+  label: string
+  command: string
+  appendEnter: boolean
+}
+
 export type FloatingTerminalCwdRequest = {
   path?: string
 }
@@ -1153,6 +1160,7 @@ export type GlobalSettings = {
   terminalMouseHideWhileTyping?: boolean
   terminalWordSeparator?: string
   terminalCursorOpacity?: number
+  terminalQuickCommands?: TerminalQuickCommand[]
   windowBackgroundBlur?: boolean
   /** Why: Windows terminals conventionally use right-click as a paste gesture.
    *  The setting stays Windows-only so macOS/Linux keep their existing context

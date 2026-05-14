@@ -46,6 +46,7 @@ import { parseWorkspaceSession } from '../shared/workspace-session-schema'
 import { pruneLocalTerminalScrollbackBuffers } from '../shared/workspace-session-terminal-buffers'
 import { pruneWorkspaceSessionBrowserHistory } from '../shared/workspace-session-browser-history'
 import { getRepoIdFromWorktreeId } from '../shared/worktree-id'
+import { normalizeTerminalQuickCommands } from '../shared/terminal-quick-commands'
 
 function encrypt(plaintext: string): string {
   if (!plaintext || !safeStorage.isEncryptionAvailable()) {
@@ -318,6 +319,9 @@ export class Store {
             terminalMacOptionAsAltMigrated: true,
             floatingTerminalEnabled: migratedFloatingTerminalEnabled,
             floatingTerminalDefaultedForAllUsers: true,
+            terminalQuickCommands: normalizeTerminalQuickCommands(
+              parsed.settings?.terminalQuickCommands
+            ),
             notifications: {
               ...getDefaultNotificationSettings(),
               ...parsed.settings?.notifications
@@ -1009,6 +1013,12 @@ export class Store {
   }
 
   updateSettings(updates: Partial<GlobalSettings>): GlobalSettings {
+    const sanitizedUpdates = { ...updates }
+    if ('terminalQuickCommands' in updates) {
+      sanitizedUpdates.terminalQuickCommands = normalizeTerminalQuickCommands(
+        updates.terminalQuickCommands
+      )
+    }
     // Why: `telemetry` is deep-merged for the same reason `notifications` is —
     // partial updates from the Privacy pane / consent flow (e.g., flipping
     // only `optedIn`) must not clobber sibling fields like `installId` or
@@ -1016,15 +1026,15 @@ export class Store {
     // synthesize a `telemetry` key on the result when at least one side has
     // one.
     const mergedTelemetry =
-      updates.telemetry !== undefined
-        ? { ...this.state.settings.telemetry, ...updates.telemetry }
+      sanitizedUpdates.telemetry !== undefined
+        ? { ...this.state.settings.telemetry, ...sanitizedUpdates.telemetry }
         : this.state.settings.telemetry
     this.state.settings = {
       ...this.state.settings,
-      ...updates,
+      ...sanitizedUpdates,
       notifications: {
         ...this.state.settings.notifications,
-        ...updates.notifications
+        ...sanitizedUpdates.notifications
       },
       ...(mergedTelemetry !== undefined ? { telemetry: mergedTelemetry } : {})
     }
