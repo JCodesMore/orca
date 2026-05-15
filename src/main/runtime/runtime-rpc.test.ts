@@ -595,6 +595,7 @@ describe('OrcaRuntimeRpcServer', () => {
     const selectCodexAccount = vi.fn().mockResolvedValue({ ok: true })
     const removeClaudeAccount = vi.fn().mockResolvedValue({ ok: true })
     const readTerminal = vi.fn().mockResolvedValue({ tail: ['ok'] })
+    const browserTabCreate = vi.fn().mockResolvedValue({ page: 'page-1' })
     const runtime = {
       getRuntimeId: () => 'test-runtime',
       getStatus: vi.fn().mockResolvedValue({ graphStatus: 'ok' }),
@@ -602,7 +603,8 @@ describe('OrcaRuntimeRpcServer', () => {
       selectClaudeAccount,
       selectCodexAccount,
       removeClaudeAccount,
-      readTerminal
+      readTerminal,
+      browserTabCreate
     } as unknown as OrcaRuntimeService
     const server = new OrcaRuntimeRpcServer({ runtime, userDataPath, enableWebSocket: false })
     server['deviceRegistry'] = new DeviceRegistry(userDataPath)
@@ -668,6 +670,16 @@ describe('OrcaRuntimeRpcServer', () => {
       (response) => replies.push(JSON.parse(response) as Record<string, unknown>),
       () => {}
     )
+    await server['handleWebSocketMessage'](
+      JSON.stringify({
+        id: 'req_browser_tab_create',
+        method: 'browser.tabCreate',
+        deviceToken: mobile.token,
+        params: { worktree: 'id:wt-1', url: 'about:blank' }
+      }),
+      (response) => replies.push(JSON.parse(response) as Record<string, unknown>),
+      () => {}
+    )
 
     expect(replies).toContainEqual(
       expect.objectContaining({
@@ -681,6 +693,9 @@ describe('OrcaRuntimeRpcServer', () => {
     expect(replies).toContainEqual(expect.objectContaining({ id: 'req_select_codex', ok: true }))
     expect(replies).toContainEqual(expect.objectContaining({ id: 'req_terminal_read', ok: true }))
     expect(replies).toContainEqual(
+      expect.objectContaining({ id: 'req_browser_tab_create', ok: true })
+    )
+    expect(replies).toContainEqual(
       expect.objectContaining({
         id: 'req_remove_claude',
         ok: false,
@@ -690,6 +705,7 @@ describe('OrcaRuntimeRpcServer', () => {
     expect(selectClaudeAccount).toHaveBeenCalledWith('claude-account')
     expect(selectCodexAccount).toHaveBeenCalledWith(null)
     expect(readTerminal).toHaveBeenCalledWith('term-1', { cursor: undefined })
+    expect(browserTabCreate).toHaveBeenCalledWith({ worktree: 'id:wt-1', url: 'about:blank' })
     expect(removeClaudeAccount).not.toHaveBeenCalled()
     expect(pushRuntimeGit).not.toHaveBeenCalled()
   })

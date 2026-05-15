@@ -127,10 +127,24 @@ export type RuntimeMobileSessionFileTab = {
   isActive: boolean
 }
 
+export type RuntimeMobileSessionBrowserTab = {
+  type: 'browser'
+  id: string
+  title: string
+  browserWorkspaceId: string
+  browserPageId: string | null
+  url: string
+  loading: boolean
+  canGoBack: boolean
+  canGoForward: boolean
+  isActive: boolean
+}
+
 export type RuntimeMobileSessionSnapshotTab =
   | RuntimeMobileSessionTerminalTab
   | RuntimeMobileSessionMarkdownTab
   | RuntimeMobileSessionFileTab
+  | RuntimeMobileSessionBrowserTab
 
 export type RuntimeMobileSessionTerminalClientTab =
   | (RuntimeMobileSessionTerminalTab & {
@@ -146,6 +160,7 @@ export type RuntimeMobileSessionClientTab =
   | RuntimeMobileSessionTerminalClientTab
   | RuntimeMobileSessionMarkdownTab
   | RuntimeMobileSessionFileTab
+  | RuntimeMobileSessionBrowserTab
 
 export type RuntimeMobileSessionTabsSnapshot = {
   worktree: string
@@ -153,7 +168,7 @@ export type RuntimeMobileSessionTabsSnapshot = {
   snapshotVersion: number
   activeGroupId: string | null
   activeTabId: string | null
-  activeTabType: 'terminal' | 'markdown' | 'file' | null
+  activeTabType: 'terminal' | 'markdown' | 'file' | 'browser' | null
   tabs: RuntimeMobileSessionSnapshotTab[]
 }
 
@@ -163,7 +178,7 @@ export type RuntimeMobileSessionTabsResult = {
   snapshotVersion: number
   activeGroupId: string | null
   activeTabId: string | null
-  activeTabType: 'terminal' | 'markdown' | 'file' | null
+  activeTabType: 'terminal' | 'markdown' | 'file' | 'browser' | null
   tabs: RuntimeMobileSessionClientTab[]
 }
 
@@ -412,6 +427,21 @@ export type BrowserScreenshotResult = {
   data: string
   format: 'png' | 'jpeg'
 }
+
+export type BrowserScreencastReadyResult = {
+  type: 'ready'
+  subscriptionId: string
+  browserPageId: string
+  format: 'jpeg' | 'png'
+  tab: BrowserTabInfo
+}
+
+export type BrowserScreencastEndResult = {
+  type: 'end'
+  subscriptionId: string
+}
+
+export type BrowserScreencastResult = BrowserScreencastReadyResult | BrowserScreencastEndResult
 
 export type BrowserEvalResult = {
   result: string
