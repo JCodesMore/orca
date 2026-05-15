@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Orca · Orchestrator Terminal Mock</title>
+<style>
+  :root {
+    --bg: #1e1e1e;
+    --bg-2: #252526;
+    --bg-3: #2d2d2d;
+    --sidebar: #181818;
+    --sidebar-hover: #2a2a2a;
+    --border: #333;
+    --border-strong: #444;
+    --text: #d4d4d4;
+    --text-dim: #8a8a8a;
+    --text-bright: #ffffff;
+    --accent: #ff6a3d; /* orca orange */
+    --accent-2: #4ec9b0;
+    --green: #6bbf47;
+    --yellow: #e5c07b;
+    --blue: #61afef;
+    --purple: #c678dd;
+    --term-bg: #1a1a1a;
+    --shadow: 0 12px 40px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0,0,0,0.35);
+    --radius: 8px;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 13px;
+    overflow: hidden;
+  }
+
+  /* ===== App shell ===== */
+  .app {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    grid-template-rows: 36px 1fr;
+    grid-template-areas:
+      "titlebar titlebar"
+      "sidebar  main";
+    height: 100vh;
+  }
+
+  .titlebar {
+    grid-area: titlebar;
+    background: #141414;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    gap: 12px;
+    -webkit-app-region: drag;
+  }
+  .traffic-lights { display: flex; gap: 8px; }
+  .traffic-lights span {
+    width: 12px; height: 12px; border-radius: 50%;
+  }
+  .tl-red { background: #ff5f57; }
+  .tl-yellow { background: #febc2e; }
+  .tl-green { background: #28c840; }
+  .titlebar .title {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-left: 8px;
+  }
+
+  /* ===== Sidebar ===== */
+  .sidebar {
+    grid-area: sidebar;
+    background: var(--sidebar);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .sb-section-label {
+    padding: 12px 14px 6px;
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+    font-weight: 600;
+  }
+
+  /* The new orchestrator terminal entry pinned at top */
+  .orchestrator-pin {
+    margin: 10px 10px 4px;
+    padding: 10px 12px;
+    border-radius: var(--radius);
+    background: linear-gradient(135deg, rgba(255,106,61,0.18), rgba(255,106,61,0.06));
+    border: 1px solid rgba(255,106,61,0.45);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+    position: relative;
+    transition: background 0.15s;
+  }
+  .orchestrator-pin:hover { background: linear-gradient(135deg, rgba(255,106,61,0.28), rgba(255,106,61,0.1)); }
+  .orchestrator-pin .icon {
+    width: 26px; height: 26px;
+    border-radius: 6px;
+    background: var(--accent);
+    color: #1a1a1a;
+    font-weight: 700;
+    display: grid; place-items: center;
+    font-size: 14px;
+    flex-shrink: 0;
+  }
+  .orchestrator-pin .meta { flex: 1; min-width: 0; }
+  .orchestrator-pin .name { color: var(--text-bright); font-weight: 600; font-size: 12.5px; }
+  .orchestrator-pin .sub { color: var(--text-dim); font-size: 11px; margin-top: 1px; }
+  .orchestrator-pin .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 6px var(--green);
+  }
+
+  .divider {
+    height: 1px; background: var(--border); margin: 8px 12px;
+  }
+
+  /* worktree list */
+  .worktrees { flex: 1; overflow: auto; padding: 0 6px 12px; }
+  .wt {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    color: var(--text);
+    font-size: 12.5px;
+  }
+  .wt:hover { background: var(--sidebar-hover); }
+  .wt.active { background: #2f2f2f; }
+  .wt .branch-icon {
+    color: var(--text-dim);
+    font-size: 13px;
+    width: 14px;
+    text-align: center;
+  }
+  .wt .wt-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wt .agent-tag {
+    font-size: 9.5px;
+    padding: 2px 5px;
+    border-radius: 3px;
+    background: #333;
+    color: var(--text-dim);
+    font-family: var(--mono);
+  }
+  .wt .agent-tag.cc { background: rgba(78,201,176,0.15); color: var(--accent-2); }
+  .wt .agent-tag.codex { background: rgba(198,120,221,0.15); color: var(--purple); }
+  .wt .status-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+  }
+  .status-running { background: var(--green); }
+  .status-idle { background: var(--text-dim); }
+  .status-waiting { background: var(--yellow); }
+
+  /* ===== Main editor area ===== */
+  .main {
+    grid-area: main;
+    position: relative;
+    background: var(--bg);
+    overflow: hidden;
+  }
+  .editor-tabs {
+    display: flex;
+    background: var(--bg-2);
+    border-bottom: 1px solid var(--border);
+    height: 34px;
+    align-items: stretch;
+  }
+  .tab {
+    padding: 0 14px;
+    display: flex; align-items: center; gap: 8px;
+    border-right: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 12px;
+  }
+  .tab.active { background: var(--bg); color: var(--text); }
+  .editor-body {
+    padding: 24px 28px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.65;
+    color: var(--text-dim);
+    overflow: auto;
+    height: calc(100% - 34px);
+  }
+  .editor-body .ln { color: #555; user-select: none; display: inline-block; width: 28px; text-align: right; margin-right: 14px; }
+  .editor-body .kw { color: var(--purple); }
+  .editor-body .str { color: #ce9178; }
+  .editor-body .fn { color: var(--blue); }
+  .editor-body .com { color: #6a9955; }
+
+  /* ===== Floating Orchestrator Terminal ===== */
+  .orchestrator {
+    position: absolute;
+    top: 88px;
+    right: 56px;
+    width: 720px;
+    height: 480px;
+    background: var(--term-bg);
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    backdrop-filter: blur(8px);
+  }
+
+  .orch-header {
+    background: #232323;
+    border-bottom: 1px solid var(--border);
+    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: grab;
+    user-select: none;
+  }
+  .orch-header .grip {
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 14px;
+    letter-spacing: -1px;
+  }
+  .orch-header .title-block { flex: 1; display: flex; align-items: center; gap: 8px; }
+  .orch-header .badge {
+    background: var(--accent);
+    color: #1a1a1a;
+    font-weight: 700;
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    letter-spacing: 0.04em;
+  }
+  .orch-header .title-text {
+    color: var(--text-bright);
+    font-size: 12.5px;
+    font-weight: 600;
+  }
+  .orch-header .subtitle { color: var(--text-dim); font-size: 11px; }
+  .orch-actions { display: flex; gap: 4px; }
+  .orch-actions button {
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    width: 24px; height: 24px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .orch-actions button:hover { background: #333; color: var(--text); }
+
+  .orch-body {
+    flex: 1;
+    padding: 14px 16px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.55;
+    color: var(--text);
+    overflow: auto;
+    background: var(--term-bg);
+  }
+  .orch-body .prompt { color: var(--green); }
+  .orch-body .cmd { color: var(--text-bright); }
+  .orch-body .dim { color: var(--text-dim); }
+  .orch-body .accent { color: var(--accent); }
+  .orch-body .cyan { color: var(--accent-2); }
+  .orch-body .purple { color: var(--purple); }
+  .orch-body .yellow { color: var(--yellow); }
+  .orch-body .blue { color: var(--blue); }
+  .orch-body p { margin: 0; }
+  .orch-body .blank { height: 8px; }
+
+  .agent-row {
+    display: grid;
+    grid-template-columns: 22px 1fr auto auto;
+    gap: 12px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    align-items: center;
+    cursor: pointer;
+  }
+  .agent-row:hover { background: rgba(255,255,255,0.04); }
+  .agent-row .num { color: var(--text-dim); }
+  .agent-row .label { color: var(--text-bright); }
+  .agent-row .branch { color: var(--accent-2); font-size: 12px; }
+  .agent-row .state { font-size: 11px; padding: 1px 6px; border-radius: 3px; }
+  .state-running { background: rgba(107,191,71,0.15); color: var(--green); }
+  .state-waiting { background: rgba(229,192,123,0.15); color: var(--yellow); }
+  .state-idle    { background: rgba(138,138,138,0.15); color: var(--text-dim); }
+
+  .input-line {
+    margin-top: 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .input-line .caret {
+    width: 8px; height: 14px;
+    background: var(--text);
+    animation: blink 1.05s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .orch-footer {
+    border-top: 1px solid var(--border);
+    background: #1f1f1f;
+    padding: 6px 12px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .orch-footer .key { color: var(--text); background: #2c2c2c; padding: 1px 6px; border-radius: 3px; border: 1px solid #3a3a3a; }
+  .orch-footer .spacer { flex: 1; }
+
+  /* Caption / annotation badges */
+  .annotation {
+    position: absolute;
+    background: #fff5e6;
+    color: #6b3a00;
+    border: 1px solid #ffb86b;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 11.5px;
+    line-height: 1.4;
+    max-width: 220px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+    z-index: 50;
+  }
+  .annotation .num {
+    display: inline-block;
+    background: var(--accent);
+    color: #1a1a1a;
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    font-weight: 700;
+    text-align: center;
+    line-height: 16px;
+    margin-right: 6px;
+    font-size: 10px;
+  }
+
+  /* second mock variant */
+  .frame-label {
+    position: absolute;
+    top: 8px;
+    left: 12px;
+    font-size: 11px;
+    color: var(--text-dim);
+    background: rgba(0,0,0,0.5);
+    padding: 3px 8px;
+    border-radius: 4px;
+    z-index: 60;
+    font-family: var(--mono);
+  }
+
+  /* /orca slash result panel */
+  .orca-view-panel {
+    border: 1px dashed var(--accent);
+    border-radius: 8px;
+    margin: 10px 0 4px;
+    background: rgba(255,106,61,0.04);
+    padding: 10px 12px;
+  }
+  .orca-view-panel .header {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+    color: var(--accent);
+    font-weight: 600;
+    font-size: 12px;
+  }
+  .orca-view-panel .wt-card {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 4px 12px;
+    padding: 8px 10px;
+    background: #1f1f1f;
+    border: 1px solid #333;
+    border-radius: 6px;
+    margin-bottom: 6px;
+    cursor: pointer;
+  }
+  .orca-view-panel .wt-card:hover { border-color: var(--accent); }
+  .orca-view-panel .wt-card .b1 { color: var(--text-bright); font-weight: 600; }
+  .orca-view-panel .wt-card .b2 { color: var(--text-dim); font-size: 11px; grid-column: 1 / -1; }
+  .orca-view-panel .wt-card .pill { font-size: 10px; padding: 2px 6px; border-radius: 3px; background: #2c2c2c; color: var(--accent-2); }
+
+  /* second snapshot ("after click") */
+  .mock-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 36px;
+    padding: 36px;
+    background: #0f0f0f;
+    overflow: auto;
+    height: 100vh;
+  }
+  .frame {
+    position: relative;
+    background: var(--bg);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.04);
+    height: 720px;
+  }
+  .frame .app { height: 100%; }
+  .frame-title {
+    color: var(--text-dim);
+    font-size: 12px;
+    margin-bottom: 8px;
+    font-family: var(--mono);
+    letter-spacing: 0.02em;
+  }
+
+  /* Trail indicator for "go back" */
+  .breadcrumb-trail {
+    position: absolute;
+    top: 44px;
+    left: 252px;
+    background: #2a2a2a;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    padding: 4px 8px 4px 4px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11.5px;
+    color: var(--text-dim);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    z-index: 30;
+  }
+  .breadcrumb-trail .back-btn {
+    background: var(--accent);
+    color: #1a1a1a;
+    border: none;
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 11px;
+  }
+  .breadcrumb-trail .crumb { color: var(--text); }
+  .breadcrumb-trail .arrow { color: #555; }
+
+  /* Heading */
+  .doc-title {
+    color: var(--text-bright);
+    font-size: 18px;
+    margin: 0 0 4px;
+    font-weight: 600;
+    font-family: var(--sans);
+  }
+  .doc-sub {
+    color: var(--text-dim);
+    font-size: 12.5px;
+    margin: 0 0 8px;
+  }
+</style>
+</head>
+<body>
+
+<div class="mock-grid">
+
+  <!-- =========================================================
+       FRAME 1: Orchestrator Terminal floating, listing agents
+       ========================================================= -->
+  <div>
+    <h1 class="doc-title">Orchestrator Terminal — concept mock</h1>
+    <p class="doc-sub">A worktree-less Claude Code session pinned to the top of the sidebar. Floating, draggable, always-on. Use <code>agents</code> or <code>/orca</code> to jump into any running agent's worktree.</p>
+  </div>
+
+  <div class="frame">
+    <div class="frame-label">FRAME 1 · Orchestrator Terminal open · `agents` listed</div>
+    <div class="app">
+
+      <div class="titlebar">
+        <div class="traffic-lights"><span class="tl-red"></span><span class="tl-yellow"></span><span class="tl-green"></span></div>
+        <div class="title">orca — main</div>
+      </div>
+
+      <!-- SIDEBAR -->
+      <aside class="sidebar">
+        <!-- Pinned orchestrator entry (NEW) -->
+        <div class="orchestrator-pin" title="Open Orchestrator Terminal">
+          <div class="icon">⌘</div>
+          <div class="meta">
+            <div class="name">Orchestrator</div>
+            <div class="sub">Claude Code · no worktree</div>
+          </div>
+          <div class="dot" title="Active"></div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="sb-section-label">Worktrees</div>
+        <div class="worktrees">
+          <div class="wt active">
+            <span class="branch-icon">⎇</span>
+            <span class="wt-name">main</span>
+            <span class="status-dot status-idle"></span>
+          </div>
+          <div class="wt">
+            <span class="branch-icon">⎇</span>
+            <span class="wt-name">add-a-pet-for-orca</span>
+            <span class="agent-tag cc">CC</span>
+            <span class="status-dot status-running"></span>
+          </div>
+          <div class="wt">
+            <span class="branch-icon">⎇</span>
+            <span class="wt-name">github-ui</span>
+            <span class="agent-tag cc">CC</span>
+            <span class="status-dot status-waiting"></span>
+          </div>
+          <div class="wt">
+            <span class="branch-icon">⎇</span>
+            <span class="wt-name">more-linear-features</span>
+            <span class="agent-tag codex">CDX</span>
+            <span class="status-dot status-running"></span>
+          </div>
+          <div class="wt">
+            <span class="branch-icon">⎇</span>
+            <span class="wt-name">new-create-pr</span>
+            <span class="agent-tag cc">CC</span>
+            <span class="status-dot status-idle"></span>
+          </div>
+          <div class="wt">
+            <span class="branch-icon">⎇</span>
+            <span class="wt-name">gbrain-demo</span>
+            <span class="status-dot status-idle"></span>
+          </div>
+          <div class="wt">
+            <span class="branch-icon">⎇</span>
+            <span class="wt-name">invesitgate-issue</span>
+            <span class="agent-tag cc">CC</span>
+            <span class="status-dot status-running"></span>
+          </div>
+          <div class="wt">
+            <span class="branch-icon">⎇</span>
+            <span class="wt-name">worktree-sidecard-overlapping</span>
+            <span class="status-dot status-idle"></span>
+          </div>
+        </div>
+      </aside>
+
+      <!-- MAIN -->
+      <main class="main">
+        <div class="editor-tabs">
+          <div class="tab active">README.md</div>
+          <div class="tab">AGENTS.md</div>
+        </div>
+        <div class="editor-body">
+          <div><span class="ln">1</span><span class="com"># Orca</span></div>
+          <div><span class="ln">2</span></div>
+          <div><span class="ln">3</span>The agent-native IDE for orchestrating many coding agents in parallel.</div>
+          <div><span class="ln">4</span></div>
+          <div><span class="ln">5</span><span class="com">## Orchestrator Terminal</span></div>
+          <div><span class="ln">6</span></div>
+          <div><span class="ln">7</span>A worktree-less Claude Code session that lives above your worktree list. Use it</div>
+          <div><span class="ln">8</span>to triage every running agent without committing to one. Run <span class="kw">agents</span> to see</div>
+          <div><span class="ln">9</span>the full roster, or <span class="kw">/orca</span> to pull up the worktree picker.</div>
+        </div>
+
+        <!-- Floating Orchestrator Terminal -->
+        <section class="orchestrator" role="dialog" aria-label="Orchestrator Terminal">
+          <header class="orch-header">
+            <span class="grip">⋮⋮</span>
+            <div class="title-block">
+              <span class="badge">ORCH</span>
+              <span class="title-text">Orchestrator Terminal</span>
+              <span class="subtitle">— Claude Code · floating · no worktree</span>
+            </div>
+            <div class="orch-actions">
+              <button title="Pin">📌</button>
+              <button title="Minimize">—</button>
+              <button title="Maximize">▢</button>
+              <button title="Close">×</button>
+            </div>
+          </header>
+
+          <div class="orch-body">
+            <p><span class="dim">Claude Code v1.3.50 — orchestrator session (no worktree bound)</span></p>
+            <p><span class="dim">Try </span><span class="cyan">agents</span><span class="dim"> to list running agents, or </span><span class="cyan">/orca</span><span class="dim"> for the worktree picker.</span></p>
+            <div class="blank"></div>
+
+            <p><span class="prompt">orchestrator ❯</span> <span class="cmd">agents</span></p>
+            <div class="blank"></div>
+
+            <p><span class="dim">7 worktrees · 4 active agents</span></p>
+            <div class="blank"></div>
+
+            <div class="agent-row">
+              <span class="num">1</span>
+              <span><span class="label">Claude Code</span> <span class="dim">on</span> <span class="branch">add-a-pet-for-orca</span> <span class="dim">— editing src/renderer/Pet.tsx</span></span>
+              <span class="state state-running">● running</span>
+              <span class="dim">2m ago</span>
+            </div>
+            <div class="agent-row">
+              <span class="num">2</span>
+              <span><span class="label">Claude Code</span> <span class="dim">on</span> <span class="branch">github-ui</span> <span class="dim">— awaiting permission</span></span>
+              <span class="state state-waiting">● waiting</span>
+              <span class="dim">just now</span>
+            </div>
+            <div class="agent-row">
+              <span class="num">3</span>
+              <span><span class="label">Codex</span> <span class="dim">on</span> <span class="branch">more-linear-features</span> <span class="dim">— running tests</span></span>
+              <span class="state state-running">● running</span>
+              <span class="dim">11m ago</span>
+            </div>
+            <div class="agent-row">
+              <span class="num">4</span>
+              <span><span class="label">Claude Code</span> <span class="dim">on</span> <span class="branch">invesitgate-issue</span> <span class="dim">— diagnosing flaky test</span></span>
+              <span class="state state-running">● running</span>
+              <span class="dim">28s ago</span>
+            </div>
+            <div class="agent-row">
+              <span class="num">5</span>
+              <span><span class="label">Claude Code</span> <span class="dim">on</span> <span class="branch">new-create-pr</span> <span class="dim">— idle, last task done</span></span>
+              <span class="state state-idle">○ idle</span>
+              <span class="dim">1h ago</span>
+            </div>
+
+            <div class="blank"></div>
+            <p><span class="dim">Click a row to jump to that agent's worktree. Use </span><span class="cyan">back</span><span class="dim"> here to return.</span></p>
+
+            <div class="input-line">
+              <span class="prompt">orchestrator ❯</span>
+              <span class="caret"></span>
+            </div>
+          </div>
+
+          <footer class="orch-footer">
+            <span><span class="key">⌘`</span> toggle</span>
+            <span><span class="key">⌘⇧O</span> orchestrator</span>
+            <span><span class="key">⌘D</span> dock/float</span>
+            <span class="spacer"></span>
+            <span>floating · 720×480</span>
+          </footer>
+        </section>
+
+        <!-- Annotations -->
+        <div class="annotation" style="top: 56px; left: -212px; max-width: 200px;">
+          <span class="num">1</span> Pinned at top of sidebar. One click opens the floating terminal.
+        </div>
+        <div class="annotation" style="top: 110px; right: -228px; max-width: 220px;">
+          <span class="num">2</span> Floating · draggable by the header · always available across worktrees.
+        </div>
+        <div class="annotation" style="top: 360px; right: -228px; max-width: 220px;">
+          <span class="num">3</span> Type <b>agents</b> to list every running agent. Click a row → jumps into that worktree.
+        </div>
+        <div class="annotation" style="bottom: 30px; right: -228px; max-width: 220px;">
+          <span class="num">4</span> Footer hint: <b>⌘⇧O</b> opens it from anywhere; <b>⌘D</b> docks it back into the sidebar.
+        </div>
+      </main>
+    </div>
+  </div>
+
+
+  <!-- =========================================================
+       FRAME 2: User clicked an agent → jumped into worktree
+       ========================================================= -->
+  <div>
+    <p class="doc-sub" style="margin-top: 12px;">After clicking <b>github-ui</b> in the orchestrator: Orca jumps to that worktree. The orchestrator stays floating (so they can keep triaging), and a "← Back to orchestrator" trail appears.</p>
+  </div>
+
+  <div class="frame">
+    <div class="frame-label">FRAME 2 · Jumped into `github-ui` · orchestrator floats above · back-trail visible</div>
+    <div class="app">
+
+      <div class="titlebar">
+        <div class="traffic-lights"><span class="tl-red"></span><span class="tl-yellow"></span><span class="tl-green"></span></div>
+        <div class="title">orca — github-ui</div>
+      </div>
+
+      <aside class="sidebar">
+        <div class="orchestrator-pin" title="Open Orchestrator Terminal">
+          <div class="icon">⌘</div>
+          <div class="meta">
+            <div class="name">Orchestrator</div>
+            <div class="sub">Floating · click to focus</div>
+          </div>
+          <div class="dot"></div>
+        </div>
+        <div class="divider"></div>
+        <div class="sb-section-label">Worktrees</div>
+        <div class="worktrees">
+          <div class="wt"><span class="branch-icon">⎇</span><span class="wt-name">main</span><span class="status-dot status-idle"></span></div>
+          <div class="wt"><span class="branch-icon">⎇</span><span class="wt-name">add-a-pet-for-orca</span><span class="agent-tag cc">CC</span><span class="status-dot status-running"></span></div>
+          <div class="wt active"><span class="branch-icon">⎇</span><span class="wt-name">github-ui</span><span class="agent-tag cc">CC</span><span class="status-dot status-waiting"></span></div>
+          <div class="wt"><span class="branch-icon">⎇</span><span class="wt-name">more-linear-features</span><span class="agent-tag codex">CDX</span><span class="status-dot status-running"></span></div>
+          <div class="wt"><span class="branch-icon">⎇</span><span class="wt-name">new-create-pr</span><span class="agent-tag cc">CC</span><span class="status-dot status-idle"></span></div>
+          <div class="wt"><span class="branch-icon">⎇</span><span class="wt-name">invesitgate-issue</span><span class="agent-tag cc">CC</span><span class="status-dot status-running"></span></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <!-- Back trail -->
+        <div class="breadcrumb-trail">
+          <button class="back-btn">← Back</button>
+          <span class="crumb">Orchestrator</span>
+          <span class="arrow">›</span>
+          <span class="crumb" style="color: var(--text-bright);">github-ui</span>
+        </div>
+
+        <div class="editor-tabs">
+          <div class="tab active">src/renderer/GithubUI.tsx</div>
+          <div class="tab">CHANGES.md</div>
+        </div>
+        <div class="editor-body">
+          <div><span class="ln">1</span><span class="kw">import</span> { useState } <span class="kw">from</span> <span class="str">'react'</span></div>
+          <div><span class="ln">2</span><span class="kw">import</span> { GitHubAPI } <span class="kw">from</span> <span class="str">'@/lib/github'</span></div>
+          <div><span class="ln">3</span></div>
+          <div><span class="ln">4</span><span class="kw">export function</span> <span class="fn">GithubPanel</span>() {</div>
+          <div><span class="ln">5</span>&nbsp;&nbsp;<span class="com">// Agent paused here — awaiting permission to call gh API</span></div>
+          <div><span class="ln">6</span>&nbsp;&nbsp;<span class="kw">const</span> [prs, setPRs] = <span class="fn">useState</span>([])</div>
+          <div><span class="ln">7</span>&nbsp;&nbsp;...</div>
+          <div><span class="ln">8</span>}</div>
+        </div>
+
+        <!-- /orca panel inside the still-floating orchestrator -->
+        <section class="orchestrator" style="top: 60px; right: 56px; width: 660px; height: 460px;">
+          <header class="orch-header">
+            <span class="grip">⋮⋮</span>
+            <div class="title-block">
+              <span class="badge">ORCH</span>
+              <span class="title-text">Orchestrator Terminal</span>
+              <span class="subtitle">— /orca worktree picker</span>
+            </div>
+            <div class="orch-actions">
+              <button>📌</button><button>—</button><button>▢</button><button>×</button>
+            </div>
+          </header>
+
+          <div class="orch-body">
+            <p><span class="prompt">orchestrator ❯</span> <span class="cmd">/orca</span></p>
+            <div class="blank"></div>
+
+            <div class="orca-view-panel">
+              <div class="header">
+                <span>◆</span> Orca worktree picker — click any to jump
+              </div>
+
+              <div class="wt-card">
+                <span class="b1">add-a-pet-for-orca</span>
+                <span class="pill">Claude Code</span>
+                <span class="b2">editing src/renderer/Pet.tsx · 3 unstaged · running</span>
+              </div>
+              <div class="wt-card" style="border-color: var(--accent);">
+                <span class="b1">github-ui</span>
+                <span class="pill">Claude Code · ← here</span>
+                <span class="b2">awaiting permission to call gh CLI · 1 unstaged</span>
+              </div>
+              <div class="wt-card">
+                <span class="b1">more-linear-features</span>
+                <span class="pill" style="color: var(--purple);">Codex</span>
+                <span class="b2">running pnpm test · 12 files changed</span>
+              </div>
+              <div class="wt-card">
+                <span class="b1">invesitgate-issue</span>
+                <span class="pill">Claude Code</span>
+                <span class="b2">diagnosing flaky test in tab-group-state · running</span>
+              </div>
+            </div>
+
+            <p><span class="dim">Tip: same as </span><span class="cyan">agents</span><span class="dim">, but presented as a visual picker. </span><span class="cyan">back</span><span class="dim"> returns to the orchestrator session.</span></p>
+
+            <div class="input-line">
+              <span class="prompt">orchestrator ❯</span>
+              <span class="caret"></span>
+            </div>
+          </div>
+
+          <footer class="orch-footer">
+            <span><span class="key">↵</span> jump</span>
+            <span><span class="key">esc</span> dismiss picker</span>
+            <span><span class="key">⌘⇧O</span> focus orchestrator</span>
+            <span class="spacer"></span>
+            <span>floating</span>
+          </footer>
+        </section>
+      </main>
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>

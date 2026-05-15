@@ -1,0 +1,834 @@
+<!doctype html>
+<html lang="en" class="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Orca Orchestrator Terminal Mock</title>
+    <style>
+      :root {
+        --app-font-family:
+          "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        --font-mono:
+          "SF Mono", SFMono-Regular, ui-monospace, "Cascadia Code", Menlo, Consolas,
+          "Liberation Mono", monospace;
+        --radius: 10px;
+        --background: #fff;
+        --editor-surface: #fff;
+        --foreground: #0a0a0a;
+        --card: #fff;
+        --card-foreground: #0a0a0a;
+        --popover: #fff;
+        --popover-foreground: #0a0a0a;
+        --primary: #171717;
+        --primary-foreground: #fafafa;
+        --secondary: #f5f5f5;
+        --secondary-foreground: #171717;
+        --muted: #f5f5f5;
+        --muted-foreground: #737373;
+        --accent: #f5f5f5;
+        --accent-foreground: #171717;
+        --border: #e5e5e5;
+        --ring: #a1a1a1;
+        --sidebar: #fafafa;
+        --sidebar-foreground: #0a0a0a;
+        --sidebar-accent: #f5f5f5;
+        --sidebar-accent-foreground: #171717;
+        --sidebar-border: #e5e5e5;
+        --git-decoration-added: #587c0c;
+        --git-decoration-modified: #895503;
+        --git-decoration-untracked: #007100;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        height: 100vh;
+        overflow: hidden;
+        background: var(--background);
+        color: var(--foreground);
+        font-family: var(--app-font-family);
+        letter-spacing: 0.01em;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      button {
+        font: inherit;
+      }
+
+      .app {
+        display: grid;
+        grid-template-columns: 212px minmax(620px, 1fr) 212px;
+        grid-template-rows: 36px minmax(0, 1fr);
+        height: 100vh;
+      }
+
+      .titlebar {
+        grid-column: 1 / -1;
+        display: grid;
+        grid-template-columns: 212px minmax(0, 1fr) 212px;
+        border-bottom: 1px solid var(--border);
+        background: var(--background);
+      }
+
+      .traffic {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 0 12px;
+        border-right: 1px solid var(--border);
+      }
+
+      .dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 999px;
+        border: 1px solid color-mix(in srgb, var(--foreground) 16%, transparent);
+      }
+
+      .dot.red {
+        background: #ff5f57;
+      }
+
+      .dot.yellow {
+        background: #ffbd2e;
+      }
+
+      .dot.green {
+        background: #28c840;
+      }
+
+      .window-title {
+        margin-left: 8px;
+        color: var(--muted-foreground);
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      .tabs {
+        display: flex;
+        align-items: end;
+        min-width: 0;
+        border-right: 1px solid var(--border);
+      }
+
+      .tab {
+        height: 35px;
+        min-width: 132px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 0 12px;
+        border-right: 1px solid var(--border);
+        color: var(--muted-foreground);
+        font-size: 12px;
+      }
+
+      .tab.active {
+        background: var(--background);
+        color: var(--foreground);
+        box-shadow: inset 0 -2px 0 var(--primary);
+      }
+
+      .title-actions {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 10px;
+        padding: 0 12px;
+        color: var(--muted-foreground);
+        font-family: var(--font-mono);
+        font-size: 13px;
+      }
+
+      .sidebar {
+        min-width: 0;
+        border-right: 1px solid var(--sidebar-border);
+        background: var(--sidebar);
+        color: var(--sidebar-foreground);
+        overflow: hidden;
+      }
+
+      .sidebar-section {
+        padding: 14px 8px 0;
+      }
+
+      .nav-row {
+        height: 32px;
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        border-radius: calc(var(--radius) * 0.6);
+        padding: 0 8px;
+        color: var(--muted-foreground);
+        font-size: 13px;
+      }
+
+      .global-orchestrator {
+        width: 100%;
+        height: 36px;
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        border: 1px solid var(--sidebar-border);
+        border-radius: calc(var(--radius) * 0.8);
+        background: var(--background);
+        color: var(--foreground);
+        padding: 0 8px;
+        box-shadow: 0 1px 1px rgb(0 0 0 / 0.04);
+      }
+
+      .global-orchestrator .terminal-mark {
+        width: 18px;
+        height: 18px;
+        display: grid;
+        place-items: center;
+        border-radius: 4px;
+        background: var(--primary);
+        color: var(--primary-foreground);
+        font-family: var(--font-mono);
+        font-size: 11px;
+        line-height: 1;
+      }
+
+      .global-orchestrator strong {
+        font-size: 12px;
+        font-weight: 650;
+      }
+
+      .global-orchestrator span:last-child {
+        margin-left: auto;
+        color: var(--muted-foreground);
+        font-family: var(--font-mono);
+        font-size: 11px;
+      }
+
+      .section-label {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin: 18px 0 8px;
+        padding: 0 2px;
+        color: var(--muted-foreground);
+        font-size: 11px;
+        font-weight: 650;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+      }
+
+      .worktree {
+        position: relative;
+        padding: 10px 8px 11px;
+        border-radius: calc(var(--radius) * 0.8);
+      }
+
+      .worktree.current {
+        background: var(--sidebar-accent);
+      }
+
+      .worktree-name {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 6px;
+        font-size: 13px;
+        font-weight: 560;
+      }
+
+      .status {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--git-decoration-untracked);
+      }
+
+      .status.idle {
+        background: var(--muted-foreground);
+        opacity: 0.5;
+      }
+
+      .worktree-meta,
+      .agent-summary {
+        color: var(--muted-foreground);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .agent-summary {
+        display: flex;
+        gap: 7px;
+        margin-top: 8px;
+        padding: 7px;
+        border-radius: calc(var(--radius) * 0.6);
+        background: color-mix(in srgb, var(--background) 74%, var(--sidebar-accent));
+      }
+
+      .agent-summary.active {
+        outline: 1px solid var(--border);
+        background: var(--background);
+        color: var(--foreground);
+      }
+
+      .main {
+        min-width: 0;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1.04fr);
+        background: var(--background);
+      }
+
+      .reader,
+      .terminal-pane {
+        min-width: 0;
+        overflow: hidden;
+        border-right: 1px solid var(--border);
+      }
+
+      .file-header,
+      .terminal-header,
+      .tree-header {
+        height: 31px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 0 12px;
+        border-bottom: 1px solid var(--border);
+        color: var(--muted-foreground);
+        font-size: 12px;
+      }
+
+      .file-body {
+        padding: 20px 22px;
+        color: var(--muted-foreground);
+        font-family: var(--font-mono);
+        font-size: 14px;
+        line-height: 1.45;
+      }
+
+      .file-body .link {
+        color: #2563eb;
+      }
+
+      .terminal-pane {
+        display: flex;
+        flex-direction: column;
+        background: var(--editor-surface);
+      }
+
+      .terminal-log {
+        flex: 1;
+        overflow: hidden;
+        padding: 16px 14px;
+        font-family: var(--font-mono);
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .input-line {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        height: 68px;
+        border-top: 1px solid var(--border);
+        padding: 0 14px;
+        font-family: var(--font-mono);
+        font-size: 13px;
+      }
+
+      .prompt {
+        color: var(--muted-foreground);
+      }
+
+      .terminal-command {
+        display: inline-block;
+        background: var(--accent);
+        color: var(--foreground);
+        padding: 1px 4px;
+      }
+
+      .right-tree {
+        min-width: 0;
+        overflow: hidden;
+        background: var(--background);
+      }
+
+      .tree-list {
+        padding: 8px 10px;
+        font-size: 13px;
+      }
+
+      .tree-item {
+        height: 24px;
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        color: var(--muted-foreground);
+      }
+
+      .tree-item.active {
+        color: var(--foreground);
+        background: var(--accent);
+        margin: 0 -6px;
+        padding: 0 6px;
+      }
+
+      .floating-terminal {
+        position: fixed;
+        left: 438px;
+        top: 88px;
+        width: min(780px, calc(100vw - 500px));
+        height: min(590px, calc(100vh - 150px));
+        display: flex;
+        flex-direction: column;
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        background: var(--popover);
+        box-shadow: 0 10px 24px rgb(0 0 0 / 0.18);
+        overflow: hidden;
+        z-index: 20;
+      }
+
+      .float-titlebar {
+        height: 38px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 10px;
+        border-bottom: 1px solid var(--border);
+        background: var(--card);
+        cursor: grab;
+        user-select: none;
+      }
+
+      .float-titlebar:active {
+        cursor: grabbing;
+      }
+
+      .float-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+        font-size: 13px;
+        font-weight: 650;
+      }
+
+      .float-title small {
+        color: var(--muted-foreground);
+        font-family: var(--font-mono);
+        font-size: 11px;
+        font-weight: 450;
+      }
+
+      .float-actions {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+
+      .icon-button {
+        width: 26px;
+        height: 26px;
+        border: 0;
+        border-radius: calc(var(--radius) * 0.6);
+        background: transparent;
+        color: var(--muted-foreground);
+      }
+
+      .icon-button:hover {
+        background: var(--accent);
+        color: var(--accent-foreground);
+      }
+
+      .float-body {
+        flex: 1;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 238px;
+        min-height: 0;
+      }
+
+      .claude-terminal {
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        background: var(--background);
+      }
+
+      .claude-log {
+        flex: 1;
+        overflow: auto;
+        padding: 16px;
+        font-family: var(--font-mono);
+        font-size: 13px;
+        line-height: 1.55;
+      }
+
+      .line {
+        min-height: 20px;
+      }
+
+      .muted {
+        color: var(--muted-foreground);
+      }
+
+      .green {
+        color: var(--git-decoration-added);
+      }
+
+      .orange {
+        color: var(--git-decoration-modified);
+      }
+
+      .agent-results {
+        margin: 10px 0 14px;
+        border: 1px solid var(--border);
+        border-radius: calc(var(--radius) * 0.8);
+        overflow: hidden;
+        font-family: var(--app-font-family);
+      }
+
+      .agent-row {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 12px;
+        padding: 10px 11px;
+        border-bottom: 1px solid var(--border);
+        background: var(--background);
+      }
+
+      .agent-row:last-child {
+        border-bottom: 0;
+      }
+
+      .agent-row.current {
+        background: var(--accent);
+      }
+
+      .agent-row strong {
+        display: block;
+        margin-bottom: 2px;
+        color: var(--foreground);
+        font-size: 13px;
+      }
+
+      .agent-row span {
+        color: var(--muted-foreground);
+        font-size: 12px;
+      }
+
+      .agent-jump {
+        align-self: center;
+        height: 26px;
+        border: 1px solid var(--border);
+        border-radius: calc(var(--radius) * 0.6);
+        background: var(--background);
+        color: var(--foreground);
+        padding: 0 9px;
+        font-size: 12px;
+      }
+
+      .mock-input {
+        min-height: 42px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        border-top: 1px solid var(--border);
+        padding: 0 14px;
+        font-family: var(--font-mono);
+        font-size: 13px;
+      }
+
+      .side-context {
+        min-width: 0;
+        border-left: 1px solid var(--border);
+        background: var(--sidebar);
+        padding: 12px;
+      }
+
+      .context-label {
+        margin-bottom: 10px;
+        color: var(--muted-foreground);
+        font-size: 11px;
+        font-weight: 650;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+      }
+
+      .context-card {
+        margin-bottom: 10px;
+        padding: 10px;
+        border: 1px solid var(--sidebar-border);
+        border-radius: calc(var(--radius) * 0.8);
+        background: var(--background);
+      }
+
+      .context-card strong {
+        display: block;
+        margin-bottom: 4px;
+        font-size: 13px;
+      }
+
+      .context-card p {
+        margin: 0;
+        color: var(--muted-foreground);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .crumb {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        color: var(--muted-foreground);
+        font-size: 12px;
+      }
+
+      .return-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 24px;
+        margin-top: 10px;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 0 9px;
+        color: var(--foreground);
+        font-size: 12px;
+      }
+
+      @media (max-width: 1100px) {
+        .app {
+          grid-template-columns: 212px minmax(0, 1fr);
+        }
+
+        .titlebar {
+          grid-template-columns: 212px minmax(0, 1fr);
+        }
+
+        .right-tree,
+        .title-actions {
+          display: none;
+        }
+
+        .main {
+          grid-template-columns: minmax(0, 1fr);
+        }
+
+        .reader {
+          display: none;
+        }
+
+        .floating-terminal {
+          left: 234px;
+          width: calc(100vw - 258px);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <header class="titlebar">
+        <div class="traffic">
+          <span class="dot red"></span>
+          <span class="dot yellow"></span>
+          <span class="dot green"></span>
+          <span class="window-title">Orca</span>
+        </div>
+        <div class="tabs">
+          <div class="tab">README.md</div>
+          <div class="tab active">orca</div>
+          <div class="tab">+</div>
+        </div>
+        <div class="title-actions">...</div>
+      </header>
+
+      <aside class="sidebar">
+        <div class="sidebar-section">
+          <div class="nav-row">Tasks</div>
+          <div class="nav-row">Search</div>
+
+          <button class="global-orchestrator" type="button">
+            <span class="terminal-mark">&gt;_</span>
+            <strong>Orchestrator</strong>
+            <span>global</span>
+          </button>
+
+          <div class="section-label">
+            <span>Workspaces</span>
+            <span>+ </span>
+          </div>
+
+          <div class="worktree current">
+            <div class="worktree-name"><span class="status"></span>main</div>
+            <div class="worktree-meta">PR #270 fix: make sidebar agents easier to resume</div>
+            <div class="agent-summary active">
+              <span>&gt;_</span>
+              <span>are you stuck?<br />/var/fold... - bash pwd && rg</span>
+            </div>
+          </div>
+
+          <div class="worktree">
+            <div class="worktree-name"><span class="status"></span>more-linear-features</div>
+            <div class="worktree-meta">Linear issue picker implemented</div>
+          </div>
+
+          <div class="worktree">
+            <div class="worktree-name"><span class="status"></span>new-create-pr</div>
+            <div class="worktree-meta">fixed openOrCreatePRUrl upstream mismatch</div>
+          </div>
+
+          <div class="worktree">
+            <div class="worktree-name"><span class="status idle"></span>gbrain-demo</div>
+            <div class="worktree-meta">gbrain-demo</div>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <section class="reader">
+          <div class="file-header">src/main/startup/crash-diagnostics.ts</div>
+          <div class="file-body">
+            <p><span class="link">src/main/startup/crash-diagnostics.ts</span> that exports <span class="link">installCrashDiagnostics()</span>, writing to userData/crash-diag.log.</p>
+            <p>The runtime cost is essentially zero. The handlers fire only on exceptional events, and writes are synchronous-but-rare.</p>
+            <p>Want me to write that file and wire it into <span class="link">index.ts</span>?</p>
+          </div>
+        </section>
+
+        <section class="terminal-pane">
+          <div class="terminal-header">orca terminal</div>
+          <div class="terminal-log">
+            <div class="line muted">Read 1 file, listed 1 directory</div>
+            <div class="line">&gt; are you stuck?</div>
+            <div class="line">No, just creating the mockup now.</div>
+            <div class="line orange">+ Working... 537 tokens</div>
+            <br />
+            <div class="line">&gt;</div>
+          </div>
+          <div class="input-line">
+            <span class="prompt">&gt;</span>
+            <span class="muted">Improve documentation in @filename</span>
+          </div>
+        </section>
+      </main>
+
+      <aside class="right-tree">
+        <div class="tree-header">Files</div>
+        <div class="tree-list">
+          <div class="tree-item">.agents</div>
+          <div class="tree-item">.claude</div>
+          <div class="tree-item">docs</div>
+          <div class="tree-item active">README.md</div>
+          <div class="tree-item">src</div>
+          <div class="tree-item">tests</div>
+          <div class="tree-item">tools</div>
+        </div>
+      </aside>
+    </div>
+
+    <section class="floating-terminal" id="floatingTerminal" aria-label="Orchestrator terminal mock">
+      <div class="float-titlebar" id="dragHandle">
+        <div class="float-title">
+          <span class="terminal-mark">&gt;_</span>
+          <span>Orchestrator Terminal</span>
+          <small>no worktree attached</small>
+        </div>
+        <div class="float-actions">
+          <button class="icon-button" type="button" aria-label="Minimize">-</button>
+          <button class="icon-button" type="button" aria-label="Pin">[]</button>
+          <button class="icon-button" type="button" aria-label="Close">x</button>
+        </div>
+      </div>
+
+      <div class="float-body">
+        <div class="claude-terminal">
+          <div class="claude-log">
+            <div class="line muted">Claude Code - global Orca session</div>
+            <div class="line muted">This terminal is launched from the sidebar and follows you across worktrees.</div>
+            <br />
+            <div class="line"><span class="prompt">&gt;</span> agents</div>
+            <div class="agent-results">
+              <div class="agent-row current">
+                <div>
+                  <strong>main / PR #270</strong>
+                  <span>Claude Code - asked "are you stuck?" - cwd: /Users/.../orca</span>
+                </div>
+                <button class="agent-jump" type="button">Open</button>
+              </div>
+              <div class="agent-row">
+                <div>
+                  <strong>more-linear-features</strong>
+                  <span>Codex - Linear issue picker - 48m idle</span>
+                </div>
+                <button class="agent-jump" type="button">Open</button>
+              </div>
+              <div class="agent-row">
+                <div>
+                  <strong>new-create-pr</strong>
+                  <span>Claude Code - fixing upstream branch mismatch - 12m idle</span>
+                </div>
+                <button class="agent-jump" type="button">Open</button>
+              </div>
+            </div>
+            <div class="line"><span class="prompt">&gt;</span> <span class="terminal-command">/orca more-linear-features</span></div>
+            <div class="line green">Opening Orca view for worktree: more-linear-features</div>
+            <div class="line muted">Press Return to jump. The orchestrator stays pinned so you can return.</div>
+          </div>
+
+          <div class="mock-input">
+            <span class="prompt">&gt;</span>
+            <span>/orca main</span>
+          </div>
+        </div>
+
+        <aside class="side-context">
+          <div class="context-label">Jump Preview</div>
+          <div class="context-card">
+            <strong>Open worktree agent</strong>
+            <p>Clicking an agent focuses that worktree, restores the agent terminal, and leaves this floating terminal available.</p>
+          </div>
+          <div class="context-card">
+            <strong>Return path</strong>
+            <p>The orchestrator keeps a breadcrumb so users can go back to the previous worktree after checking another agent.</p>
+            <span class="return-pill">Back to main</span>
+          </div>
+          <div class="context-card">
+            <strong>Same command surface</strong>
+            <p><span class="terminal-command">agents</span> lists running agents. <span class="terminal-command">/orca</span> opens the same jump view from inside Claude Code.</p>
+          </div>
+          <div class="crumb">Orchestrator -> more-linear-features -> agent terminal</div>
+        </aside>
+      </div>
+    </section>
+
+    <script>
+      const terminal = document.getElementById("floatingTerminal");
+      const handle = document.getElementById("dragHandle");
+      let dragState = null;
+
+      handle.addEventListener("pointerdown", (event) => {
+        dragState = {
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startY: event.clientY,
+          left: terminal.offsetLeft,
+          top: terminal.offsetTop,
+        };
+        handle.setPointerCapture(event.pointerId);
+      });
+
+      handle.addEventListener("pointermove", (event) => {
+        if (!dragState || dragState.pointerId !== event.pointerId) return;
+        const nextLeft = dragState.left + event.clientX - dragState.startX;
+        const nextTop = dragState.top + event.clientY - dragState.startY;
+        terminal.style.left = `${Math.max(8, Math.min(window.innerWidth - 240, nextLeft))}px`;
+        terminal.style.top = `${Math.max(44, Math.min(window.innerHeight - 80, nextTop))}px`;
+      });
+
+      handle.addEventListener("pointerup", () => {
+        dragState = null;
+      });
+    </script>
+  </body>
+</html>
