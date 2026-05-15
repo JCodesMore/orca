@@ -2,6 +2,7 @@
 import { useEffect, useRef } from 'react'
 import type { IDisposable } from '@xterm/xterm'
 import { PaneManager } from '@/lib/pane-manager/pane-manager'
+import { buildWindowsPtyCompatibilityOptions } from '@/lib/pane-manager/windows-pty-compatibility'
 import { useAppStore } from '@/store'
 import {
   createFilePathLinkProvider,
@@ -37,6 +38,7 @@ import { installMouseHideWhileTyping } from './mouse-hide-while-typing'
 import type { EffectiveMacOptionAsAlt } from '@/lib/keyboard-layout/detect-option-as-alt'
 import { resolveEffectiveTerminalAppearance } from '@/lib/terminal-theme'
 import { connectPanePty } from './pty-connection'
+import { getConnectionId } from '@/lib/connection-context'
 import type { PtyTransport } from './pty-transport'
 import { isPaneReplaying, type ReplayingPanesRef } from './replay-guard'
 import { fitAndFocusPanes, fitPanes } from './pane-helpers'
@@ -662,7 +664,18 @@ export function useTerminalPaneLifecycle({
       terminalOptions: () => {
         const currentSettings = settingsRef.current
         const terminalFontWeights = resolveTerminalFontWeights(currentSettings?.terminalFontWeight)
+        const storeState = useAppStore.getState()
+        const currentTab = storeState.tabsByWorktree[worktreeId]?.find(
+          (candidate) => candidate.id === tabId
+        )
+        const windowsPtyCompatibilityOptions = buildWindowsPtyCompatibilityOptions({
+          userAgent: navigator.userAgent,
+          connectionId: getConnectionId(worktreeId),
+          cwd: startupCwd,
+          shellOverride: currentTab?.shellOverride
+        })
         return {
+          ...windowsPtyCompatibilityOptions,
           fontSize: currentSettings?.terminalFontSize ?? 14,
           fontFamily: buildFontFamily(currentSettings?.terminalFontFamily ?? ''),
           fontWeight: terminalFontWeights.fontWeight,
