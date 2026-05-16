@@ -27,6 +27,7 @@
     "build:relay": "node config/scripts/build-relay.mjs",
     "build:computer-macos": "node config/scripts/build-computer-macos.mjs",
     "smoke:computer": "node config/scripts/computer-use-smoke.mjs",
+    "verify:macos-entitlements": "node config/scripts/verify-macos-entitlements.mjs",
     "verify:computer-native": "node config/scripts/verify-computer-native.mjs",
     "build:cli": "tsc -p config/tsconfig.cli.json --outDir out --composite false --incremental false && node config/scripts/install-dev-cli.mjs",
     "build:electron-vite": "node config/scripts/run-electron-vite-build.mjs",
