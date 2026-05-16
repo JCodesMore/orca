@@ -546,6 +546,10 @@ export default function CombinedDiffViewer({
         measuredContentHeight: sectionHeights[index],
         originalContent: section.originalContent,
         modifiedContent: section.modifiedContent,
+        changedLineCount:
+          section.added === undefined && section.removed === undefined
+            ? undefined
+            : (section.added ?? 0) + (section.removed ?? 0),
         useIntrinsicImageHeight: isIntrinsicHeightImageDiff(section.diffResult)
       })
     },
