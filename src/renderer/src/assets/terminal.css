@@ -39,6 +39,13 @@
   left: 0;
 }
 
+.pane-manager-root .xterm .xterm-helper-textarea {
+  /* Why: xterm moves this hidden textarea before the cursor layer repaints.
+     Windows can momentarily paint the native caret even at opacity:0, which
+     shows up as cursor flashes during ConPTY/PowerShell redraws. */
+  caret-color: transparent;
+}
+
 /* Divider: the element is a wide transparent hit area; the visible line is
    drawn by ::after so that setting `background` on the element never hides it. */
 .pane-divider.is-vertical,
