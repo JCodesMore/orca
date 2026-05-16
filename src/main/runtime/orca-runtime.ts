@@ -6280,7 +6280,7 @@ export class OrcaRuntimeService {
           await this.notifier.revealTerminalSession(worktree.id, {
             ptyId: result.id,
             title: opts.title ?? null,
-            activate: false,
+            activate: opts.activate === true,
             tabId,
             leafId
           })
@@ -6420,6 +6420,11 @@ export class OrcaRuntimeService {
       parentTabId,
       leafId,
       title: terminal.title ?? livePty.pty.title ?? 'Terminal',
+      parentLayout: {
+        root: { type: 'leaf', leafId },
+        activeLeafId: leafId,
+        expandedLeafId: null
+      },
       isActive: activate
     }
     const existing = this.mobileSessionTabsByWorktree.get(worktreeId)
@@ -7662,6 +7667,7 @@ export class OrcaRuntimeService {
         parentTabId: tab.parentTabId,
         leafId: tab.leafId,
         title: leaf?.paneTitle ?? syncedTab?.title ?? pty?.title ?? tab.title,
+        ...(tab.parentLayout ? { parentLayout: tab.parentLayout } : {}),
         isActive: tab.isActive,
         ...(leaf
           ? { status: 'ready' as const, terminal: this.issueHandle(leaf) }
