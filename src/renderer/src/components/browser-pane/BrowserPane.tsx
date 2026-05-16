@@ -93,6 +93,7 @@ import { isEditableKeyboardTarget } from './browser-keyboard'
 import BrowserAddressBar from './BrowserAddressBar'
 import { BrowserToolbarMenu } from './BrowserToolbarMenu'
 import BrowserFind from './BrowserFind'
+import { BrowserMobileDriverOverlay } from './BrowserMobileDriverOverlay'
 import {
   consumeBrowserFocusRequest,
   ORCA_BROWSER_FOCUS_REQUEST_EVENT,
@@ -128,6 +129,11 @@ import {
   formatPermissionNotice,
   formatPopupNotice
 } from './browser-notices'
+import {
+  getDriverForBrowserPage,
+  onBrowserDriverChange,
+  type BrowserDriverState
+} from '@/lib/pane-manager/browser-mobile-driver-state'
 
 type BrowserTabPageState = Partial<
   Pick<
@@ -716,6 +722,10 @@ export default function BrowserPane({
   const updateBrowserPageState = useAppStore((s) => s.updateBrowserPageState)
   const setBrowserPageUrl = useAppStore((s) => s.setBrowserPageUrl)
   const runtimeEnvironmentActive = Boolean(activeRuntimeEnvironmentId?.trim())
+  const activeBrowserPageId = activeBrowserPage?.id ?? null
+  const [activeBrowserDriver, setActiveBrowserDriver] = useState<BrowserDriverState>({
+    kind: 'idle'
+  })
 
   useEffect(() => {
     if (!runtimeEnvironmentActive) {
@@ -725,6 +735,26 @@ export default function BrowserPane({
       destroyPersistentWebview(page.id)
     }
   }, [browserPages, runtimeEnvironmentActive])
+
+  useEffect(() => {
+    if (runtimeEnvironmentActive || !activeBrowserPageId) {
+      setActiveBrowserDriver({ kind: 'idle' })
+      return
+    }
+    setActiveBrowserDriver(getDriverForBrowserPage(activeBrowserPageId))
+    return onBrowserDriverChange((event) => {
+      if (event.browserPageId === activeBrowserPageId) {
+        setActiveBrowserDriver(event.driver)
+      }
+    })
+  }, [activeBrowserPageId, runtimeEnvironmentActive])
+
+  const reclaimActiveBrowserForDesktop = useCallback(async (): Promise<void> => {
+    if (!activeBrowserPageId) {
+      return
+    }
+    await window.api.runtime.reclaimBrowserForDesktop(activeBrowserPageId)
+  }, [activeBrowserPageId])
 
   if (runtimeEnvironmentActive) {
     return activeBrowserPage ? (
@@ -752,8 +782,13 @@ export default function BrowserPane({
             worktreeId={browserTab.worktreeId}
             sessionProfileId={browserTab.sessionProfileId ?? null}
             isActive={isActive}
+            inputLocked={activeBrowserDriver.kind === 'mobile'}
             onUpdatePageState={updateBrowserPageState}
             onSetUrl={setBrowserPageUrl}
+          />
+          <BrowserMobileDriverOverlay
+            driver={activeBrowserDriver}
+            onTakeBack={reclaimActiveBrowserForDesktop}
           />
         </div>
       ) : null}
@@ -1478,6 +1513,9 @@ function RemoteBrowserPagePane({
                 setBusy(false)
               } else if (event.type === 'end') {
                 handleRemoteStreamClosed(token, true)
+              } else if (event.type === 'error') {
+                setRemoteError(event.message)
+                handleRemoteStreamClosed(token, false)
               }
             },
             onBinary: (bytes) => updateStreamFrame(token, bytes),
@@ -2163,6 +2201,7 @@ function BrowserPagePane({
   worktreeId,
   sessionProfileId,
   isActive,
+  inputLocked,
   onUpdatePageState,
   onSetUrl
 }: {
@@ -2171,6 +2210,7 @@ function BrowserPagePane({
   worktreeId: string
   sessionProfileId: string | null
   isActive: boolean
+  inputLocked: boolean
   onUpdatePageState: (tabId: string, updates: BrowserTabPageState) => void
   onSetUrl: (tabId: string, url: string) => void
 }): React.JSX.Element {
@@ -2179,6 +2219,8 @@ function BrowserPagePane({
   const webviewRef = useRef<Electron.WebviewTag | null>(null)
   const browserTabIdRef = useRef(browserTab.id)
   browserTabIdRef.current = browserTab.id
+  const inputLockedRef = useRef(inputLocked)
+  inputLockedRef.current = inputLocked
   const faviconUrlRef = useRef<string | null>(browserTab.faviconUrl)
   const initialBrowserUrlRef = useRef(browserTab.url)
   const browserTabUrlRef = useRef(browserTab.url)
@@ -2914,6 +2956,7 @@ function BrowserPagePane({
     if (webview) {
       container.appendChild(webview)
       parkedAtByTabId.delete(browserTab.id)
+      webview.style.pointerEvents = inputLockedRef.current ? 'none' : 'auto'
       syncNavigationState(webview)
       // Why: seed the ref with the store URL so the URL sync effect does not
       // force-navigate a reclaimed webview that is already on the right page.
@@ -2930,6 +2973,7 @@ function BrowserPagePane({
       webview.style.width = '100%'
       webview.style.height = '100%'
       webview.style.border = 'none'
+      webview.style.pointerEvents = inputLockedRef.current ? 'none' : 'auto'
       // Why: default to white so sites that don't set an html/body background
       // (e.g. httpbin.org/html) don't show through to Orca's dark chrome. Real
       // browsers paint the viewport white by default; sites that specify their
@@ -3743,6 +3787,16 @@ function BrowserPagePane({
     }
     return received
   })()
+
+  useEffect(() => {
+    const webview = webviewRef.current
+    if (!webview) {
+      return
+    }
+    // Why: desktop reclaim uses a React overlay, but Electron webviews can
+    // keep receiving native input unless their own hit testing is disabled.
+    webview.style.pointerEvents = inputLocked ? 'none' : 'auto'
+  }, [inputLocked])
 
   useEffect(() => {
     const webview = webviewRef.current

@@ -25,9 +25,9 @@ import {
   Folder,
   File,
   FileText,
+  Globe,
   Mic,
   Monitor,
-  PanelTop,
   Plus,
   RefreshCw,
   Smartphone,
@@ -2591,7 +2591,7 @@ export default function SessionScreen() {
                   >
                     <View style={styles.tabLabelRow}>
                       {t.type === 'browser' && (
-                        <PanelTop size={13} color={colors.textSecondary} strokeWidth={2.1} />
+                        <Globe size={13} color={colors.textSecondary} strokeWidth={2.1} />
                       )}
                       {t.type === 'markdown' && (
                         <FileText size={13} color={colors.textSecondary} strokeWidth={2.1} />
@@ -2958,7 +2958,7 @@ export default function SessionScreen() {
           },
           {
             label: 'Browser',
-            icon: PanelTop,
+            icon: Globe,
             onPress: () => {
               setShowCreateTabDrawer(false)
               if (browserScreencastSupported !== true) {
@@ -3210,10 +3210,11 @@ export default function SessionScreen() {
       <TextInputModal
         visible={showCreateBrowserModal}
         title="New Browser"
-        message="Enter a URL or leave about:blank."
-        defaultValue="about:blank"
+        message="Enter a URL, or leave blank for a new tab."
+        defaultValue=""
         placeholder="https://example.com"
         submitLabel="Open"
+        allowEmpty
         selectTextOnFocus
         keyboardType={Platform.OS === 'ios' ? 'url' : 'default'}
         onSubmit={(value) => {
