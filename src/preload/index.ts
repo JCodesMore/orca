@@ -2242,6 +2242,9 @@ const api = {
         ptyId?: string
         activate?: boolean
         tabId?: string
+        leafId?: string
+        splitFromLeafId?: string
+        splitDirection?: 'horizontal' | 'vertical'
       }) => void
     ): (() => void) => {
       const listener = (
@@ -2255,6 +2258,8 @@ const api = {
           activate?: boolean
           tabId?: string
           leafId?: string
+          splitFromLeafId?: string
+          splitDirection?: 'horizontal' | 'vertical'
         }
       ) => callback(data)
       ipcRenderer.on('ui:createTerminal', listener)

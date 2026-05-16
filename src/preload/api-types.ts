@@ -1553,6 +1553,8 @@ export type PreloadApi = {
         activate?: boolean
         tabId?: string
         leafId?: string
+        splitFromLeafId?: string
+        splitDirection?: 'horizontal' | 'vertical'
       }) => void
     ) => () => void
     onRequestTerminalCreate: (
