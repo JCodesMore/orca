@@ -665,6 +665,8 @@ describe('OrcaRuntimeRpcServer', () => {
     const readTerminal = vi.fn().mockResolvedValue({ tail: ['ok'] })
     const browserTabCreate = vi.fn().mockResolvedValue({ page: 'page-1' })
     const browserSetViewport = vi.fn().mockResolvedValue({ ok: true })
+    const browserDialogAccept = vi.fn().mockResolvedValue({ ok: true })
+    const browserDialogDismiss = vi.fn().mockResolvedValue({ ok: true })
     const runtime = {
       getRuntimeId: () => 'test-runtime',
       getStatus: vi.fn().mockResolvedValue({ graphStatus: 'ok' }),
@@ -674,7 +676,9 @@ describe('OrcaRuntimeRpcServer', () => {
       removeClaudeAccount,
       readTerminal,
       browserTabCreate,
-      browserSetViewport
+      browserSetViewport,
+      browserDialogAccept,
+      browserDialogDismiss
     } as unknown as OrcaRuntimeService
     const server = new OrcaRuntimeRpcServer({ runtime, userDataPath, enableWebSocket: false })
     server['deviceRegistry'] = new DeviceRegistry(userDataPath)
@@ -760,6 +764,26 @@ describe('OrcaRuntimeRpcServer', () => {
       (response) => replies.push(JSON.parse(response) as Record<string, unknown>),
       () => {}
     )
+    await server['handleWebSocketMessage'](
+      JSON.stringify({
+        id: 'req_browser_dialog_accept',
+        method: 'browser.dialogAccept',
+        deviceToken: mobile.token,
+        params: { worktree: 'id:wt-1', page: 'page-1', text: 'ok' }
+      }),
+      (response) => replies.push(JSON.parse(response) as Record<string, unknown>),
+      () => {}
+    )
+    await server['handleWebSocketMessage'](
+      JSON.stringify({
+        id: 'req_browser_dialog_dismiss',
+        method: 'browser.dialogDismiss',
+        deviceToken: mobile.token,
+        params: { worktree: 'id:wt-1', page: 'page-1' }
+      }),
+      (response) => replies.push(JSON.parse(response) as Record<string, unknown>),
+      () => {}
+    )
 
     expect(replies).toContainEqual(
       expect.objectContaining({
@@ -779,6 +803,12 @@ describe('OrcaRuntimeRpcServer', () => {
       expect.objectContaining({ id: 'req_browser_viewport', ok: true })
     )
     expect(replies).toContainEqual(
+      expect.objectContaining({ id: 'req_browser_dialog_accept', ok: true })
+    )
+    expect(replies).toContainEqual(
+      expect.objectContaining({ id: 'req_browser_dialog_dismiss', ok: true })
+    )
+    expect(replies).toContainEqual(
       expect.objectContaining({
         id: 'req_remove_claude',
         ok: false,
@@ -794,6 +824,15 @@ describe('OrcaRuntimeRpcServer', () => {
       page: 'page-1',
       width: 390,
       height: 844
+    })
+    expect(browserDialogAccept).toHaveBeenCalledWith({
+      worktree: 'id:wt-1',
+      page: 'page-1',
+      text: 'ok'
+    })
+    expect(browserDialogDismiss).toHaveBeenCalledWith({
+      worktree: 'id:wt-1',
+      page: 'page-1'
     })
     expect(removeClaudeAccount).not.toHaveBeenCalled()
     expect(pushRuntimeGit).not.toHaveBeenCalled()
