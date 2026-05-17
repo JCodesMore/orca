@@ -5,6 +5,7 @@ import { useAppStore } from '@/store'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { Input } from '@/components/ui/input'
 import SpaceTab from './SpaceTab'
+import { useSpaceTabDocumentDrop } from './use-space-tab-drop'
 
 type RenameState = { spaceId: string; value: string }
 
@@ -21,6 +22,8 @@ export default function SpaceTabs(): React.JSX.Element {
   const addSpace = useAppStore((s) => s.addSpace)
   const renameSpace = useAppStore((s) => s.renameSpace)
   const deleteSpace = useAppStore((s) => s.deleteSpace)
+
+  useSpaceTabDocumentDrop()
 
   const [rename, setRename] = useState<RenameState | null>(null)
   const [creating, setCreating] = useState(false)
