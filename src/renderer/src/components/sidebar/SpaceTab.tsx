@@ -25,9 +25,10 @@ type SpaceTabProps = {
   onRenameChange?: (value: string) => void
   onRenameCommit?: () => void
   onRenameCancel?: () => void
-  /** Unread agent-event count for this Space. Rendered as a trailing chip
-   *  when > 0; never rendered on the "All Projects" pill because that count
-   *  would re-summarize every other Space's badge (double-counting). */
+  /** Unread agent-event count to render as a trailing chip when > 0. For a
+   *  Space, this is the per-Space total; for the "All Projects" pill, this
+   *  is the grand total across every repo (assigned + unassigned), matching
+   *  the Activity titlebar count. */
   notificationCount?: number
 }
 
@@ -185,7 +186,7 @@ export default function SpaceTab({
       ) : (
         <>
           <span className="truncate max-w-[140px]">{label}</span>
-          {!isAllProjects && notificationCount > 0 ? (
+          {notificationCount > 0 ? (
             <span
               aria-label={`${notificationCount} unread`}
               className={cn(
