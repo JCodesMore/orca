@@ -1515,6 +1515,11 @@ export default function ActivityPrototypePage(): React.JSX.Element {
     if (state.activeRepoId !== worktree.repoId) {
       state.setActiveRepo(worktree.repoId)
     }
+    // Why: keep the active Space consistent with the row the user is
+    // previewing, so returning to terminal view lands in the right Space
+    // rather than leaving the sidebar in its prior Space.
+    const targetSpaceId = state.repoSpaceAssignments[worktree.repoId] ?? null
+    state.setActiveSpace(targetSpaceId)
     if (state.activeWorktreeId !== worktree.id) {
       state.setActiveWorktree(worktree.id)
     }
@@ -1563,7 +1568,23 @@ export default function ActivityPrototypePage(): React.JSX.Element {
       return
     }
     markThreadRead(thread)
-    activateAndRevealWorktree(thread.worktree.id)
+    const activated = activateAndRevealWorktree(thread.worktree.id)
+    if (!activated) {
+      return
+    }
+    // Why: re-read state — activateAndRevealWorktree may have created an
+    // initial terminal via ensureWorktreeHasInitialTerminal, so the pre-call
+    // tabsByWorktree snapshot could be stale.
+    const after = useAppStore.getState()
+    const liveTabs = after.tabsByWorktree[thread.worktree.id] ?? []
+    if (!liveTabs.some((t) => t.id === thread.tab.id)) {
+      return
+    }
+    const parsed = parsePaneKey(thread.paneKey)
+    activateTabAndFocusPane(
+      thread.tab.id,
+      parsed && parsed.tabId === thread.tab.id ? parsed.leafId : null
+    )
   }
 
   const hasUnreadThreads = allThreads.some((thread) => thread.unread)
