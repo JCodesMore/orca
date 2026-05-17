@@ -1110,6 +1110,8 @@ export function connectPanePty(
             : null
           : existingPtyId
         : null
+    const detachedRemoteLeafPtyId =
+      restoredSessionId && isRemoteRuntimePtyId(restoredSessionId) ? restoredSessionId : null
     const candidateReattachSessionId =
       restoredSessionId && restoredSessionId !== detachedLivePtyId
         ? restoredSessionId
@@ -1126,7 +1128,7 @@ export function connectPanePty(
         ? candidateReattachSessionId
         : null
     recordPtyConnectDiagnostic(
-      `pane=${pane.id} tab=${deps.tabId} restored=${restoredPtyId} existing=${existingPtyId} detached=${detachedLivePtyId} reattach=${deferredReattachSessionId} hasTransport=${hasExistingPaneTransport} pendingKey=${pendingSpawnKey}`
+      `pane=${pane.id} tab=${deps.tabId} restored=${restoredPtyId} existing=${existingPtyId} detached=${detachedRemoteLeafPtyId ?? detachedLivePtyId} reattach=${deferredReattachSessionId} hasTransport=${hasExistingPaneTransport} pendingKey=${pendingSpawnKey}`
     )
 
     if (deferredReattachSessionId) {
@@ -1211,8 +1213,12 @@ export function connectPanePty(
           reportError(message)
           startFreshSpawn()
         })
-    } else if (detachedLivePtyId) {
-      recordPtyConnectDiagnostic(`pane=${pane.id} -> ATTACH detached=${detachedLivePtyId}`)
+    } else if (detachedRemoteLeafPtyId || detachedLivePtyId) {
+      // Why: mirrored web terminal layouts mount one pane per host leaf.
+      // Later leaves already have a pane transport, but must still attach to
+      // their exact remote PTY instead of spawning replacement host tabs.
+      const attachPtyId = detachedRemoteLeafPtyId ?? detachedLivePtyId!
+      recordPtyConnectDiagnostic(`pane=${pane.id} -> ATTACH detached=${attachPtyId}`)
       allowInitialIdleCacheSeed = false
       // Why: surface synchronous attach failures (e.g., the PTY died between
       // mount and remount, so window.api.pty.resize rejects) through
@@ -1225,7 +1231,7 @@ export function connectPanePty(
       // the store and lands in this branch again in a loop.
       try {
         transport.attach({
-          existingPtyId: detachedLivePtyId,
+          existingPtyId: attachPtyId,
           cols,
           rows,
           callbacks: {
@@ -1234,11 +1240,11 @@ export function connectPanePty(
             onError: reportError
           }
         })
-        deps.syncPanePtyLayoutBinding(pane.id, detachedLivePtyId)
-        deps.updateTabPtyId(deps.tabId, detachedLivePtyId)
+        deps.syncPanePtyLayoutBinding(pane.id, attachPtyId)
+        deps.updateTabPtyId(deps.tabId, attachPtyId)
       } catch (err) {
         reportError(err instanceof Error ? err.message : String(err))
-        deps.clearTabPtyId(deps.tabId, detachedLivePtyId)
+        deps.clearTabPtyId(deps.tabId, attachPtyId)
         startFreshSpawn()
       }
     } else {
