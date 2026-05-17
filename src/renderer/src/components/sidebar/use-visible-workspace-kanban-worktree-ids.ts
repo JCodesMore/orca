@@ -18,6 +18,8 @@ export function useVisibleWorkspaceKanbanWorktreeIds({
   const showActiveOnly = useAppStore((s) => s.showActiveOnly)
   const hideDefaultBranchWorkspace = useAppStore((s) => s.hideDefaultBranchWorkspace)
   const filterRepoIds = useAppStore((s) => s.filterRepoIds)
+  const activeSpaceId = useAppStore((s) => s.activeSpaceId)
+  const repoSpaceAssignments = useAppStore((s) => s.repoSpaceAssignments)
   const tabsByWorktree = useAppStore((s) => (showActiveOnly ? s.tabsByWorktree : null))
   const ptyIdsByTabId = useAppStore((s) => (showActiveOnly ? s.ptyIdsByTabId : null))
   const browserTabsByWorktree = useAppStore((s) =>
@@ -37,7 +39,9 @@ export function useVisibleWorkspaceKanbanWorktreeIds({
         browserTabsByWorktree,
         activeWorktreeId,
         hideDefaultBranchWorkspace,
-        repoMap
+        repoMap,
+        activeSpaceId,
+        repoSpaceAssignments
       })
     )
   }, [
@@ -50,6 +54,8 @@ export function useVisibleWorkspaceKanbanWorktreeIds({
     repoMap,
     showActiveOnly,
     tabsByWorktree,
-    worktreesByRepo
+    worktreesByRepo,
+    activeSpaceId,
+    repoSpaceAssignments
   ])
 }

@@ -1,9 +1,11 @@
-import React, { useEffect } from 'react'
+import React, { useCallback, useEffect } from 'react'
+import { DndContext, PointerSensor, useSensor, useSensors, type DragEndEvent } from '@dnd-kit/core'
 import { useAppStore } from '@/store'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { useSidebarResize } from '@/hooks/useSidebarResize'
 import SidebarHeader from './SidebarHeader'
 import SidebarNav from './SidebarNav'
+import SpaceTabs from './SpaceTabs'
 import WorktreeList from './WorktreeList'
 import SidebarToolbar from './SidebarToolbar'
 import WorktreeMetaDialog from './WorktreeMetaDialog'
@@ -30,6 +32,55 @@ function Sidebar({
   const setSidebarWidth = useAppStore((s) => s.setSidebarWidth)
   const repos = useAppStore((s) => s.repos)
   const fetchAllWorktrees = useAppStore((s) => s.fetchAllWorktrees)
+  const spaces = useAppStore((s) => s.spaces)
+  const moveRepoToSpace = useAppStore((s) => s.moveRepoToSpace)
+  const reorderSpaces = useAppStore((s) => s.reorderSpaces)
+
+  // Why: 4px matches the tab-reorder + repo-reorder thresholds elsewhere in the
+  // sidebar so click-to-switch on a tab still fires without engaging dnd-kit on
+  // tiny accidental movements.
+  const pointerSensor = useSensor(PointerSensor, {
+    activationConstraint: { distance: 4 }
+  })
+  const sensors = useSensors(pointerSensor)
+
+  const handleDragEnd = useCallback(
+    (event: DragEndEvent) => {
+      const { active, over } = event
+      if (!over) {
+        return
+      }
+      const activeKind = active.data.current?.kind
+      const overKind = over.data.current?.kind
+
+      // Repo dragged onto a Space tab → (re)assign or unassign.
+      if (activeKind === 'repo' && overKind === 'space') {
+        const repoId = active.data.current?.repoId as string | undefined
+        const spaceId = (over.data.current?.spaceId ?? null) as string | null
+        if (repoId) {
+          moveRepoToSpace(repoId, spaceId)
+        }
+        return
+      }
+
+      // Space tab reorder — active.id and over.id are Space ids inside the
+      // SortableContext. Build the new order by swapping active into over's
+      // index in the current sorted-by-order list.
+      if (activeKind === 'tab' && overKind === 'tab' && active.id !== over.id) {
+        const sortedIds = [...spaces].sort((a, b) => a.order - b.order).map((s) => s.id)
+        const fromIndex = sortedIds.indexOf(String(active.id))
+        const toIndex = sortedIds.indexOf(String(over.id))
+        if (fromIndex < 0 || toIndex < 0) {
+          return
+        }
+        const next = sortedIds.slice()
+        next.splice(fromIndex, 1)
+        next.splice(toIndex, 0, String(active.id))
+        reorderSpaces(next)
+      }
+    },
+    [moveRepoToSpace, reorderSpaces, spaces]
+  )
 
   const setLiveSidebarWidth = React.useCallback((width: number) => {
     document.documentElement.style.setProperty('--workspace-sidebar-live-width', `${width}px`)
@@ -65,12 +116,16 @@ function Sidebar({
       >
         {/* Fixed controls */}
         <SidebarNav />
-        <SidebarHeader />
 
-        <WorktreeList
-          scrollOffsetRef={worktreeScrollOffsetRef}
-          scrollAnchorRef={worktreeScrollAnchorRef}
-        />
+        <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
+          <SpaceTabs />
+          <SidebarHeader />
+
+          <WorktreeList
+            scrollOffsetRef={worktreeScrollOffsetRef}
+            scrollAnchorRef={worktreeScrollAnchorRef}
+          />
+        </DndContext>
 
         {/* Fixed bottom toolbar */}
         <SidebarToolbar />

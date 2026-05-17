@@ -38,6 +38,7 @@ import { VIRTUALIZED_SCROLL_ANCHOR_RECORD_EVENT } from '@/hooks/useVirtualizedSc
 import { getLineageRenderInfo } from './worktree-list-groups'
 import { getWorkspaceStatus, getWorkspaceStatusVisualMeta } from './workspace-status'
 import { WorktreeOpenInSubMenu } from './WorktreeOpenInMenu'
+import RepoMoveToSpaceMenu from './RepoMoveToSpaceMenu'
 
 type Props = {
   worktree: Worktree
@@ -482,6 +483,9 @@ const WorktreeContextMenu = React.memo(function WorktreeContextMenu({
               </DropdownMenuRadioGroup>
             </DropdownMenuSubContent>
           </DropdownMenuSub>
+          {!isMultiContext && (
+            <RepoMoveToSpaceMenu repoId={worktree.repoId} label="Move Project to Space" />
+          )}
           {!isMultiContext && (
             <DropdownMenuItem onSelect={handleRename} disabled={isDeleting}>
               <Pencil className="size-3.5" />

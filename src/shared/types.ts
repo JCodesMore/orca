@@ -77,6 +77,24 @@ export type Repo = {
   symlinkPaths?: string[]
 }
 
+/**
+ * A user-created named tab that groups projects in the sidebar. A project
+ * (Repo) can live in at most one Space. The permanent "All Projects" view is
+ * represented by activeSpaceId === null, not by a Space row.
+ *
+ * Why this isn't a field on `Repo`: Repo is written by main-process git code,
+ * the AddRepo flow, and SSH bridges. The Space → repo membership map lives in
+ * UISlice alongside sibling filter state and persists through the same
+ * `window.api.ui.set()` channel — mirrors the trustedOrcaHooks pattern.
+ */
+export type Space = {
+  id: string
+  name: string
+  order: number
+  color?: string
+  createdAt: number
+}
+
 export type SetupRunPolicy = 'ask' | 'run-by-default' | 'skip-by-default'
 export type SetupDecision = 'inherit' | 'run' | 'skip'
 
@@ -1717,6 +1735,15 @@ export type PersistedUIState = {
    *  sidebar filters reached through the same dropdown. */
   hideDefaultBranchWorkspace: boolean
   filterRepoIds: string[]
+  /** User-created Spaces (named sidebar tabs that group projects). Absent on
+   *  fresh installs and pre-Spaces persisted state — treated as []. */
+  spaces?: Space[]
+  /** Currently selected Space id. null === All Projects (no filter). */
+  activeSpaceId?: string | null
+  /** repoId → spaceId membership map. Missing key means the repo is
+   *  unassigned (visible only in All Projects). Kept here rather than on
+   *  Repo so non-UI repo writers don't have to think about it. */
+  repoSpaceAssignments?: Record<string, string>
   collapsedGroups: string[]
   uiZoomLevel: number
   editorFontZoomLevel: number
