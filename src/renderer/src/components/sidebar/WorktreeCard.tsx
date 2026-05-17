@@ -24,6 +24,7 @@ import { SshDisconnectedDialog } from './SshDisconnectedDialog'
 import WorktreeCardAgents from './WorktreeCardAgents'
 import { cn } from '@/lib/utils'
 import { activateAndRevealWorktree } from '@/lib/worktree-activation'
+import { getRepoTintBackground } from '@/lib/repo-tint'
 import { getWorktreeStatusLabel } from '@/lib/worktree-status'
 import { getRepoKindLabel, isFolderRepo } from '../../../../shared/repo-kind'
 import type { HostedReviewInfo } from '../../../../shared/hosted-review'
@@ -342,309 +343,321 @@ const WorktreeCard = React.memo(function WorktreeCard({
   const showUnreadEmphasis = cardProps.includes('unread') && worktree.isUnread
 
   const cardBody = (
+    // Why: tint wrapper paints a subtle repo.badgeColor wash behind the row
+    // so each project owns a swim lane. State overlays (active darkening,
+    // hover, multi-select) live on the inner div and composite on top of the
+    // tint without specificity fights.
     <div
-      className={cn(
-        'group relative flex items-start gap-1.5 px-1.5 py-1.5 cursor-pointer transition-all duration-200 outline-none select-none ml-1',
-        isMultiSelected ? 'rounded-sm' : 'rounded-lg',
-        isActive
-          ? 'bg-black/[0.08] shadow-[0_1px_2px_rgba(0,0,0,0.04)] border border-black/[0.015] dark:bg-white/[0.10] dark:border-border/40 dark:shadow-[0_1px_2px_rgba(0,0,0,0.03)]'
-          : isMultiSelected
-            ? 'border border-sidebar-ring/35 bg-sidebar-accent/70 ring-1 ring-sidebar-ring/30'
-            : 'border border-transparent hover:bg-sidebar-accent/40',
-        isActive && isMultiSelected && 'ring-1 ring-sidebar-ring/35',
-        !nativeDragEnabled && !isDeleting && '!cursor-grab',
-        isDeleting && 'opacity-50 grayscale cursor-not-allowed',
-        isSshDisconnected && !isDeleting && 'opacity-60'
-      )}
-      onClick={handleClick}
-      onDoubleClick={handleDoubleClick}
-      draggable={nativeDragEnabled && !isDeleting}
-      onDragStart={nativeDragEnabled ? handleDragStart : undefined}
-      aria-busy={isDeleting}
+      className={cn('ml-1', isMultiSelected ? 'rounded-sm' : 'rounded-lg')}
+      style={repo ? { backgroundColor: getRepoTintBackground(repo.badgeColor) } : undefined}
     >
-      {isDeleting && (
-        <div className="absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-background/50 backdrop-blur-[1px]">
-          <div className="inline-flex items-center gap-1.5 rounded-full bg-background px-3 py-1 text-[11px] font-medium text-foreground shadow-sm border border-border/50">
-            <LoaderCircle className="size-3.5 animate-spin text-muted-foreground" />
-            Deleting…
+      <div
+        className={cn(
+          'group relative flex items-start gap-1.5 px-1.5 py-1.5 cursor-pointer transition-all duration-200 outline-none select-none',
+          isMultiSelected ? 'rounded-sm' : 'rounded-lg',
+          isActive
+            ? 'bg-black/[0.08] shadow-[0_1px_2px_rgba(0,0,0,0.04)] border border-black/[0.015] dark:bg-white/[0.10] dark:border-border/40 dark:shadow-[0_1px_2px_rgba(0,0,0,0.03)]'
+            : isMultiSelected
+              ? 'border border-sidebar-ring/35 bg-sidebar-accent/70 ring-1 ring-sidebar-ring/30'
+              : 'border border-transparent hover:bg-sidebar-accent/40',
+          isActive && isMultiSelected && 'ring-1 ring-sidebar-ring/35',
+          !nativeDragEnabled && !isDeleting && '!cursor-grab',
+          isDeleting && 'opacity-50 grayscale cursor-not-allowed',
+          isSshDisconnected && !isDeleting && 'opacity-60'
+        )}
+        onClick={handleClick}
+        onDoubleClick={handleDoubleClick}
+        draggable={nativeDragEnabled && !isDeleting}
+        onDragStart={nativeDragEnabled ? handleDragStart : undefined}
+        aria-busy={isDeleting}
+      >
+        {isDeleting && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-background/50 backdrop-blur-[1px]">
+            <div className="inline-flex items-center gap-1.5 rounded-full bg-background px-3 py-1 text-[11px] font-medium text-foreground shadow-sm border border-border/50">
+              <LoaderCircle className="size-3.5 animate-spin text-muted-foreground" />
+              Deleting…
+            </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {/* Status indicator on the left */}
-      {(cardProps.includes('status') || cardProps.includes('unread')) && (
-        <div className="flex flex-col items-center justify-start pt-[2px] gap-2 shrink-0">
-          {cardProps.includes('status') && (
-            <>
-              <StatusIndicator status={status} aria-hidden="true" />
-              <span className="sr-only">{getWorktreeStatusLabel(status)}</span>
-            </>
-          )}
+        {/* Status indicator on the left */}
+        {(cardProps.includes('status') || cardProps.includes('unread')) && (
+          <div className="flex flex-col items-center justify-start pt-[2px] gap-2 shrink-0">
+            {cardProps.includes('status') && (
+              <>
+                <StatusIndicator status={status} aria-hidden="true" />
+                <span className="sr-only">{getWorktreeStatusLabel(status)}</span>
+              </>
+            )}
 
-          {cardProps.includes('unread') && (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  onClick={handleToggleUnreadQuick}
-                  className={cn(
-                    'group/unread flex size-4 cursor-pointer items-center justify-center rounded transition-all',
-                    'hover:bg-accent/80 active:scale-95',
-                    'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring'
-                  )}
-                  aria-label={worktree.isUnread ? 'Mark as read' : 'Mark as unread'}
-                >
-                  {worktree.isUnread ? (
-                    <FilledBellIcon className="size-[13px] text-amber-500 drop-shadow-sm" />
-                  ) : (
-                    <Bell className="size-3 text-muted-foreground/40 opacity-0 group-hover:opacity-100 group-hover/unread:opacity-100 transition-opacity" />
-                  )}
-                </button>
-              </TooltipTrigger>
-              <TooltipContent side="right" sideOffset={8}>
-                <span>{unreadTooltip}</span>
-              </TooltipContent>
-            </Tooltip>
-          )}
-        </div>
-      )}
-
-      {/* Content area */}
-      <div className="flex-1 min-w-0 flex flex-col gap-1.5">
-        {/* Header row: Title and Checks */}
-        <div className="flex items-center justify-between min-w-0 gap-2">
-          <div className="flex items-center gap-1.5 min-w-0">
-            {repo?.connectionId && (
+            {cardProps.includes('unread') && (
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <span className="shrink-0 inline-flex items-center">
-                    {isSshDisconnected ? (
-                      <ServerOff className="size-3 text-red-400" />
-                    ) : (
-                      <Server className="size-3 text-muted-foreground" />
+                  <button
+                    type="button"
+                    onClick={handleToggleUnreadQuick}
+                    className={cn(
+                      'group/unread flex size-4 cursor-pointer items-center justify-center rounded transition-all',
+                      'hover:bg-accent/80 active:scale-95',
+                      'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring'
                     )}
-                  </span>
+                    aria-label={worktree.isUnread ? 'Mark as read' : 'Mark as unread'}
+                  >
+                    {worktree.isUnread ? (
+                      <FilledBellIcon className="size-[13px] text-amber-500 drop-shadow-sm" />
+                    ) : (
+                      <Bell className="size-3 text-muted-foreground/40 opacity-0 group-hover:opacity-100 group-hover/unread:opacity-100 transition-opacity" />
+                    )}
+                  </button>
                 </TooltipTrigger>
                 <TooltipContent side="right" sideOffset={8}>
-                  {isSshDisconnected ? 'SSH disconnected' : 'Remote repository via SSH'}
+                  <span>{unreadTooltip}</span>
                 </TooltipContent>
               </Tooltip>
             )}
+          </div>
+        )}
 
-            {/* Why: weight alone carries the unread signal; color stays
+        {/* Content area */}
+        <div className="flex-1 min-w-0 flex flex-col gap-1.5">
+          {/* Header row: Title and Checks */}
+          <div className="flex items-center justify-between min-w-0 gap-2">
+            <div className="flex items-center gap-1.5 min-w-0">
+              {repo?.connectionId && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="shrink-0 inline-flex items-center">
+                      {isSshDisconnected ? (
+                        <ServerOff className="size-3 text-red-400" />
+                      ) : (
+                        <Server className="size-3 text-muted-foreground" />
+                      )}
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="right" sideOffset={8}>
+                    {isSshDisconnected ? 'SSH disconnected' : 'Remote repository via SSH'}
+                  </TooltipContent>
+                </Tooltip>
+              )}
+
+              {/* Why: weight alone carries the unread signal; color stays
                  at text-foreground in both states so the title keeps
                  hierarchy against the muted branch row below (muting the
                  title as well flattened the card — same reasoning as the
                  repo chip comment below). */}
-            <div
-              className={cn(
-                'text-[12px] truncate leading-tight text-foreground',
-                showUnreadEmphasis ? 'font-semibold' : 'font-normal'
-              )}
-            >
-              {/* Why: the card root is a non-interactive <div>, so aria-label
+              <div
+                className={cn(
+                  'text-[12px] truncate leading-tight text-foreground',
+                  showUnreadEmphasis ? 'font-semibold' : 'font-normal'
+                )}
+              >
+                {/* Why: the card root is a non-interactive <div>, so aria-label
                    on it is announced inconsistently across screen readers.
                    A visible-text prefix inside the accessible name is reliable. */}
-              {showUnreadEmphasis && <span className="sr-only">Unread: </span>}
-              {worktree.displayName}
-            </div>
+                {showUnreadEmphasis && <span className="sr-only">Unread: </span>}
+                {worktree.displayName}
+              </div>
 
-            {/* Why: the primary worktree (the original clone directory) cannot be
+              {/* Why: the primary worktree (the original clone directory) cannot be
                  deleted via `git worktree remove`. Placing this badge next to the
                  name makes it immediately visible and avoids confusion with the
                  branch name "main" shown below. */}
-            {worktree.isMainWorktree && !isFolder && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Badge
-                    variant="outline"
-                    className="h-[16px] px-1.5 text-[10px] font-medium rounded shrink-0 leading-none text-foreground/70 border-foreground/20 bg-foreground/[0.06]"
-                  >
-                    primary
-                  </Badge>
-                </TooltipTrigger>
-                <TooltipContent side="right" sideOffset={8}>
-                  Primary worktree (original clone directory)
-                </TooltipContent>
-              </Tooltip>
+              {worktree.isMainWorktree && !isFolder && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Badge
+                      variant="outline"
+                      className="h-[16px] px-1.5 text-[10px] font-medium rounded shrink-0 leading-none text-foreground/70 border-foreground/20 bg-foreground/[0.06]"
+                    >
+                      primary
+                    </Badge>
+                  </TooltipTrigger>
+                  <TooltipContent side="right" sideOffset={8}>
+                    Primary worktree (original clone directory)
+                  </TooltipContent>
+                </Tooltip>
+              )}
+
+              {worktree.isSparse && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Badge
+                      variant="outline"
+                      className="h-[16px] px-1.5 text-[10px] font-medium rounded shrink-0 leading-none text-amber-700 dark:text-amber-300 border-amber-500/30 bg-amber-500/5"
+                    >
+                      sparse
+                    </Badge>
+                  </TooltipTrigger>
+                  <TooltipContent side="right" sideOffset={8} className="max-w-72">
+                    <div className="space-y-1">
+                      <div>Partial checkout. Files outside these paths are not on disk.</div>
+                      {worktree.sparseDirectories && worktree.sparseDirectories.length > 0 ? (
+                        <div className="font-mono text-[11px] opacity-80">
+                          {formatSparseDirectoryPreview(worktree.sparseDirectories)}
+                        </div>
+                      ) : null}
+                    </div>
+                  </TooltipContent>
+                </Tooltip>
+              )}
+            </div>
+
+            <div className="flex items-center gap-1 shrink-0">
+              {/* CI Checks & PR state on the right */}
+              {showCI && hostedReview && hostedReview.status !== 'neutral' && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="inline-flex items-center opacity-80 hover:opacity-100 transition-opacity">
+                      {hostedReview.status === 'success' && (
+                        <CircleCheck className="size-3.5 text-emerald-500" />
+                      )}
+                      {hostedReview.status === 'failure' && (
+                        <CircleX className="size-3.5 text-rose-500" />
+                      )}
+                      {hostedReview.status === 'pending' && (
+                        <LoaderCircle className="size-3.5 text-amber-500 animate-spin" />
+                      )}
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="right" sideOffset={8}>
+                    <span>CI checks {checksLabel(hostedReview.status).toLowerCase()}</span>
+                  </TooltipContent>
+                </Tooltip>
+              )}
+            </div>
+          </div>
+
+          {/* Subtitle row: Repo badge + Branch */}
+          <div className="flex items-center gap-1.5 min-w-0">
+            {repo && !hideRepoBadge && (
+              <div className="flex items-center gap-1.5 shrink-0 px-1.5 py-0.5 rounded-[4px] bg-accent border border-border dark:bg-accent/50 dark:border-border/60">
+                <div
+                  className="size-1.5 rounded-full"
+                  style={{ backgroundColor: repo.badgeColor }}
+                />
+                <span className="text-[10px] font-semibold text-foreground truncate max-w-[6rem] leading-none lowercase">
+                  {repo.displayName}
+                </span>
+              </div>
             )}
 
-            {worktree.isSparse && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Badge
-                    variant="outline"
-                    className="h-[16px] px-1.5 text-[10px] font-medium rounded shrink-0 leading-none text-amber-700 dark:text-amber-300 border-amber-500/30 bg-amber-500/5"
-                  >
-                    sparse
-                  </Badge>
-                </TooltipTrigger>
-                <TooltipContent side="right" sideOffset={8} className="max-w-72">
-                  <div className="space-y-1">
-                    <div>Partial checkout. Files outside these paths are not on disk.</div>
-                    {worktree.sparseDirectories && worktree.sparseDirectories.length > 0 ? (
-                      <div className="font-mono text-[11px] opacity-80">
-                        {formatSparseDirectoryPreview(worktree.sparseDirectories)}
-                      </div>
-                    ) : null}
-                  </div>
-                </TooltipContent>
-              </Tooltip>
+            {isFolder ? (
+              <Badge
+                variant="secondary"
+                className="h-[16px] px-1.5 text-[10px] font-medium rounded shrink-0 text-muted-foreground bg-accent border border-border dark:bg-accent/80 dark:border-border/50 leading-none"
+              >
+                {repo ? getRepoKindLabel(repo) : 'Folder'}
+              </Badge>
+            ) : (
+              <span className="text-[11px] text-muted-foreground truncate leading-none">
+                {branch}
+              </span>
+            )}
+
+            {/* Why: the conflict operation (merge/rebase/cherry-pick) is the
+               only signal that the worktree is in an incomplete operation state.
+               Showing it on the card lets the user spot worktrees that need
+               attention without switching to them first. */}
+            {conflictOperation && conflictOperation !== 'unknown' && (
+              <Badge
+                variant="outline"
+                className="h-[16px] px-1.5 text-[10px] font-medium rounded shrink-0 gap-1 text-amber-600 border-amber-500/30 bg-amber-500/5 dark:text-amber-400 dark:border-amber-400/30 dark:bg-amber-400/5 leading-none"
+              >
+                <GitMerge className="size-2.5" />
+                {CONFLICT_OPERATION_LABELS[conflictOperation]}
+              </Badge>
+            )}
+
+            <CacheTimer worktreeId={worktree.id} />
+
+            {parentLabel && (
+              <Badge
+                variant="outline"
+                className={cn(
+                  'h-[16px] px-1.5 text-[10px] font-medium rounded shrink-0 gap-1 leading-none',
+                  lineageState === 'missing'
+                    ? 'text-muted-foreground border-border bg-muted/40'
+                    : 'text-muted-foreground border-border bg-accent/50'
+                )}
+              >
+                <Workflow className="size-2.5" />
+                <span className="max-w-[7rem] truncate">
+                  {lineageState === 'missing' ? 'Missing parent' : `from ${parentLabel}`}
+                </span>
+              </Badge>
             )}
           </div>
 
-          <div className="flex items-center gap-1 shrink-0">
-            {/* CI Checks & PR state on the right */}
-            {showCI && hostedReview && hostedReview.status !== 'neutral' && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span className="inline-flex items-center opacity-80 hover:opacity-100 transition-opacity">
-                    {hostedReview.status === 'success' && (
-                      <CircleCheck className="size-3.5 text-emerald-500" />
-                    )}
-                    {hostedReview.status === 'failure' && (
-                      <CircleX className="size-3.5 text-rose-500" />
-                    )}
-                    {hostedReview.status === 'pending' && (
-                      <LoaderCircle className="size-3.5 text-amber-500 animate-spin" />
-                    )}
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent side="right" sideOffset={8}>
-                  <span>CI checks {checksLabel(hostedReview.status).toLowerCase()}</span>
-                </TooltipContent>
-              </Tooltip>
-            )}
-          </div>
-        </div>
+          {/* Meta section: Issue / hosted review / Comment
+             Layout coupling: spacing here is used to derive size estimates in
+             WorktreeList's estimateSize. Update that function if changing spacing. */}
+          {((cardProps.includes('issue') && issueDisplay) ||
+            (cardProps.includes('pr') && prDisplay) ||
+            (cardProps.includes('comment') && worktree.comment)) && (
+            <div className="flex flex-col gap-[3px] mt-0.5">
+              {cardProps.includes('issue') && issueDisplay && (
+                <IssueSection issue={issueDisplay} onClick={handleEditIssue} />
+              )}
+              {cardProps.includes('pr') && prDisplay && (
+                <ReviewSection review={prDisplay} onEdit={handleEditPr} onRemove={handleRemovePr} />
+              )}
+              {cardProps.includes('comment') && worktree.comment && (
+                <CommentSection comment={worktree.comment} onDoubleClick={handleEditComment} />
+              )}
+            </div>
+          )}
 
-        {/* Subtitle row: Repo badge + Branch */}
-        <div className="flex items-center gap-1.5 min-w-0">
-          {repo && !hideRepoBadge && (
-            <div className="flex items-center gap-1.5 shrink-0 px-1.5 py-0.5 rounded-[4px] bg-accent border border-border dark:bg-accent/50 dark:border-border/60">
-              <div className="size-1.5 rounded-full" style={{ backgroundColor: repo.badgeColor }} />
-              <span className="text-[10px] font-semibold text-foreground truncate max-w-[6rem] leading-none lowercase">
-                {repo.displayName}
+          {remoteBranchConflict && (
+            <div className="mt-0.5 flex items-start gap-1.5 rounded border border-amber-500/25 bg-amber-500/5 px-1.5 py-1 text-[10.5px] leading-snug text-amber-700 dark:text-amber-300">
+              <AlertTriangle className="mt-[1px] size-3 shrink-0" />
+              <span className="min-w-0 flex-1">
+                {remoteBranchConflict.remote}/{remoteBranchConflict.branchName} already exists.
               </span>
             </div>
           )}
 
-          {isFolder ? (
-            <Badge
-              variant="secondary"
-              className="h-[16px] px-1.5 text-[10px] font-medium rounded shrink-0 text-muted-foreground bg-accent border border-border dark:bg-accent/80 dark:border-border/50 leading-none"
-            >
-              {repo ? getRepoKindLabel(repo) : 'Folder'}
-            </Badge>
-          ) : (
-            <span className="text-[11px] text-muted-foreground truncate leading-none">
-              {branch}
-            </span>
-          )}
-
-          {/* Why: the conflict operation (merge/rebase/cherry-pick) is the
-               only signal that the worktree is in an incomplete operation state.
-               Showing it on the card lets the user spot worktrees that need
-               attention without switching to them first. */}
-          {conflictOperation && conflictOperation !== 'unknown' && (
-            <Badge
-              variant="outline"
-              className="h-[16px] px-1.5 text-[10px] font-medium rounded shrink-0 gap-1 text-amber-600 border-amber-500/30 bg-amber-500/5 dark:text-amber-400 dark:border-amber-400/30 dark:bg-amber-400/5 leading-none"
-            >
-              <GitMerge className="size-2.5" />
-              {CONFLICT_OPERATION_LABELS[conflictOperation]}
-            </Badge>
-          )}
-
-          <CacheTimer worktreeId={worktree.id} />
-
-          {parentLabel && (
-            <Badge
-              variant="outline"
-              className={cn(
-                'h-[16px] px-1.5 text-[10px] font-medium rounded shrink-0 gap-1 leading-none',
-                lineageState === 'missing'
-                  ? 'text-muted-foreground border-border bg-muted/40'
-                  : 'text-muted-foreground border-border bg-accent/50'
-              )}
-            >
-              <Workflow className="size-2.5" />
-              <span className="max-w-[7rem] truncate">
-                {lineageState === 'missing' ? 'Missing parent' : `from ${parentLabel}`}
-              </span>
-            </Badge>
-          )}
-        </div>
-
-        {/* Meta section: Issue / hosted review / Comment
-             Layout coupling: spacing here is used to derive size estimates in
-             WorktreeList's estimateSize. Update that function if changing spacing. */}
-        {((cardProps.includes('issue') && issueDisplay) ||
-          (cardProps.includes('pr') && prDisplay) ||
-          (cardProps.includes('comment') && worktree.comment)) && (
-          <div className="flex flex-col gap-[3px] mt-0.5">
-            {cardProps.includes('issue') && issueDisplay && (
-              <IssueSection issue={issueDisplay} onClick={handleEditIssue} />
-            )}
-            {cardProps.includes('pr') && prDisplay && (
-              <ReviewSection review={prDisplay} onEdit={handleEditPr} onRemove={handleRemovePr} />
-            )}
-            {cardProps.includes('comment') && worktree.comment && (
-              <CommentSection comment={worktree.comment} onDoubleClick={handleEditComment} />
-            )}
-          </div>
-        )}
-
-        {remoteBranchConflict && (
-          <div className="mt-0.5 flex items-start gap-1.5 rounded border border-amber-500/25 bg-amber-500/5 px-1.5 py-1 text-[10.5px] leading-snug text-amber-700 dark:text-amber-300">
-            <AlertTriangle className="mt-[1px] size-3 shrink-0" />
-            <span className="min-w-0 flex-1">
-              {remoteBranchConflict.remote}/{remoteBranchConflict.branchName} already exists.
-            </span>
-          </div>
-        )}
-
-        {/* Why: inline agent list. Gated on the 'inline-agents' card
+          {/* Why: inline agent list. Gated on the 'inline-agents' card
              property so users can hide it. Layout coupling: this block
              grows the card height dynamically — WorktreeList uses
              measureElement on each row, so the virtualizer re-measures
              naturally when agents appear/disappear. */}
-        {cardProps.includes('inline-agents') && <WorktreeCardAgents worktreeId={worktree.id} />}
+          {cardProps.includes('inline-agents') && <WorktreeCardAgents worktreeId={worktree.id} />}
 
-        {showLineageChildChip && (
-          <div
-            className="relative mt-1 flex min-w-0 justify-start"
-            style={{ color: 'color-mix(in srgb, var(--muted-foreground) 42%, var(--sidebar))' }}
-          >
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="xs"
-                  className="relative z-10 h-[18px] max-w-[8rem] gap-1 rounded-md border border-sidebar-border bg-sidebar px-1.5 text-[10px] font-medium leading-none text-muted-foreground shadow-none hover:bg-sidebar-accent hover:text-foreground focus-visible:ring-1 focus-visible:ring-sidebar-ring"
-                  aria-label={`${lineageCollapsed ? 'Show' : 'Hide'} ${childWorkspaceLabel}`}
-                  aria-expanded={!lineageCollapsed}
-                  onClick={onLineageToggle}
-                >
-                  <Workflow className="size-2.5" />
-                  <span className="truncate">{childWorkspaceShortLabel}</span>
-                  <ChevronDown
-                    className={cn(
-                      'size-2.5 transition-transform',
-                      lineageCollapsed && '-rotate-90'
-                    )}
-                  />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="right" sideOffset={8}>
-                {lineageCollapsed ? 'Show child workspaces' : 'Hide child workspaces'}
-              </TooltipContent>
-            </Tooltip>
-          </div>
-        )}
+          {showLineageChildChip && (
+            <div
+              className="relative mt-1 flex min-w-0 justify-start"
+              style={{ color: 'color-mix(in srgb, var(--muted-foreground) 42%, var(--sidebar))' }}
+            >
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    className="relative z-10 h-[18px] max-w-[8rem] gap-1 rounded-md border border-sidebar-border bg-sidebar px-1.5 text-[10px] font-medium leading-none text-muted-foreground shadow-none hover:bg-sidebar-accent hover:text-foreground focus-visible:ring-1 focus-visible:ring-sidebar-ring"
+                    aria-label={`${lineageCollapsed ? 'Show' : 'Hide'} ${childWorkspaceLabel}`}
+                    aria-expanded={!lineageCollapsed}
+                    onClick={onLineageToggle}
+                  >
+                    <Workflow className="size-2.5" />
+                    <span className="truncate">{childWorkspaceShortLabel}</span>
+                    <ChevronDown
+                      className={cn(
+                        'size-2.5 transition-transform',
+                        lineageCollapsed && '-rotate-90'
+                      )}
+                    />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="right" sideOffset={8}>
+                  {lineageCollapsed ? 'Show child workspaces' : 'Hide child workspaces'}
+                </TooltipContent>
+              </Tooltip>
+            </div>
+          )}
 
-        {lineageChildren && <div className="-ml-4 mt-1.5 space-y-1">{lineageChildren}</div>}
+          {lineageChildren && <div className="-ml-4 mt-1.5 space-y-1">{lineageChildren}</div>}
+        </div>
       </div>
     </div>
   )
