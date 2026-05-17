@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { SortableContext, horizontalListSortingStrategy } from '@dnd-kit/sortable'
-import { Plus } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Plus } from 'lucide-react'
 import { useAppStore } from '@/store'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { Input } from '@/components/ui/input'
@@ -25,6 +25,10 @@ export default function SpaceTabs(): React.JSX.Element {
   const [rename, setRename] = useState<RenameState | null>(null)
   const [creating, setCreating] = useState(false)
   const [createValue, setCreateValue] = useState('')
+  // Why: chevrons only render when there's actual headroom to scroll in that
+  // direction, so the affordance disappears at the edges instead of misleading.
+  const [canScrollLeft, setCanScrollLeft] = useState(false)
+  const [canScrollRight, setCanScrollRight] = useState(false)
   const createInputRef = useRef<HTMLInputElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const outerRef = useRef<HTMLDivElement>(null)
@@ -61,6 +65,8 @@ export default function SpaceTabs(): React.JSX.Element {
       outer.style.maskImage = ''
       outer.style.webkitMaskImage = ''
     }
+    setCanScrollLeft(overflowing && el.scrollLeft > 0)
+    setCanScrollRight(overflowing && el.scrollLeft < el.scrollWidth - el.clientWidth - 1)
   }, [])
 
   useLayoutEffect(() => {
@@ -69,13 +75,47 @@ export default function SpaceTabs(): React.JSX.Element {
 
   useEffect(() => {
     const el = scrollRef.current
-    if (!el || typeof ResizeObserver === 'undefined') {
+    if (!el) {
       return
     }
-    const ro = new ResizeObserver(() => updateOverflow())
-    ro.observe(el)
-    return () => ro.disconnect()
+    const onScroll = (): void => updateOverflow()
+    el.addEventListener('scroll', onScroll, { passive: true })
+    let ro: ResizeObserver | undefined
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(() => updateOverflow())
+      ro.observe(el)
+    }
+    return () => {
+      el.removeEventListener('scroll', onScroll)
+      ro?.disconnect()
+    }
   }, [updateOverflow])
+
+  // Why: vertical wheel deltas should pan the strip horizontally, matching the
+  // same affordance the main TabBar uses — otherwise mouse-wheel users have no
+  // way to traverse the bar without clicking the chevrons.
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) {
+      return
+    }
+    const onWheel = (e: WheelEvent): void => {
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+        e.preventDefault()
+        el.scrollLeft += e.deltaY
+      }
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [])
+
+  const scrollByDirection = useCallback((dir: 1 | -1) => {
+    const el = scrollRef.current
+    if (!el) {
+      return
+    }
+    el.scrollBy({ left: dir * Math.floor(el.clientWidth * 0.6), behavior: 'smooth' })
+  }, [])
 
   const handleCreateCommit = useCallback(() => {
     const trimmed = createValue.trim()
@@ -114,76 +154,98 @@ export default function SpaceTabs(): React.JSX.Element {
   }, [])
 
   return (
-    <div ref={outerRef} className="relative mt-2 px-2" role="tablist" aria-label="Project Spaces">
-      <div
-        ref={scrollRef}
-        className="flex items-center gap-1 overflow-x-auto scrollbar-none"
-        style={{ scrollbarWidth: 'none' }}
-      >
-        <SpaceTab
-          space={null}
-          isActive={activeSpaceId === null}
-          onActivate={() => setActiveSpace(null)}
-        />
-        <SortableContext items={sortableIds} strategy={horizontalListSortingStrategy}>
-          {sortedSpaces.map((space) => (
-            <SpaceTab
-              key={space.id}
-              space={space}
-              isActive={activeSpaceId === space.id}
-              onActivate={() => setActiveSpace(space.id)}
-              onRequestRename={() => handleRequestRename(space.id, space.name)}
-              onRequestDelete={() => deleteSpace(space.id)}
-              isRenaming={rename?.spaceId === space.id}
-              renameValue={rename?.spaceId === space.id ? rename.value : undefined}
-              onRenameChange={(v) =>
-                setRename((prev) =>
-                  prev && prev.spaceId === space.id ? { ...prev, value: v } : prev
-                )
-              }
-              onRenameCommit={handleRenameCommit}
-              onRenameCancel={handleRenameCancel}
-            />
-          ))}
-        </SortableContext>
-        {creating ? (
-          <Input
-            ref={createInputRef}
-            value={createValue}
-            placeholder="Space name"
-            onChange={(e) => setCreateValue(e.target.value)}
-            onBlur={handleCreateCommit}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault()
-                handleCreateCommit()
-              } else if (e.key === 'Escape') {
-                e.preventDefault()
-                handleCreateCancel()
-              }
-            }}
-            className="h-7 w-[120px] min-w-[120px] max-w-[120px] px-2 text-[11px]"
-            spellCheck={false}
-            aria-label="New Space name"
+    <div className="relative mt-2">
+      <div ref={outerRef} className="px-2" role="tablist" aria-label="Project Spaces">
+        <div
+          ref={scrollRef}
+          className="flex items-center gap-1 overflow-x-auto scrollbar-none"
+          style={{ scrollbarWidth: 'none' }}
+        >
+          <SpaceTab
+            space={null}
+            isActive={activeSpaceId === null}
+            onActivate={() => setActiveSpace(null)}
           />
-        ) : (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                onClick={() => setCreating(true)}
-                aria-label="New Space"
-                className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground"
-              >
-                <Plus className="size-3.5" strokeWidth={2.25} />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom" sideOffset={6}>
-              New Space
-            </TooltipContent>
-          </Tooltip>
-        )}
+          <SortableContext items={sortableIds} strategy={horizontalListSortingStrategy}>
+            {sortedSpaces.map((space) => (
+              <SpaceTab
+                key={space.id}
+                space={space}
+                isActive={activeSpaceId === space.id}
+                onActivate={() => setActiveSpace(space.id)}
+                onRequestRename={() => handleRequestRename(space.id, space.name)}
+                onRequestDelete={() => deleteSpace(space.id)}
+                isRenaming={rename?.spaceId === space.id}
+                renameValue={rename?.spaceId === space.id ? rename.value : undefined}
+                onRenameChange={(v) =>
+                  setRename((prev) =>
+                    prev && prev.spaceId === space.id ? { ...prev, value: v } : prev
+                  )
+                }
+                onRenameCommit={handleRenameCommit}
+                onRenameCancel={handleRenameCancel}
+              />
+            ))}
+          </SortableContext>
+          {creating ? (
+            <Input
+              ref={createInputRef}
+              value={createValue}
+              placeholder="Space name"
+              onChange={(e) => setCreateValue(e.target.value)}
+              onBlur={handleCreateCommit}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  handleCreateCommit()
+                } else if (e.key === 'Escape') {
+                  e.preventDefault()
+                  handleCreateCancel()
+                }
+              }}
+              className="h-7 w-[120px] min-w-[120px] max-w-[120px] px-2 text-[11px]"
+              spellCheck={false}
+              aria-label="New Space name"
+            />
+          ) : (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  onClick={() => setCreating(true)}
+                  aria-label="New Space"
+                  className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground"
+                >
+                  <Plus className="size-3.5" strokeWidth={2.25} />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" sideOffset={6}>
+                New Space
+              </TooltipContent>
+            </Tooltip>
+          )}
+        </div>
       </div>
+      {canScrollLeft && (
+        <button
+          type="button"
+          aria-label="Scroll spaces left"
+          onClick={() => scrollByDirection(-1)}
+          className="absolute left-0.5 top-1/2 z-20 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md bg-sidebar/80 text-muted-foreground shadow-sm backdrop-blur-sm hover:bg-sidebar hover:text-foreground"
+        >
+          <ChevronLeft className="size-3.5" strokeWidth={2.25} />
+        </button>
+      )}
+      {canScrollRight && (
+        <button
+          type="button"
+          aria-label="Scroll spaces right"
+          onClick={() => scrollByDirection(1)}
+          className="absolute right-0.5 top-1/2 z-20 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md bg-sidebar/80 text-muted-foreground shadow-sm backdrop-blur-sm hover:bg-sidebar hover:text-foreground"
+        >
+          <ChevronRight className="size-3.5" strokeWidth={2.25} />
+        </button>
+      )}
     </div>
   )
 }
