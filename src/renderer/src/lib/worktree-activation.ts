@@ -133,6 +133,13 @@ export function activateAndRevealWorktree(
     state.setActiveRepo(wt.repoId)
   }
 
+  // 1b. Switch to the Space that contains this repo. Without this, the
+  // sidebar's visible-worktrees filter hides any worktree whose repo isn't
+  // in the active Space, so step 6's revealWorktreeInSidebar silently
+  // no-ops. setActiveSpace already early-returns on no-op.
+  const targetSpaceId = state.repoSpaceAssignments[wt.repoId] ?? null
+  state.setActiveSpace(targetSpaceId)
+
   // 2. Switch any non-terminal view back to terminal
   if (state.activeView !== 'terminal') {
     state.setActiveView('terminal')
