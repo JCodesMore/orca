@@ -7,6 +7,8 @@ import path from 'node:path'
 const repoRoot = process.cwd()
 const mainPath = path.join(repoRoot, 'out', 'main', 'index.js')
 const outputDir = path.join(repoRoot, 'tmp', 'terminal-cursor-diagnostics')
+const coloredStyleMarker = 'ORCA_STYLE_COLORED'
+const plainStyleMarker = 'ORCA_STYLE_PLAIN'
 
 function createDiagnosticRepo() {
   const repoPath = mkdtempSync(path.join(os.tmpdir(), 'orca-cursor-diagnostic-repo-'))
@@ -192,6 +194,29 @@ async function installSampler(page) {
       const textarea = pane.container
         .querySelector('.xterm-helper-textarea')
         ?.getBoundingClientRect()
+      const rowSnapshots = [...pane.container.querySelectorAll('.xterm-rows > div')].map(
+        (rowElement, rowIndex) => {
+          const bufferLine = terminal.buffer.active.getLine(
+            terminal.buffer.active.viewportY + rowIndex
+          )
+          const spans = [...rowElement.querySelectorAll('span')]
+          return {
+            rowIndex,
+            domText: rowElement.textContent ?? '',
+            bufferText: bufferLine?.translateToString(true) ?? '',
+            hasBackgroundSpan: spans.some((span) => {
+              const style = window.getComputedStyle(span)
+              const backgroundColor = style.backgroundColor
+              return (
+                String(span.className).includes('xterm-bg-') ||
+                (backgroundColor !== '' &&
+                  backgroundColor !== 'transparent' &&
+                  backgroundColor !== 'rgba(0, 0, 0, 0)')
+              )
+            })
+          }
+        }
+      )
       samples.push({
         time: performance.now(),
         cursorX: terminal.buffer.active.cursorX,
@@ -204,6 +229,7 @@ async function installSampler(page) {
         xtermClassName: xterm?.className ?? '',
         screenClassName: screen?.className ?? '',
         cursorCandidates,
+        rowSnapshots,
         textarea: textarea
           ? {
               left: textarea.left - container.left,
@@ -232,6 +258,20 @@ async function stopSampler(page) {
     cancelAnimationFrame(diagnostic.raf)
     return diagnostic.samples
   })
+}
+
+async function sendInputToActivePty(page, data) {
+  await page.evaluate((input) => {
+    const store = window.__store
+    const tabId = store?.getState().activeTabId
+    const manager = tabId ? window.__paneManagers?.get(tabId) : null
+    const pane = manager?.getActivePane?.() ?? manager?.getPanes?.()[0] ?? null
+    const ptyId = pane?.container?.dataset?.ptyId
+    if (!ptyId) {
+      throw new Error('active diagnostic PTY id unavailable')
+    }
+    window.api.pty.write(ptyId, input)
+  }, data)
 }
 
 function summarizeSamples(samples) {
@@ -274,6 +314,37 @@ function summarizeSamples(samples) {
   }
 }
 
+function summarizeStyleSamples(samples) {
+  const artifacts = []
+  for (const sample of samples) {
+    for (const row of sample.rowSnapshots ?? []) {
+      const domText = row.domText.replace(/\u00a0/g, ' ')
+      const bufferText = row.bufferText.replace(/\u00a0/g, ' ')
+      const staleColoredText =
+        domText.includes(coloredStyleMarker) && !bufferText.includes(coloredStyleMarker)
+      const staleHighlightedPlainText =
+        domText.includes(plainStyleMarker) &&
+        bufferText.includes(plainStyleMarker) &&
+        row.hasBackgroundSpan
+      if (staleColoredText || staleHighlightedPlainText) {
+        artifacts.push({
+          time: sample.time,
+          rowIndex: row.rowIndex,
+          staleColoredText,
+          staleHighlightedPlainText,
+          domText,
+          bufferText,
+          hasBackgroundSpan: row.hasBackgroundSpan
+        })
+      }
+    }
+  }
+  return {
+    artifactCount: artifacts.length,
+    firstArtifacts: artifacts.slice(0, 25)
+  }
+}
+
 async function driveArrowLeftRepro(page) {
   console.log('[cursor-diagnostic] driving ArrowLeft repro')
   await focusTerminal(page)
@@ -293,6 +364,31 @@ async function driveArrowLeftRepro(page) {
     () => window.__terminalOutputSchedulerDebug?.snapshot?.() ?? null
   )
   console.log(`[cursor-diagnostic] collected ${samples.length} frame samples`)
+  return { samples, scheduler }
+}
+
+async function driveStyleRepro(page) {
+  console.log('[cursor-diagnostic] driving styled row repro')
+  await focusTerminal(page)
+  await page.evaluate(() => window.__terminalOutputSchedulerDebug?.reset?.())
+  const command =
+    '$esc=[char]27; 1..100 | ForEach-Object { [Console]::Out.Write("$esc[46;33mORCA_STYLE_COLORED_$($_) Reading response stream$esc[0m`r"); [Console]::Out.Write("$esc[0mORCA_STYLE_PLAIN_$($_) ready                         `r"); Start-Sleep -Milliseconds 1 }; [Console]::Out.Write("ORCA_STYLE_DONE`n")'
+  await installSampler(page)
+  await sendInputToActivePty(page, `\x15${command}\r`)
+  await page.waitForFunction(
+    () =>
+      [...document.querySelectorAll('.xterm-rows > div')].some((row) =>
+        row.textContent?.includes('ORCA_STYLE_DONE')
+      ),
+    null,
+    { timeout: 15_000 }
+  )
+  await page.waitForTimeout(250)
+  const samples = await stopSampler(page)
+  const scheduler = await page.evaluate(
+    () => window.__terminalOutputSchedulerDebug?.snapshot?.() ?? null
+  )
+  console.log(`[cursor-diagnostic] collected ${samples.length} styled frame samples`)
   return { samples, scheduler }
 }
 
@@ -318,17 +414,39 @@ async function main() {
     console.log('[cursor-diagnostic] launched Electron')
     const page = await app.firstWindow({ timeout: 120_000 })
     await addRepoAndOpenTerminal(page, diagnosticRepo)
-    const { samples, scheduler } = await driveArrowLeftRepro(page)
-    const summary = summarizeSamples(samples)
-    summary.scheduler = scheduler
+    const cursorResult = await driveArrowLeftRepro(page)
+    const styleResult = await driveStyleRepro(page)
+    const cursorSummary = summarizeSamples(cursorResult.samples)
+    const styleSummary = summarizeStyleSamples(styleResult.samples)
+    const summary = {
+      anomalyCount: cursorSummary.anomalyCount + styleSummary.artifactCount,
+      cursor: {
+        ...cursorSummary,
+        scheduler: cursorResult.scheduler
+      },
+      style: {
+        ...styleSummary,
+        scheduler: styleResult.scheduler
+      }
+    }
     const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-    const samplesPath = path.join(outputDir, `cursor-samples-${stamp}.json`)
-    const summaryPath = path.join(outputDir, `cursor-summary-${stamp}.json`)
-    writeFileSync(samplesPath, `${JSON.stringify(samples, null, 2)}\n`)
+    const samplesPath = path.join(outputDir, `terminal-visual-samples-${stamp}.json`)
+    const summaryPath = path.join(outputDir, `terminal-visual-summary-${stamp}.json`)
+    writeFileSync(
+      samplesPath,
+      `${JSON.stringify(
+        {
+          cursorSamples: cursorResult.samples,
+          styleSamples: styleResult.samples
+        },
+        null,
+        2
+      )}\n`
+    )
     writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`)
     console.log(JSON.stringify({ samplesPath, summaryPath, summary }, null, 2))
     if (summary.anomalyCount > 0) {
-      throw new Error(`cursor diagnostic failed with ${summary.anomalyCount} visible anomalies`)
+      throw new Error(`terminal visual diagnostic failed with ${summary.anomalyCount} anomalies`)
     }
   } finally {
     await app.close().catch(() => {})
