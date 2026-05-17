@@ -26,6 +26,14 @@ type SpaceTabProps = {
   onRenameChange?: (value: string) => void
   onRenameCommit?: () => void
   onRenameCancel?: () => void
+  /** Unread agent-event count for this Space. Rendered as a trailing chip
+   *  when > 0; never rendered on the "All Projects" pill because that count
+   *  would re-summarize every other Space's badge (double-counting). */
+  notificationCount?: number
+}
+
+function formatNotificationCount(count: number): string {
+  return count >= 100 ? '99+' : String(count)
 }
 
 const ALL_PROJECTS_LABEL = 'All Projects'
@@ -40,7 +48,8 @@ export default function SpaceTab({
   renameValue,
   onRenameChange,
   onRenameCommit,
-  onRenameCancel
+  onRenameCancel,
+  notificationCount = 0
 }: SpaceTabProps): React.JSX.Element {
   const isAllProjects = space === null
   // Why: All Projects is rendered outside the SortableContext and never
@@ -143,7 +152,25 @@ export default function SpaceTab({
           aria-label={`Rename Space ${space?.name ?? ''}`}
         />
       ) : (
-        <span className="truncate max-w-[140px]">{label}</span>
+        <>
+          <span className="truncate max-w-[140px]">{label}</span>
+          {!isAllProjects && notificationCount > 0 ? (
+            <span
+              aria-label={`${notificationCount} unread`}
+              className={cn(
+                'ml-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-medium tabular-nums',
+                // Why: re-tint on the active pill so the chip stays legible
+                // against bg-sidebar-accent — `foreground/10` would all but
+                // vanish there.
+                isActive
+                  ? 'bg-background/25 text-foreground'
+                  : 'bg-foreground/10 text-foreground/80'
+              )}
+            >
+              {formatNotificationCount(notificationCount)}
+            </span>
+          ) : null}
+        </>
       )}
     </div>
   )
