@@ -5,6 +5,7 @@ import { useAppStore } from '@/store'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { Input } from '@/components/ui/input'
 import SpaceTab from './SpaceTab'
+import { useSpaceNotificationCounts } from './use-space-notification-counts'
 import { useSpaceTabDocumentDrop } from './use-space-tab-drop'
 
 type RenameState = { spaceId: string; value: string }
@@ -22,6 +23,7 @@ export default function SpaceTabs(): React.JSX.Element {
   const addSpace = useAppStore((s) => s.addSpace)
   const renameSpace = useAppStore((s) => s.renameSpace)
   const deleteSpace = useAppStore((s) => s.deleteSpace)
+  const notificationCounts = useSpaceNotificationCounts()
 
   useSpaceTabDocumentDrop()
 
@@ -189,6 +191,7 @@ export default function SpaceTabs(): React.JSX.Element {
                 }
                 onRenameCommit={handleRenameCommit}
                 onRenameCancel={handleRenameCancel}
+                notificationCount={notificationCounts[space.id] ?? 0}
               />
             ))}
           </SortableContext>
