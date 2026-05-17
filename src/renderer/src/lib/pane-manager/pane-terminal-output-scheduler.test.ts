@@ -8,6 +8,22 @@ function createTerminal() {
   }
 }
 
+function createForegroundTerminal() {
+  return {
+    buffer: {
+      active: {
+        cursorY: 7
+      }
+    },
+    rows: 24,
+    refresh: vi.fn(),
+    _core: {
+      refresh: vi.fn()
+    },
+    write: vi.fn((_data: string, callback?: () => void) => callback?.())
+  }
+}
+
 async function loadScheduler() {
   vi.resetModules()
   return import('./pane-terminal-output-scheduler')
@@ -24,7 +40,22 @@ describe('pane terminal output scheduler', () => {
 
     writeTerminalOutput(terminal, 'foreground', { foreground: true })
 
-    expect(terminal.write).toHaveBeenCalledWith('foreground')
+    expect(terminal.write).toHaveBeenCalledWith('foreground', expect.any(Function))
+  })
+
+  it('synchronously refreshes visible rows after foreground parse', async () => {
+    const { writeTerminalOutput } = await loadScheduler()
+    const terminal = createForegroundTerminal()
+    terminal.write.mockImplementation((_data: string, callback?: () => void) => {
+      // Simulate xterm parsing the write before it calls the completion callback.
+      terminal.buffer.active.cursorY = 3
+      callback?.()
+    })
+
+    writeTerminalOutput(terminal, 'foreground', { foreground: true })
+
+    expect(terminal._core.refresh).toHaveBeenCalledWith(0, 23, true)
+    expect(terminal.refresh).not.toHaveBeenCalled()
   })
 
   it('coalesces background output until the shared drain runs', async () => {

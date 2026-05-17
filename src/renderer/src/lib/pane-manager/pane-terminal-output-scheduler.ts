@@ -1,6 +1,17 @@
 import { e2eConfig } from '@/lib/e2e-config'
 
 type TerminalOutputTarget = {
+  element?: HTMLElement | null
+  buffer?: {
+    active?: {
+      cursorY?: number
+    }
+  }
+  _core?: {
+    refresh?(start: number, end: number, sync?: boolean): void
+  }
+  refresh?(start: number, end: number): void
+  rows?: number
   write(data: string, callback?: () => void): void
 }
 
@@ -122,6 +133,40 @@ function writeQueuedChunk(entry: QueueEntry): boolean {
   return true
 }
 
+function refreshVisibleRowsNow(terminal: TerminalOutputTarget): void {
+  if (typeof terminal.rows !== 'number' || terminal.rows < 1) {
+    return
+  }
+
+  const start = 0
+  const end = Math.max(0, terminal.rows - 1)
+  try {
+    // Why: xterm's normal DOM renderer refresh is debounced. On Windows
+    // ConPTY, PowerShell edit bursts can expose one-frame stale cursor and
+    // style rows unless the foreground viewport is painted with the parsed
+    // terminal state before Chromium's next frame.
+    if (typeof terminal._core?.refresh === 'function') {
+      terminal._core.refresh(start, end, true)
+      return
+    }
+    terminal.refresh?.(start, end)
+  } catch {
+    // Ignore disposed terminals; PTY output can race pane teardown.
+  }
+}
+
+function settleForegroundRender(terminal: TerminalOutputTarget): void {
+  refreshVisibleRowsNow(terminal)
+}
+
+function writeForegroundChunk(terminal: TerminalOutputTarget, data: string): void {
+  try {
+    terminal.write(data, () => settleForegroundRender(terminal))
+  } catch {
+    settleForegroundRender(terminal)
+  }
+}
+
 function drainQueuedOutput(): void {
   drainTimer = null
   let writes = 0
@@ -167,7 +212,7 @@ export function writeTerminalOutput(
     if (debugEnabled) {
       debugState.foregroundWriteCount++
     }
-    terminal.write(data)
+    writeForegroundChunk(terminal, data)
     return
   }
 

@@ -857,7 +857,10 @@ describe('connectPanePty', () => {
     expect(capturedDataCallback.current).not.toBeNull()
     capturedDataCallback.current?.('visible split output\r\n')
 
-    expect(pane.terminal.write).toHaveBeenCalledWith('visible split output\r\n')
+    expect(pane.terminal.write).toHaveBeenCalledWith(
+      'visible split output\r\n',
+      expect.any(Function)
+    )
   })
 
   it('marks panes that receive Arabic output for DOM rendering', async () => {
@@ -880,7 +883,10 @@ describe('connectPanePty', () => {
     capturedDataCallback.current?.('Arabic: السلام عليكم\r\n')
 
     expect(manager.markPaneHasComplexScriptOutput).toHaveBeenCalledWith(1)
-    expect(pane.terminal.write).toHaveBeenCalledWith('Arabic: السلام عليكم\r\n')
+    expect(pane.terminal.write).toHaveBeenCalledWith(
+      'Arabic: السلام عليكم\r\n',
+      expect.any(Function)
+    )
   })
 
   it('reattaches via daemon sessionId when an in-session PTY is live', async () => {
