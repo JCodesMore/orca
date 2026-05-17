@@ -114,7 +114,15 @@ export default function SpaceTabs(): React.JSX.Element {
   }, [])
 
   return (
-    <div ref={outerRef} className="relative mt-2 px-2" role="tablist" aria-label="Project Spaces">
+    // Why: clicks anywhere in the Space tabs strip must not dismiss the
+    // open Workspace board — switching spaces keeps the board open.
+    <div
+      ref={outerRef}
+      className="relative mt-2 px-2"
+      role="tablist"
+      aria-label="Project Spaces"
+      data-workspace-board-preserve-open=""
+    >
       <div
         ref={scrollRef}
         className="flex items-center gap-1 overflow-x-auto scrollbar-none"
