@@ -7,6 +7,7 @@ import type {
   CustomPet,
   PersistedTrustedOrcaHooks,
   PersistedUIState,
+  Space,
   StatusBarItem,
   TaskProvider,
   TaskResumeState,
@@ -197,6 +198,66 @@ function sanitizeWorkspaceCleanupDismissals(
   return out
 }
 
+function sanitizePersistedSpaces(value: unknown): Space[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  const out: Space[] = []
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object') {
+      continue
+    }
+    const input = raw as Record<string, unknown>
+    if (typeof input.id !== 'string' || input.id.length === 0) {
+      continue
+    }
+    if (typeof input.name !== 'string') {
+      continue
+    }
+    if (typeof input.order !== 'number' || !Number.isFinite(input.order)) {
+      continue
+    }
+    if (typeof input.createdAt !== 'number' || !Number.isFinite(input.createdAt)) {
+      continue
+    }
+    const space: Space = {
+      id: input.id,
+      name: input.name,
+      order: input.order,
+      createdAt: input.createdAt
+    }
+    if (typeof input.color === 'string') {
+      space.color = input.color
+    }
+    out.push(space)
+  }
+  return out
+}
+
+function sanitizeRepoSpaceAssignments(
+  value: unknown,
+  validRepoIds: Set<string>,
+  validSpaceIds: Set<string>
+): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {}
+  }
+  const out: Record<string, string> = {}
+  for (const [repoId, spaceId] of Object.entries(value as Record<string, unknown>)) {
+    if (repoId === '__proto__' || repoId === 'constructor' || repoId === 'prototype') {
+      continue
+    }
+    if (typeof spaceId !== 'string') {
+      continue
+    }
+    if (!validRepoIds.has(repoId) || !validSpaceIds.has(spaceId)) {
+      continue
+    }
+    out[repoId] = spaceId
+  }
+  return out
+}
+
 function sanitizeTaskResumeState(value: unknown): TaskResumeState | undefined {
   if (!value || typeof value !== 'object') {
     return undefined
@@ -364,6 +425,18 @@ export type UISlice = {
   setHideDefaultBranchWorkspace: (v: boolean) => void
   filterRepoIds: string[]
   setFilterRepoIds: (ids: string[]) => void
+  /** User-created Spaces (named sidebar tabs that group projects). */
+  spaces: Space[]
+  /** Currently active Space. null === All Projects. */
+  activeSpaceId: string | null
+  /** repoId → spaceId membership map. Missing key means unassigned. */
+  repoSpaceAssignments: Record<string, string>
+  addSpace: (name: string) => Space | null
+  renameSpace: (id: string, name: string) => void
+  deleteSpace: (id: string) => void
+  setActiveSpace: (id: string | null) => void
+  moveRepoToSpace: (repoId: string, spaceId: string | null) => void
+  reorderSpaces: (orderedIds: string[]) => void
   collapsedGroups: Set<string>
   toggleCollapsedGroup: (key: string) => void
   worktreeCardProperties: WorktreeCardProperty[]
@@ -738,6 +811,130 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
   filterRepoIds: [],
   setFilterRepoIds: (ids) => set({ filterRepoIds: ids }),
 
+  spaces: [],
+  activeSpaceId: null,
+  repoSpaceAssignments: {},
+  addSpace: (name) => {
+    const trimmed = name.trim()
+    if (trimmed.length === 0) {
+      return null
+    }
+    const space: Space = {
+      id: crypto.randomUUID(),
+      name: trimmed,
+      order: 0,
+      createdAt: Date.now()
+    }
+    let created: Space | null = null
+    set((s) => {
+      // Append to the end and rewrite order so it stays a contiguous 0-based
+      // sequence even after intermediate deletes.
+      const nextSpaces = [...s.spaces, space].map((sp, i) => ({ ...sp, order: i }))
+      created = nextSpaces.find((sp) => sp.id === space.id) ?? space
+      window.api.ui.set({ spaces: nextSpaces }).catch(console.error)
+      return { spaces: nextSpaces }
+    })
+    return created
+  },
+  renameSpace: (id, name) => {
+    const trimmed = name.trim()
+    if (trimmed.length === 0) {
+      return
+    }
+    set((s) => {
+      let changed = false
+      const nextSpaces = s.spaces.map((sp) => {
+        if (sp.id !== id || sp.name === trimmed) {
+          return sp
+        }
+        changed = true
+        return { ...sp, name: trimmed }
+      })
+      if (!changed) {
+        return s
+      }
+      window.api.ui.set({ spaces: nextSpaces }).catch(console.error)
+      return { spaces: nextSpaces }
+    })
+  },
+  deleteSpace: (id) =>
+    set((s) => {
+      if (!s.spaces.some((sp) => sp.id === id)) {
+        return s
+      }
+      const nextSpaces = s.spaces.filter((sp) => sp.id !== id).map((sp, i) => ({ ...sp, order: i }))
+      const nextAssignments: Record<string, string> = {}
+      for (const [repoId, spaceId] of Object.entries(s.repoSpaceAssignments)) {
+        if (spaceId !== id) {
+          nextAssignments[repoId] = spaceId
+        }
+      }
+      const nextActive = s.activeSpaceId === id ? null : s.activeSpaceId
+      window.api.ui
+        .set({
+          spaces: nextSpaces,
+          repoSpaceAssignments: nextAssignments,
+          activeSpaceId: nextActive
+        })
+        .catch(console.error)
+      return {
+        spaces: nextSpaces,
+        repoSpaceAssignments: nextAssignments,
+        activeSpaceId: nextActive
+      }
+    }),
+  setActiveSpace: (id) =>
+    set((s) => {
+      if (id !== null && !s.spaces.some((sp) => sp.id === id)) {
+        return s
+      }
+      if (s.activeSpaceId === id) {
+        return s
+      }
+      window.api.ui.set({ activeSpaceId: id }).catch(console.error)
+      return { activeSpaceId: id }
+    }),
+  moveRepoToSpace: (repoId, spaceId) =>
+    set((s) => {
+      if (spaceId !== null && !s.spaces.some((sp) => sp.id === spaceId)) {
+        return s
+      }
+      const current = s.repoSpaceAssignments[repoId] ?? null
+      if (current === spaceId) {
+        return s
+      }
+      const next = { ...s.repoSpaceAssignments }
+      if (spaceId === null) {
+        delete next[repoId]
+      } else {
+        next[repoId] = spaceId
+      }
+      window.api.ui.set({ repoSpaceAssignments: next }).catch(console.error)
+      return { repoSpaceAssignments: next }
+    }),
+  reorderSpaces: (orderedIds) =>
+    set((s) => {
+      if (orderedIds.length === 0) {
+        return s
+      }
+      const byId = new Map(s.spaces.map((sp) => [sp.id, sp]))
+      const nextSpaces: Space[] = []
+      for (let i = 0; i < orderedIds.length; i++) {
+        const sp = byId.get(orderedIds[i])
+        if (sp) {
+          nextSpaces.push({ ...sp, order: i })
+          byId.delete(orderedIds[i])
+        }
+      }
+      // Append any Spaces not present in orderedIds so a stale call cannot
+      // drop entries silently.
+      for (const sp of byId.values()) {
+        nextSpaces.push({ ...sp, order: nextSpaces.length })
+      }
+      window.api.ui.set({ spaces: nextSpaces }).catch(console.error)
+      return { spaces: nextSpaces }
+    }),
+
   collapsedGroups: new Set<string>(),
   toggleCollapsedGroup: (key) =>
     set((s) => {
@@ -884,6 +1081,17 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
   hydratePersistedUI: (ui) =>
     set((s) => {
       const validRepoIds = new Set(s.repos.map((repo) => repo.id))
+      const persistedSpaces = sanitizePersistedSpaces(ui.spaces)
+      const validSpaceIds = new Set(persistedSpaces.map((sp) => sp.id))
+      const repoSpaceAssignments = sanitizeRepoSpaceAssignments(
+        ui.repoSpaceAssignments,
+        validRepoIds,
+        validSpaceIds
+      )
+      const activeSpaceId =
+        typeof ui.activeSpaceId === 'string' && validSpaceIds.has(ui.activeSpaceId)
+          ? ui.activeSpaceId
+          : null
       // Why: persisted UI from pre-rename builds used sidekick* keys. Read
       // those only as fallbacks so new pet* writes win immediately after upgrade.
       const customPets = Array.isArray(ui.customPets)
@@ -926,6 +1134,9 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
         showActiveOnly: ui.showActiveOnly,
         hideDefaultBranchWorkspace: ui.hideDefaultBranchWorkspace ?? false,
         filterRepoIds: (ui.filterRepoIds ?? []).filter((repoId) => validRepoIds.has(repoId)),
+        spaces: persistedSpaces,
+        activeSpaceId,
+        repoSpaceAssignments,
         collapsedGroups: new Set(ui.collapsedGroups ?? []),
         uiZoomLevel: ui.uiZoomLevel ?? 0,
         editorFontZoomLevel: ui.editorFontZoomLevel ?? 0,

@@ -123,6 +123,13 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
         toast.success(isGitRepoKind(repo) ? 'Project added' : 'Folder added', {
           description: repo.displayName
         })
+        // Why: when the user is browsing a non-All Space and adds a project,
+        // they expect the new project to belong to *that* Space. Otherwise it
+        // would appear to vanish (visible only under All Projects).
+        const { activeSpaceId, moveRepoToSpace } = get()
+        if (activeSpaceId !== null) {
+          moveRepoToSpace(repo.id, activeSpaceId)
+        }
       }
       return repo
     } catch (err) {

@@ -64,6 +64,8 @@ function visibleOptions(overrides: Partial<VisibleOptions> = {}): VisibleOptions
     activeWorktreeId: null,
     hideDefaultBranchWorkspace: false,
     repoMap,
+    activeSpaceId: null,
+    repoSpaceAssignments: {},
     ...overrides
   }
 }
@@ -197,6 +199,38 @@ describe('computeVisibleWorktreeIds', () => {
     )
 
     expect(result).toEqual([feature.id])
+  })
+
+  it('filters worktrees by activeSpaceId via repoSpaceAssignments', () => {
+    const wt1 = makeWorktree('wt1', 'repo1')
+    const wt2 = makeWorktree('wt2', 'repo2')
+
+    const result = computeVisibleWorktreeIds(
+      { repo1: [wt1], repo2: [wt2] },
+      [wt1.id, wt2.id],
+      visibleOptions({
+        activeSpaceId: 'space-a',
+        repoSpaceAssignments: { repo1: 'space-a' }
+      })
+    )
+
+    expect(result).toEqual([wt1.id])
+  })
+
+  it('returns all worktrees when activeSpaceId is null (All Projects)', () => {
+    const wt1 = makeWorktree('wt1', 'repo1')
+    const wt2 = makeWorktree('wt2', 'repo2')
+
+    const result = computeVisibleWorktreeIds(
+      { repo1: [wt1], repo2: [wt2] },
+      [wt1.id, wt2.id],
+      visibleOptions({
+        activeSpaceId: null,
+        repoSpaceAssignments: { repo1: 'space-a' }
+      })
+    )
+
+    expect(result).toEqual([wt1.id, wt2.id])
   })
 
   it('composes with filterRepoIds: hides mains only within the selected repos', () => {

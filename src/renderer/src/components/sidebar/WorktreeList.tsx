@@ -64,6 +64,7 @@ import {
 } from '@/hooks/useVirtualizedScrollAnchor'
 import { activateAndRevealWorktree } from '@/lib/worktree-activation'
 import { useRepoHeaderDrag } from './repo-header-drag'
+import RepoGroupHeaderDraggable from './RepoGroupHeaderDraggable'
 import WorktreeContextMenu from './WorktreeContextMenu'
 import {
   areWorktreeSelectionsEqual,
@@ -759,6 +760,130 @@ const VirtualizedWorktreeViewport = React.memo(function VirtualizedWorktreeViewp
                 ? getWorkspaceStatusFromGroupKey(row.key, workspaceStatuses)
                 : null
             const isPinnedHeader = row.key === PINNED_GROUP_KEY
+            const headerInner = (
+              <div
+                role="button"
+                tabIndex={0}
+                data-repo-header-id={repoIdForHeader}
+                data-workspace-status-drop-target={headerWorkspaceStatus ? '' : undefined}
+                data-workspace-status={headerWorkspaceStatus ?? undefined}
+                data-workspace-pin-drop-target={isPinnedHeader ? '' : undefined}
+                className={cn(
+                  'group flex h-7 w-full items-center gap-1.5 pl-3 pr-1 text-left transition-all',
+                  'cursor-pointer',
+                  isDraggingThis &&
+                    'bg-accent/80 ring-1 ring-ring/40 shadow-md rounded-md scale-[1.01]',
+                  headerWorkspaceStatus &&
+                    dragOverStatus === headerWorkspaceStatus &&
+                    'rounded-md bg-sidebar-accent ring-1 ring-sidebar-ring/40',
+                  isPinnedHeader &&
+                    pinDragOver &&
+                    'rounded-md bg-sidebar-accent ring-1 ring-sidebar-ring/40',
+                  // First header sits directly under SidebarHeader, which already
+                  // supplies its own spacing — only offset secondary group headers.
+                  vItem.index !== firstHeaderIndex && 'mt-2',
+                  row.repo && 'overflow-hidden'
+                )}
+                onDragOver={
+                  isPinnedHeader
+                    ? handleWorkspacePinDragOver
+                    : headerWorkspaceStatus
+                      ? (event) => handleWorkspaceStatusDragOver(event, headerWorkspaceStatus)
+                      : undefined
+                }
+                onDragLeave={
+                  isPinnedHeader
+                    ? handleWorkspacePinDragLeave
+                    : headerWorkspaceStatus
+                      ? handleWorkspaceStatusDragLeave
+                      : undefined
+                }
+                onDrop={
+                  headerWorkspaceStatus
+                    ? (event) => handleWorkspaceStatusDrop(event, headerWorkspaceStatus)
+                    : undefined
+                }
+                onClick={() => toggleGroupWithScrollAnchor(row.key)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault()
+                    toggleGroupWithScrollAnchor(row.key)
+                  }
+                }}
+              >
+                {row.icon ? (
+                  <div
+                    onPointerDown={
+                      canReorderRepoHeaders && isRepoHeader && repoIdForHeader
+                        ? (e) => {
+                            // Why: keep the repo-reorder controller authoritative
+                            // for the folder icon. Without stopPropagation, the
+                            // outer dnd-kit useDraggable would also arm and a
+                            // single press could end up tracked by both systems.
+                            e.stopPropagation()
+                            repoDrag.onHandlePointerDown(e, repoIdForHeader)
+                          }
+                        : undefined
+                    }
+                    className={cn(
+                      'flex size-4 shrink-0 items-center justify-center rounded-[4px]',
+                      row.repo ? 'text-muted-foreground' : row.tone
+                    )}
+                  >
+                    <row.icon className={row.repo ? 'size-3.5' : 'size-3'} />
+                  </div>
+                ) : null}
+
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5">
+                    <div className="truncate text-[13px] font-semibold leading-none">
+                      {row.label}
+                    </div>
+                    <div className="rounded-full bg-black/12 px-1.5 py-0.5 text-[9px] font-medium leading-none text-muted-foreground/90">
+                      {row.count}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex size-4 shrink-0 cursor-pointer items-center justify-center text-muted-foreground/60 opacity-0 transition-opacity group-hover:opacity-100">
+                  <ChevronDown
+                    className={cn(
+                      'size-3.5 cursor-pointer transition-transform [&_path]:cursor-pointer',
+                      collapsedGroups.has(row.key) && '-rotate-90'
+                    )}
+                  />
+                </div>
+
+                {row.repo && groupBy === 'repo' ? (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-xs"
+                        className="size-5 shrink-0 rounded-md text-muted-foreground hover:bg-accent/70 hover:text-foreground transition-opacity"
+                        aria-label={`Create worktree for ${row.label}`}
+                        onClick={(event) => {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          if (row.repo && isGitRepoKind(row.repo)) {
+                            handleCreateForRepo(row.repo.id)
+                          }
+                        }}
+                        disabled={row.repo ? !isGitRepoKind(row.repo) : false}
+                      >
+                        <Plus className="size-3" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom" sideOffset={6}>
+                      {row.repo && !isGitRepoKind(row.repo)
+                        ? `${row.label} is opened as a folder`
+                        : `Create worktree for ${row.label}`}
+                    </TooltipContent>
+                  </Tooltip>
+                ) : null}
+              </div>
+            )
             return (
               <div
                 key={vItem.key}
@@ -770,121 +895,13 @@ const VirtualizedWorktreeViewport = React.memo(function VirtualizedWorktreeViewp
                 className="absolute left-0 right-0"
                 style={{ transform: getVirtualRowTransform(vItem.start) }}
               >
-                <div
-                  role="button"
-                  tabIndex={0}
-                  data-repo-header-id={repoIdForHeader}
-                  data-workspace-status-drop-target={headerWorkspaceStatus ? '' : undefined}
-                  data-workspace-status={headerWorkspaceStatus ?? undefined}
-                  data-workspace-pin-drop-target={isPinnedHeader ? '' : undefined}
-                  className={cn(
-                    'group flex h-7 w-full items-center gap-1.5 pl-3 pr-1 text-left transition-all',
-                    'cursor-pointer',
-                    isDraggingThis &&
-                      'bg-accent/80 ring-1 ring-ring/40 shadow-md rounded-md scale-[1.01]',
-                    headerWorkspaceStatus &&
-                      dragOverStatus === headerWorkspaceStatus &&
-                      'rounded-md bg-sidebar-accent ring-1 ring-sidebar-ring/40',
-                    isPinnedHeader &&
-                      pinDragOver &&
-                      'rounded-md bg-sidebar-accent ring-1 ring-sidebar-ring/40',
-                    // First header sits directly under SidebarHeader, which already
-                    // supplies its own spacing — only offset secondary group headers.
-                    vItem.index !== firstHeaderIndex && 'mt-2',
-                    row.repo && 'overflow-hidden'
-                  )}
-                  onDragOver={
-                    isPinnedHeader
-                      ? handleWorkspacePinDragOver
-                      : headerWorkspaceStatus
-                        ? (event) => handleWorkspaceStatusDragOver(event, headerWorkspaceStatus)
-                        : undefined
-                  }
-                  onDragLeave={
-                    isPinnedHeader
-                      ? handleWorkspacePinDragLeave
-                      : headerWorkspaceStatus
-                        ? handleWorkspaceStatusDragLeave
-                        : undefined
-                  }
-                  onDrop={
-                    headerWorkspaceStatus
-                      ? (event) => handleWorkspaceStatusDrop(event, headerWorkspaceStatus)
-                      : undefined
-                  }
-                  onClick={() => toggleGroupWithScrollAnchor(row.key)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault()
-                      toggleGroupWithScrollAnchor(row.key)
-                    }
-                  }}
-                >
-                  {row.icon ? (
-                    <div
-                      onPointerDown={
-                        canReorderRepoHeaders && isRepoHeader && repoIdForHeader
-                          ? (e) => repoDrag.onHandlePointerDown(e, repoIdForHeader)
-                          : undefined
-                      }
-                      className={cn(
-                        'flex size-4 shrink-0 items-center justify-center rounded-[4px]',
-                        row.repo ? 'text-muted-foreground' : row.tone
-                      )}
-                    >
-                      <row.icon className={row.repo ? 'size-3.5' : 'size-3'} />
-                    </div>
-                  ) : null}
-
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-1.5">
-                      <div className="truncate text-[13px] font-semibold leading-none">
-                        {row.label}
-                      </div>
-                      <div className="rounded-full bg-black/12 px-1.5 py-0.5 text-[9px] font-medium leading-none text-muted-foreground/90">
-                        {row.count}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="flex size-4 shrink-0 cursor-pointer items-center justify-center text-muted-foreground/60 opacity-0 transition-opacity group-hover:opacity-100">
-                    <ChevronDown
-                      className={cn(
-                        'size-3.5 cursor-pointer transition-transform [&_path]:cursor-pointer',
-                        collapsedGroups.has(row.key) && '-rotate-90'
-                      )}
-                    />
-                  </div>
-
-                  {row.repo && groupBy === 'repo' ? (
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-xs"
-                          className="size-5 shrink-0 rounded-md text-muted-foreground hover:bg-accent/70 hover:text-foreground transition-opacity"
-                          aria-label={`Create worktree for ${row.label}`}
-                          onClick={(event) => {
-                            event.preventDefault()
-                            event.stopPropagation()
-                            if (row.repo && isGitRepoKind(row.repo)) {
-                              handleCreateForRepo(row.repo.id)
-                            }
-                          }}
-                          disabled={row.repo ? !isGitRepoKind(row.repo) : false}
-                        >
-                          <Plus className="size-3" />
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent side="bottom" sideOffset={6}>
-                        {row.repo && !isGitRepoKind(row.repo)
-                          ? `${row.label} is opened as a folder`
-                          : `Create worktree for ${row.label}`}
-                      </TooltipContent>
-                    </Tooltip>
-                  ) : null}
-                </div>
+                {isRepoHeader && repoIdForHeader ? (
+                  <RepoGroupHeaderDraggable repoId={repoIdForHeader}>
+                    {headerInner}
+                  </RepoGroupHeaderDraggable>
+                ) : (
+                  headerInner
+                )}
               </div>
             )
           }
@@ -1160,6 +1177,8 @@ const WorktreeList = React.memo(function WorktreeList({
   const showActiveOnly = useAppStore((s) => s.showActiveOnly)
   const hideDefaultBranchWorkspace = useAppStore((s) => s.hideDefaultBranchWorkspace)
   const filterRepoIds = useAppStore((s) => s.filterRepoIds)
+  const activeSpaceId = useAppStore((s) => s.activeSpaceId)
+  const repoSpaceAssignments = useAppStore((s) => s.repoSpaceAssignments)
   const openModal = useAppStore((s) => s.openModal)
   const updateWorktreeMeta = useAppStore((s) => s.updateWorktreeMeta)
   const updateWorktreesMeta = useAppStore((s) => s.updateWorktreesMeta)
@@ -1432,7 +1451,9 @@ const WorktreeList = React.memo(function WorktreeList({
       browserTabsByWorktree,
       activeWorktreeId,
       hideDefaultBranchWorkspace,
-      repoMap
+      repoMap,
+      activeSpaceId,
+      repoSpaceAssignments
     })
     return ids.map((id) => worktreeMap.get(id)).filter((w): w is Worktree => w != null)
   }, [
@@ -1446,7 +1467,9 @@ const WorktreeList = React.memo(function WorktreeList({
     browserTabsByWorktree,
     sortedIds,
     worktreeMap,
-    worktreesByRepo
+    worktreesByRepo,
+    activeSpaceId,
+    repoSpaceAssignments
   ])
 
   const worktrees = visibleWorktrees

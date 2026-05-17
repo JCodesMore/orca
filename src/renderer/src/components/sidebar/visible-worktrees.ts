@@ -18,6 +18,9 @@ export function isDefaultBranchWorkspace(worktree: Worktree): boolean {
 }
 
 /** Inputs describing every sidebar filter that can leave the list empty. */
+// Why: Space membership is intentionally excluded — Spaces are navigation
+// (the user picked a tab), not a clearable filter. Clear Filters must not
+// rip the user out of their active Space.
 export type SidebarFilterState = {
   showActiveOnly: boolean
   filterRepoIds: readonly string[]
@@ -89,6 +92,11 @@ export function computeVisibleWorktreeIds(
     // forgetting to pass it.
     hideDefaultBranchWorkspace: boolean
     repoMap: Map<string, Repo>
+    // Why required: same reasoning as hideDefaultBranchWorkspace — the Space
+    // filter is part of the active sidebar view contract. A caller that
+    // forgot to pass it would silently widen the list across all Spaces.
+    activeSpaceId: string | null
+    repoSpaceAssignments: Record<string, string>
   }
 ): string[] {
   let all: Worktree[] = getAllWorktreesFromState({ worktreesByRepo })
@@ -104,6 +112,10 @@ export function computeVisibleWorktreeIds(
   if (opts.filterRepoIds.length > 0) {
     const selectedRepoIds = new Set(opts.filterRepoIds)
     all = all.filter((w) => selectedRepoIds.has(w.repoId))
+  }
+
+  if (opts.activeSpaceId !== null) {
+    all = all.filter((w) => opts.repoSpaceAssignments[w.repoId] === opts.activeSpaceId)
   }
 
   // Filter active only
@@ -207,6 +219,8 @@ export function getVisibleWorktreeIds(): string[] {
     browserTabsByWorktree: state.browserTabsByWorktree,
     activeWorktreeId: state.activeWorktreeId,
     hideDefaultBranchWorkspace: state.hideDefaultBranchWorkspace,
-    repoMap
+    repoMap,
+    activeSpaceId: state.activeSpaceId,
+    repoSpaceAssignments: state.repoSpaceAssignments
   })
 }
