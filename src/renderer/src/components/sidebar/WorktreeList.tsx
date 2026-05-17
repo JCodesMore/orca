@@ -14,6 +14,8 @@ import {
 } from '@/store/selectors'
 import WorktreeCard from './WorktreeCard'
 import WorktreeCardAgents from './WorktreeCardAgents'
+import RepoAddToSpaceButton from './RepoAddToSpaceButton'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
@@ -453,6 +455,13 @@ const VirtualizedWorktreeViewport = React.memo(function VirtualizedWorktreeViewp
 
   const prCacheLen = useAppStore((s) => Object.keys(s.prCache).length)
   const issueCacheLen = useAppStore((s) => Object.keys(s.issueCache).length)
+  const spaces = useAppStore((s) => s.spaces)
+  const repoSpaceAssignments = useAppStore((s) => s.repoSpaceAssignments)
+  const setActiveSpace = useAppStore((s) => s.setActiveSpace)
+  // Why: badge/add-button logic below renders only in the All Projects view
+  // (activeSpaceId === null). Inside a specific space, the assignment is
+  // already implied by the active tab so showing it on every row is redundant.
+  const activeSpaceId = useAppStore((s) => s.activeSpaceId)
   const renderRowKeySignature = useMemo(
     () => renderRows.map(getRenderRowKey).join('\n'),
     [renderRows]
@@ -752,6 +761,10 @@ const VirtualizedWorktreeViewport = React.memo(function VirtualizedWorktreeViewp
           if (row.type === 'header') {
             const isRepoHeader = groupBy === 'repo' && row.repo !== undefined
             const repoIdForHeader = isRepoHeader ? row.repo!.id : undefined
+            const assignedSpace =
+              isRepoHeader && row.repo
+                ? (spaces.find((sp) => sp.id === repoSpaceAssignments[row.repo!.id]) ?? null)
+                : null
             const isDraggingThis =
               canReorderRepoHeaders &&
               repoDrag.state.draggingRepoId !== null &&
@@ -834,9 +847,47 @@ const VirtualizedWorktreeViewport = React.memo(function VirtualizedWorktreeViewp
                     <div className="truncate text-[13px] font-semibold leading-none">
                       {row.label}
                     </div>
-                    <div className="rounded-full bg-black/12 px-1.5 py-0.5 text-[9px] font-medium leading-none text-muted-foreground/90">
-                      {row.count}
-                    </div>
+                    {isRepoHeader ? (
+                      activeSpaceId === null ? (
+                        assignedSpace ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Badge
+                                variant="outline"
+                                role="button"
+                                tabIndex={0}
+                                className="h-[16px] shrink-0 cursor-pointer rounded border-foreground/20 bg-foreground/[0.06] px-1.5 text-[10px] font-medium leading-none text-foreground/70 transition-colors hover:bg-foreground/[0.12] hover:text-foreground"
+                                onClick={(e) => {
+                                  // Why: the parent row's onClick toggles
+                                  // group collapse — without stopPropagation
+                                  // the pill click would also fire that.
+                                  e.stopPropagation()
+                                  setActiveSpace(assignedSpace.id)
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' || e.key === ' ') {
+                                    e.preventDefault()
+                                    e.stopPropagation()
+                                    setActiveSpace(assignedSpace.id)
+                                  }
+                                }}
+                              >
+                                {assignedSpace.name}
+                              </Badge>
+                            </TooltipTrigger>
+                            <TooltipContent side="right" sideOffset={8}>
+                              Switch to {assignedSpace.name} space
+                            </TooltipContent>
+                          </Tooltip>
+                        ) : (
+                          <RepoAddToSpaceButton repoId={row.repo!.id} />
+                        )
+                      ) : null
+                    ) : (
+                      <div className="rounded-full bg-black/12 px-1.5 py-0.5 text-[9px] font-medium leading-none text-muted-foreground/90">
+                        {row.count}
+                      </div>
+                    )}
                   </div>
                 </div>
 

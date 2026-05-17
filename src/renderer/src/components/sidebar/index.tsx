@@ -33,7 +33,6 @@ function Sidebar({
   const repos = useAppStore((s) => s.repos)
   const fetchAllWorktrees = useAppStore((s) => s.fetchAllWorktrees)
   const spaces = useAppStore((s) => s.spaces)
-  const moveRepoToSpace = useAppStore((s) => s.moveRepoToSpace)
   const reorderSpaces = useAppStore((s) => s.reorderSpaces)
 
   // Why: 4px matches the tab-reorder + repo-reorder thresholds elsewhere in the
@@ -53,19 +52,10 @@ function Sidebar({
       const activeKind = active.data.current?.kind
       const overKind = over.data.current?.kind
 
-      // Repo dragged onto a Space tab → (re)assign or unassign.
-      if (activeKind === 'repo' && overKind === 'space') {
-        const repoId = active.data.current?.repoId as string | undefined
-        const spaceId = (over.data.current?.spaceId ?? null) as string | null
-        if (repoId) {
-          moveRepoToSpace(repoId, spaceId)
-        }
-        return
-      }
-
       // Space tab reorder — active.id and over.id are Space ids inside the
       // SortableContext. Build the new order by swapping active into over's
-      // index in the current sorted-by-order list.
+      // index in the current sorted-by-order list. Repo→Space drops do not
+      // come through here — those use native HTML5 drag handled in SpaceTab.
       if (activeKind === 'tab' && overKind === 'tab' && active.id !== over.id) {
         const sortedIds = [...spaces].sort((a, b) => a.order - b.order).map((s) => s.id)
         const fromIndex = sortedIds.indexOf(String(active.id))
@@ -79,7 +69,7 @@ function Sidebar({
         reorderSpaces(next)
       }
     },
-    [moveRepoToSpace, reorderSpaces, spaces]
+    [reorderSpaces, spaces]
   )
 
   const setLiveSidebarWidth = React.useCallback((width: number) => {
@@ -133,7 +123,7 @@ function Sidebar({
         {/* Resize handle */}
         <div
           data-sidebar-resize-handle=""
-          className="absolute top-0 right-0 h-full w-5 cursor-col-resize transition-colors z-10 before:absolute before:inset-y-0 before:right-0 before:w-1 before:transition-colors hover:before:bg-ring/20 active:before:bg-ring/30"
+          className="absolute top-0 right-0 h-full w-2 cursor-col-resize transition-colors z-10 before:absolute before:inset-y-0 before:right-0 before:w-1 before:transition-colors hover:before:bg-ring/20 active:before:bg-ring/30"
           onMouseDown={onResizeStart}
         />
       </div>

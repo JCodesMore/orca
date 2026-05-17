@@ -1,5 +1,4 @@
-import React, { useCallback, useEffect, useRef } from 'react'
-import { useDroppable } from '@dnd-kit/core'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import {
@@ -11,8 +10,8 @@ import {
 import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
 import type { Space } from '../../../../shared/types'
-
-export type SpaceTabDropData = { kind: 'space'; spaceId: string | null }
+import { hasRepoDragData } from './repo-drag-types'
+import { hasWorkspaceDragData } from './workspace-status'
 
 type SpaceTabProps = {
   // null means the permanent "All Projects" tab.
@@ -52,16 +51,6 @@ export default function SpaceTab({
   notificationCount = 0
 }: SpaceTabProps): React.JSX.Element {
   const isAllProjects = space === null
-  // Why: All Projects is rendered outside the SortableContext and never
-  // reorders, so it only needs a droppable target. User Spaces wrap both so
-  // they can be reordered AND accept dropped repos.
-  const droppableId = isAllProjects ? 'space-drop-all' : `space-drop-${space.id}`
-  const dropData: SpaceTabDropData = { kind: 'space', spaceId: space?.id ?? null }
-
-  const { setNodeRef: setDroppableRef, isOver } = useDroppable({
-    id: droppableId,
-    data: dropData
-  })
 
   const sortable = useSortable({
     id: space?.id ?? '__all_projects__',
@@ -69,6 +58,16 @@ export default function SpaceTab({
     disabled: isAllProjects
   })
 
+  const [isDragOver, setIsDragOver] = useState(false)
+  // Why: the actual drop is committed by useSpaceTabDocumentDrop in capture
+  // phase (preload's drop listener stopPropagation()s the bubble path).
+  // dragend on the source still propagates normally, so it's a reliable
+  // signal to clear the highlight after the drop completes or is cancelled.
+  useEffect(() => {
+    const onDragEnd = (): void => setIsDragOver(false)
+    document.addEventListener('dragend', onDragEnd, true)
+    return () => document.removeEventListener('dragend', onDragEnd, true)
+  }, [])
   const renameInputRef = useRef<HTMLInputElement>(null)
   useEffect(() => {
     if (!isRenaming) {
@@ -83,13 +82,42 @@ export default function SpaceTab({
 
   const setRefs = useCallback(
     (node: HTMLElement | null) => {
-      setDroppableRef(node)
       if (!isAllProjects) {
         sortable.setNodeRef(node)
       }
     },
-    [setDroppableRef, sortable, isAllProjects]
+    [sortable, isAllProjects]
   )
+
+  const acceptsDrag = useCallback((dataTransfer: DataTransfer) => {
+    return hasRepoDragData(dataTransfer) || hasWorkspaceDragData(dataTransfer)
+  }, [])
+
+  const onDragOver = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!acceptsDrag(event.dataTransfer)) {
+        return
+      }
+      // Why: preventDefault here tells the browser "this is a valid drop
+      // target" — without it the cursor stays as the red "no drop" symbol
+      // and onDrop never fires.
+      event.preventDefault()
+      event.dataTransfer.dropEffect = 'move'
+      if (!isDragOver) {
+        setIsDragOver(true)
+      }
+    },
+    [acceptsDrag, isDragOver]
+  )
+
+  const onDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    // Why: dragleave fires when crossing into a child element too. Only clear
+    // the highlight when the pointer truly leaves the tab.
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      return
+    }
+    setIsDragOver(false)
+  }, [])
 
   const style: React.CSSProperties = isAllProjects
     ? {}
@@ -107,6 +135,7 @@ export default function SpaceTab({
       style={style}
       data-active={isActive ? 'true' : 'false'}
       data-space-id={space?.id ?? 'all'}
+      data-space-drop-target={space?.id ?? 'all'}
       onClick={() => {
         if (isRenaming) {
           return
@@ -119,6 +148,8 @@ export default function SpaceTab({
         }
         onRequestRename()
       }}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
       {...(isAllProjects ? {} : sortable.attributes)}
       {...(isAllProjects || isRenaming ? {} : sortable.listeners)}
       className={cn(
@@ -126,7 +157,7 @@ export default function SpaceTab({
         isActive
           ? 'bg-sidebar-accent text-sidebar-accent-foreground'
           : 'text-muted-foreground hover:text-foreground',
-        isOver && 'ring-1 ring-sidebar-ring/60'
+        isDragOver && 'ring-1 ring-sidebar-ring/60'
       )}
     >
       {isRenaming ? (
