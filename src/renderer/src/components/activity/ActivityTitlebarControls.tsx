@@ -4,35 +4,15 @@ import { useAppStore } from '@/store'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { countUnreadAgentEvents } from '@/lib/agent-status-unread'
-import { migrationUnsupportedToAgentStatusEntry } from '@/lib/migration-unsupported-agent-entry'
+import { useAllAgentsUnreadCount } from '@/components/sidebar/use-space-notification-counts'
 
-// Why: per-pane unread accumulation lives in agent-status-unread.ts so the
-// per-Space pill badges share the same definition. "Mark all read" moved to
-// the thread-list overflow menu in ActivityPrototypePage so it lives next to
-// the cards it acts on.
-
-function useActivityUnreadCount(): number {
-  return useAppStore((s) => {
-    let count = 0
-    for (const [paneKey, entry] of Object.entries(s.agentStatusByPaneKey)) {
-      count += countUnreadAgentEvents(entry, s.acknowledgedAgentsByPaneKey[paneKey] ?? 0)
-    }
-    for (const [paneKey, retained] of Object.entries(s.retainedAgentsByPaneKey)) {
-      count += countUnreadAgentEvents(retained.entry, s.acknowledgedAgentsByPaneKey[paneKey] ?? 0)
-    }
-    for (const unsupported of Object.values(s.migrationUnsupportedByPtyId)) {
-      const entry = migrationUnsupportedToAgentStatusEntry(unsupported)
-      if (entry) {
-        count += countUnreadAgentEvents(entry, s.acknowledgedAgentsByPaneKey[entry.paneKey] ?? 0)
-      }
-    }
-    return count
-  })
-}
+// Why: the cross-Space total lives in use-space-notification-counts.ts so this
+// titlebar badge and the "All Projects" pill in the sidebar share one
+// definition. "Mark all read" moved to the thread-list overflow menu in
+// ActivityPrototypePage so it lives next to the cards it acts on.
 
 export function ActivityTitlebarControls(): React.JSX.Element {
-  const unreadCount = useActivityUnreadCount()
+  const unreadCount = useAllAgentsUnreadCount()
   const closeActivityPage = useAppStore((s) => s.closeActivityPage)
 
   return (

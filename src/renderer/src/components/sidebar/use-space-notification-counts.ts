@@ -9,13 +9,12 @@ import type { AppState } from '@/store'
  * Per-Space unread agent-event count, keyed by spaceId.
  *
  * Worktrees whose repo has no Space assignment are intentionally excluded —
- * they only appear under "All Projects", which never shows a badge to avoid
- * re-summarizing counts the user can already see on individual rows.
+ * those events are surfaced by `selectAllAgentsUnreadCount` instead, which
+ * powers the "All Projects" pill and the Activity titlebar badge.
  *
- * Why this matches `useActivityUnreadCount`: when every repo is assigned to
- * a space, the per-space totals sum exactly to the `Agents N` badge in the
- * titlebar. Both readers go through `countUnreadAgentEvents`, so the two
- * surfaces cannot drift.
+ * Why nothing drifts: every reader in this file routes through
+ * `countUnreadAgentEvents`, so the per-Space pills, the All Projects pill,
+ * and the titlebar share one definition of "unread".
  */
 export function selectSpaceNotificationCounts(state: AppState): Record<string, number> {
   const counts: Record<string, number> = {}
@@ -58,10 +57,7 @@ export function selectSpaceNotificationCounts(state: AppState): Record<string, n
   }
 
   for (const [paneKey, entry] of Object.entries(state.agentStatusByPaneKey)) {
-    const events = countUnreadAgentEvents(
-      entry,
-      state.acknowledgedAgentsByPaneKey[paneKey] ?? 0
-    )
+    const events = countUnreadAgentEvents(entry, state.acknowledgedAgentsByPaneKey[paneKey] ?? 0)
     if (events === 0) {
       continue
     }
@@ -111,4 +107,31 @@ export function selectSpaceNotificationCounts(state: AppState): Record<string, n
 
 export function useSpaceNotificationCounts(): Record<string, number> {
   return useAppStore(useShallow(selectSpaceNotificationCounts))
+}
+
+/**
+ * Total unread agent events across every repo — assigned, unassigned, retained,
+ * and migration-unsupported alike. Drives both the "All Projects" pill badge
+ * and the Activity titlebar count, so the two cannot diverge.
+ */
+export function selectAllAgentsUnreadCount(state: AppState): number {
+  let count = 0
+  for (const [paneKey, entry] of Object.entries(state.agentStatusByPaneKey)) {
+    count += countUnreadAgentEvents(entry, state.acknowledgedAgentsByPaneKey[paneKey] ?? 0)
+  }
+  for (const [paneKey, retained] of Object.entries(state.retainedAgentsByPaneKey)) {
+    count += countUnreadAgentEvents(retained.entry, state.acknowledgedAgentsByPaneKey[paneKey] ?? 0)
+  }
+  for (const unsupported of Object.values(state.migrationUnsupportedByPtyId)) {
+    const entry = migrationUnsupportedToAgentStatusEntry(unsupported)
+    if (!entry) {
+      continue
+    }
+    count += countUnreadAgentEvents(entry, state.acknowledgedAgentsByPaneKey[entry.paneKey] ?? 0)
+  }
+  return count
+}
+
+export function useAllAgentsUnreadCount(): number {
+  return useAppStore(selectAllAgentsUnreadCount)
 }
