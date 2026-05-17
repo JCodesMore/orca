@@ -700,6 +700,63 @@ describe('terminal slice behaviors', () => {
     expect(store.getState().ptyIdsByTabId['tab-1']).toEqual(['pty-1', 'pty-2'])
   })
 
+  it('does not persist worktree activity when attaching a mirrored remote runtime PTY', () => {
+    const store = createTestStore()
+    const worktreeId = 'repo1::/path/wt1'
+
+    store.setState({
+      repos: [
+        { id: 'repo1', path: '/repo1', displayName: 'Repo 1', badgeColor: '#000', addedAt: 0 }
+      ],
+      worktreesByRepo: {
+        repo1: [
+          makeWorktree({ id: worktreeId, repoId: 'repo1', path: '/path/wt1', lastActivityAt: 1000 })
+        ]
+      },
+      tabsByWorktree: {
+        [worktreeId]: [makeTab({ id: 'tab-1', worktreeId })]
+      }
+    })
+
+    store.getState().updateTabPtyId('tab-1', 'remote:web-env@@terminal-1')
+
+    expect(store.getState().worktreesByRepo.repo1[0].lastActivityAt).toBe(1000)
+    expect(mockApi.worktrees.updateMeta).not.toHaveBeenCalled()
+  })
+
+  it('does not persist worktree activity when clearing a mirrored remote runtime PTY', () => {
+    const store = createTestStore()
+    const worktreeId = 'repo1::/path/wt1'
+
+    store.setState({
+      repos: [
+        { id: 'repo1', path: '/repo1', displayName: 'Repo 1', badgeColor: '#000', addedAt: 0 }
+      ],
+      worktreesByRepo: {
+        repo1: [
+          makeWorktree({ id: worktreeId, repoId: 'repo1', path: '/path/wt1', lastActivityAt: 1000 })
+        ]
+      },
+      tabsByWorktree: {
+        [worktreeId]: [
+          makeTab({
+            id: 'tab-1',
+            worktreeId,
+            ptyId: 'remote:web-env@@terminal-1'
+          })
+        ]
+      },
+      ptyIdsByTabId: {
+        'tab-1': ['remote:web-env@@terminal-1']
+      }
+    })
+
+    store.getState().clearTabPtyId('tab-1', 'remote:web-env@@terminal-1')
+
+    expect(store.getState().worktreesByRepo.repo1[0].lastActivityAt).toBe(1000)
+    expect(mockApi.worktrees.updateMeta).not.toHaveBeenCalled()
+  })
+
   // Why: clicking a worktree in the sidebar triggers a generation bump on
   // dead-PTY tabs which remounts TerminalPane and fresh-spawns a PTY. That
   // fresh spawn calls updateTabPtyId → bumpWorktreeActivity. Without the

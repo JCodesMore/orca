@@ -31,6 +31,7 @@ import {
 import { normalizeTerminalLayoutSnapshot } from '@/components/terminal-pane/terminal-layout-leaf-ids'
 import { shutdownBufferCaptures } from '@/components/terminal-pane/shutdown-buffer-captures'
 import { callRuntimeRpc, getActiveRuntimeTarget } from '@/runtime/runtime-rpc-client'
+import { parseRemoteRuntimePtyId } from '@/runtime/runtime-terminal-stream'
 import { createBrowserUuid } from '@/lib/browser-uuid'
 import { hasWorktreeSleepIntent } from '@/lib/worktree-sleep-intent'
 
@@ -49,6 +50,10 @@ function getNextTerminalOrdinal(tabs: TerminalTab[]): number {
     nextOrdinal += 1
   }
   return nextOrdinal
+}
+
+function isRemoteRuntimePtyId(ptyId: string | null | undefined): boolean {
+  return typeof ptyId === 'string' && parseRemoteRuntimePtyId(ptyId) !== null
 }
 
 function getFallbackTabTitle(tab: TerminalTab, index?: number): string {
@@ -950,6 +955,7 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
   updateTabPtyId: (tabId, ptyId) => {
     let worktreeId: string | null = null
     let wasActivationSpawn = false
+    const isRemoteRuntimeMirror = isRemoteRuntimePtyId(ptyId)
     set((s) => {
       const next = { ...s.tabsByWorktree }
       for (const wId of Object.keys(next)) {
@@ -974,6 +980,8 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
           // legitimate respawn (e.g. the user restarting a codex tab) would
           // also be classified as activation and silently dropped from the
           // recency sort.
+          // Remote runtime PTY ids are mirrored host state. Attaching them
+          // in this client must not write host worktree activity metadata.
           const { pendingActivationSpawn: _unused, ...rest } = t
           void _unused
           return {
@@ -1015,7 +1023,7 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
     // stamp and the sortEpoch bump so the sidebar does not reorder on click.
     // Other spawn reasons (new tab, codex restart, reconnect) still flow
     // through bumpWorktreeActivity as a normal activity signal.
-    if (worktreeId && !wasActivationSpawn) {
+    if (worktreeId && !wasActivationSpawn && !isRemoteRuntimeMirror) {
       get().bumpWorktreeActivity(worktreeId)
     }
   },
@@ -1023,6 +1031,7 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
   clearTabPtyId: (tabId, ptyId) => {
     let worktreeId: string | null = null
     let wasActivationSpawn = false
+    let isRemoteRuntimeMirror = isRemoteRuntimePtyId(ptyId)
     set((s) => {
       const next = { ...s.tabsByWorktree }
       for (const wId of Object.keys(next)) {
@@ -1035,6 +1044,11 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
           }
           if (t.pendingActivationSpawn) {
             wasActivationSpawn = true
+          }
+          if (!ptyId) {
+            const currentPtyIds = s.ptyIdsByTabId[tabId] ?? []
+            isRemoteRuntimeMirror =
+              currentPtyIds.length > 0 && currentPtyIds.every((id) => isRemoteRuntimePtyId(id))
           }
           const remainingPtyIds = ptyId
             ? (s.ptyIdsByTabId[tabId] ?? []).filter((id) => id !== ptyId)
@@ -1089,6 +1103,7 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
     if (
       worktreeId &&
       !wasActivationSpawn &&
+      !isRemoteRuntimeMirror &&
       !hasWorktreeSleepIntent(worktreeId) &&
       !(ptyId && get().suppressedPtyExitIds[ptyId])
     ) {
