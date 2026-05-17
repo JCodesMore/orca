@@ -465,12 +465,9 @@ const WorktreeCard = React.memo(function WorktreeCard({
               {worktree.isMainWorktree && !isFolder && (
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <Badge
-                      variant="outline"
-                      className="h-[16px] px-1.5 text-[10px] font-medium rounded shrink-0 leading-none text-foreground/70 border-foreground/20 bg-foreground/[0.06]"
-                    >
+                    <span className="shrink-0 text-[9px] font-medium uppercase tracking-wide leading-none text-muted-foreground/55">
                       primary
-                    </Badge>
+                    </span>
                   </TooltipTrigger>
                   <TooltipContent side="right" sideOffset={8}>
                     Primary worktree (original clone directory)
