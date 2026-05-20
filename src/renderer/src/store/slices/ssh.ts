@@ -54,7 +54,6 @@ export type SshSlice = {
   setRemoteWorkspaceSyncStatus: (targetId: string, status: RemoteWorkspaceSyncStatus) => void
   enqueueSshCredentialRequest: (req: SshCredentialRequest) => void
   removeSshCredentialRequest: (requestId: string) => void
-  bumpSshConnectedGeneration: () => void
   setPortForwards: (targetId: string, forwards: PortForwardEntry[]) => void
   clearPortForwards: (targetId: string) => void
   setDetectedPorts: (targetId: string, ports: DetectedPort[]) => void
@@ -74,8 +73,15 @@ export const createSshSlice: StateCreator<AppState, [], [], SshSlice> = (set) =>
   setSshConnectionState: (targetId, state) =>
     set((s) => {
       const next = new Map(s.sshConnectionStates)
+      const previous = next.get(targetId)
       next.set(targetId, state)
-      return { sshConnectionStates: next }
+      return {
+        sshConnectionStates: next,
+        sshConnectedGeneration:
+          previous?.status !== 'connected' && state.status === 'connected'
+            ? s.sshConnectedGeneration + 1
+            : s.sshConnectedGeneration
+      }
     }),
 
   setSshTargetLabels: (labels) => set({ sshTargetLabels: labels }),
@@ -111,8 +117,6 @@ export const createSshSlice: StateCreator<AppState, [], [], SshSlice> = (set) =>
     set((s) => ({
       sshCredentialQueue: s.sshCredentialQueue.filter((req) => req.requestId !== requestId)
     })),
-  bumpSshConnectedGeneration: () =>
-    set((s) => ({ sshConnectedGeneration: s.sshConnectedGeneration + 1 })),
 
   setPortForwards: (targetId, forwards) =>
     set((s) => {

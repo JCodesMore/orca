@@ -1,10 +1,11 @@
-import { type ReactNode, useState } from 'react'
+import { type ReactNode, useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import type { GlobalSettings } from '../../../../shared/types'
 import { Button } from '../ui/button'
 import { Label } from '../ui/label'
 import { Separator } from '../ui/separator'
-import { BellRing, Bot, FileAudio, Siren, X } from 'lucide-react'
+import { Slider } from '../ui/slider'
+import { BellRing, Bot, FileAudio, Siren, Volume2, X } from 'lucide-react'
 import type { SettingsSearchEntry } from './settings-search'
 import { basename } from '@/lib/path'
 
@@ -36,6 +37,11 @@ export const NOTIFICATIONS_PANE_SEARCH_ENTRIES: SettingsSearchEntry[] = [
     keywords: ['notifications', 'sound', 'audio', 'mp3', 'wav', 'ogg', 'm4a', 'aac', 'flac']
   },
   {
+    title: 'Notification Volume',
+    description: 'Playback volume for the custom notification sound.',
+    keywords: ['notifications', 'sound', 'volume', 'loudness']
+  },
+  {
     title: 'Send Test Notification',
     description: 'Trigger a sample desktop notification using the native delivery path.',
     keywords: ['notifications', 'test']
@@ -47,37 +53,101 @@ type NotificationsPaneProps = {
   updateSettings: (updates: Partial<GlobalSettings>) => void
 }
 
+function getRendererNotificationPermission(): NotificationPermission | null {
+  if (typeof window.Notification === 'undefined') {
+    return null
+  }
+  return window.Notification.permission
+}
+
+function showNotificationPermissionDeniedToast(): void {
+  toast.error('Notifications are blocked in macOS', {
+    description: 'Enable notifications for this Orca app in System Settings.',
+    action: {
+      label: 'Open Settings',
+      onClick: () => {
+        void window.api.notifications.openSystemSettings()
+      }
+    }
+  })
+}
+
 export function NotificationsPane({
   settings,
   updateSettings
 }: NotificationsPaneProps): React.JSX.Element {
   const notificationSettings = settings.notifications
+  const notificationSettingsRef = useRef(notificationSettings)
   const [isPickingSound, setIsPickingSound] = useState(false)
 
   const updateNotificationSettings = (updates: Partial<GlobalSettings['notifications']>): void => {
     updateSettings({
       notifications: {
-        ...notificationSettings,
+        ...notificationSettingsRef.current,
         ...updates
       }
     })
   }
 
+  // Why: keep dragging local and persist only on Radix's commit event. That
+  // avoids IPC on every tick without a debounce timer that can race settings updates.
+  const [volumeDraft, setVolumeDraft] = useState(notificationSettings.customSoundVolume)
+
+  useEffect(() => {
+    notificationSettingsRef.current = notificationSettings
+    setVolumeDraft(notificationSettings.customSoundVolume)
+  }, [notificationSettings])
+
+  const handleVolumeCommit = (value: number): void => {
+    if (notificationSettingsRef.current.customSoundVolume !== value) {
+      updateNotificationSettings({ customSoundVolume: value })
+    }
+  }
+
   const handleSendTestNotification = async (): Promise<void> => {
+    // Why: Electron main cannot reliably read macOS notification authorization,
+    // but the renderer exposes it. Without this check, dev builds can report
+    // "sent" while macOS silently drops the notification.
+    if (getRendererNotificationPermission() === 'denied') {
+      showNotificationPermissionDeniedToast()
+      return
+    }
+
+    const permissionStatus = await window.api.notifications.getPermissionStatus()
+    if (!permissionStatus.supported) {
+      toast.error('Notifications are not supported on this system')
+      return
+    }
+
     const result = await window.api.notifications.dispatch({ source: 'test' })
     if (result.delivered) {
       // Why: the Test button must always play through, even if the user clicks
       // it twice in quick succession — the in-flight dedupe is for incidental
       // bursts of real notifications, not for an explicit user action.
       const soundResult = notificationSettings.customSoundPath
-        ? await window.api.notifications.playSound({ force: true })
+        ? await window.api.notifications.playSound({
+            force: true,
+            volume: volumeDraft
+          })
         : null
       if (notificationSettings.customSoundPath && soundResult && !soundResult.played) {
         toast.error('Custom notification sound could not be played')
         return
       }
       toast.success('Test notification sent')
+      return
     }
+
+    if (getRendererNotificationPermission() === 'denied') {
+      showNotificationPermissionDeniedToast()
+      return
+    }
+
+    toast.error(
+      result.reason === 'disabled'
+        ? 'Notifications are disabled'
+        : 'Test notification was not delivered'
+    )
   }
 
   const handleChooseSound = async (): Promise<void> => {
@@ -187,6 +257,25 @@ export function NotificationsPane({
             </Button>
           ) : null}
         </div>
+        {selectedSoundPath ? (
+          <div className="flex items-center gap-3 pt-1">
+            <Volume2 className="size-4 text-muted-foreground" />
+            <Slider
+              value={[volumeDraft]}
+              min={0}
+              max={100}
+              step={5}
+              disabled={!notificationSettings.enabled}
+              onValueChange={([value]) => setVolumeDraft(value)}
+              onValueCommit={([value]) => handleVolumeCommit(value)}
+              className="flex-1"
+              aria-label="Notification sound volume"
+            />
+            <span className="w-10 text-right font-mono text-xs tabular-nums text-muted-foreground">
+              {volumeDraft}%
+            </span>
+          </div>
+        ) : null}
       </div>
 
       <Separator />

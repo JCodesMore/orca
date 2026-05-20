@@ -3,6 +3,7 @@ merge actions, and conflict state in one component to keep the data flow straigh
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { LoaderCircle, ExternalLink, RefreshCw, Check, X, Pencil } from 'lucide-react'
 import { useAppStore } from '@/store'
+import { prChecksCacheSuffix, prCommentsCacheSuffix } from '@/store/slices/github'
 import { useActiveWorktree, useRepoById } from '@/store/selectors'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -43,6 +44,7 @@ export default function ChecksPanel(): React.JSX.Element {
   const getHostedReviewCreationEligibility = useAppStore(
     (s) => s.getHostedReviewCreationEligibility
   )
+  const enqueueGitHubPRRefresh = useAppStore((s) => s.enqueueGitHubPRRefresh)
   const gitConflictOperationByWorktree = useAppStore((s) => s.gitConflictOperationByWorktree)
   const gitStatusByWorktree = useAppStore((s) => s.gitStatusByWorktree)
   const remoteStatusesByWorktree = useAppStore((s) => s.remoteStatusesByWorktree)
@@ -82,6 +84,8 @@ export default function ChecksPanel(): React.JSX.Element {
   const prevChecksRef = useRef<string>('')
   const conflictSummaryRefreshKeyRef = useRef<string | null>(null)
   const asyncResultKeyRef = useRef<string>('')
+  const refreshRequestKeyRef = useRef<string | null>(null)
+  const refreshContextKeyRef = useRef<string | null>(null)
 
   // Why: the sidebar no longer uses key={activeWorktreeId} to force a full
   // remount on worktree switch (that caused an IPC storm on Windows).
@@ -102,13 +106,22 @@ export default function ChecksPanel(): React.JSX.Element {
     setCreatePrDialogOpen(false)
     setCreatePrPushFirst(false)
     conflictSummaryRefreshKeyRef.current = null
+    refreshRequestKeyRef.current = null
   }
 
   // Find active worktree and repo
   const branch = activeWorktree ? activeWorktree.branch.replace(/^refs\/heads\//, '') : ''
   const isFolder = repo ? isFolderRepo(repo) : false
   const prCacheKey = repo && branch ? `${repo.id}::${branch}` : ''
+  const refreshContextKey = `${activeWorktreeId ?? ''}::${repo?.id ?? ''}::${branch}`
+  if (refreshContextKey !== refreshContextKeyRef.current) {
+    refreshContextKeyRef.current = refreshContextKey
+    refreshRequestKeyRef.current = null
+  }
   const pr: PRInfo | null = prCacheKey ? (prCache[prCacheKey]?.data ?? null) : null
+  const prRefreshState = useAppStore((s) =>
+    prCacheKey ? s.prRefreshStates[prCacheKey] : undefined
+  )
   const prNumber = pr?.number ?? null
   const remoteStatus = activeWorktreeId ? remoteStatusesByWorktree[activeWorktreeId] : undefined
   const hasUncommittedChanges = activeWorktreeId
@@ -124,8 +137,10 @@ export default function ChecksPanel(): React.JSX.Element {
   const prFetchedAt = useAppStore((s) =>
     prCacheKey ? s.prCache[prCacheKey]?.fetchedAt : undefined
   )
-  const checksCacheKey = repo && prNumber ? `${repo.id}::pr-checks::${prNumber}` : ''
-  const commentsCacheKey = repo && prNumber ? `${repo.id}::pr-comments::${prNumber}` : ''
+  const checksCacheKey =
+    repo && prNumber ? `${repo.id}::${prChecksCacheSuffix(prNumber, pr?.prRepo)}` : ''
+  const commentsCacheKey =
+    repo && prNumber ? `${repo.id}::${prCommentsCacheSuffix(prNumber, pr?.prRepo)}` : ''
   const checksFetchedAt = useAppStore((s) =>
     checksCacheKey ? s.checksCache[checksCacheKey]?.fetchedAt : undefined
   )
@@ -139,7 +154,8 @@ export default function ChecksPanel(): React.JSX.Element {
   const linkedPR = activeWorktree?.linkedPR ?? null
   const linkedGitLabMR = activeWorktree?.linkedGitLabMR ?? null
   const activeWorktreePath = activeWorktree?.path ?? null
-  const stateRequestKey = repo && branch ? checksPanelAsyncResultKey(repo.id, branch, prNumber) : ''
+  const stateRequestKey =
+    repo && branch ? checksPanelAsyncResultKey(repo.id, branch, prNumber, pr?.prRepo) : ''
   asyncResultKeyRef.current = stateRequestKey
 
   const isCurrentAsyncResult = useCallback(
@@ -148,10 +164,12 @@ export default function ChecksPanel(): React.JSX.Element {
     []
   )
   useEffect(() => {
-    if (repo && !isFolder && branch) {
-      void fetchPRForBranch(repo.path, branch, { repoId: repo.id, linkedPRNumber: linkedPR })
+    if (isPanelVisible && repo && !isFolder && branch) {
+      if (activeWorktreeId) {
+        enqueueGitHubPRRefresh(activeWorktreeId, 'swr', 30)
+      }
     }
-  }, [repo, isFolder, branch, linkedPR, fetchPRForBranch])
+  }, [repo, isFolder, branch, activeWorktreeId, enqueueGitHubPRRefresh, isPanelVisible])
 
   useEffect(() => {
     if (!repo || isFolder || !branch || !isPanelVisible) {
@@ -198,7 +216,14 @@ export default function ChecksPanel(): React.JSX.Element {
   ])
 
   useEffect(() => {
-    if (!repo || isFolder || !branch || !pr || pr.mergeable !== 'CONFLICTING') {
+    if (
+      !repo ||
+      isFolder ||
+      !branch ||
+      !pr ||
+      pr.mergeable !== 'CONFLICTING' ||
+      !activeWorktreeId
+    ) {
       conflictSummaryRefreshKeyRef.current = null
       setConflictDetailsRefreshing(false)
       return
@@ -227,7 +252,7 @@ export default function ChecksPanel(): React.JSX.Element {
         setConflictDetailsRefreshing(false)
       }
     })
-  }, [repo, isFolder, branch, pr, linkedPR, fetchPRForBranch])
+  }, [repo, isFolder, branch, pr, activeWorktreeId, linkedPR, fetchPRForBranch])
 
   // Fetch checks via cached store method
   const fetchChecks = useCallback(
@@ -241,11 +266,18 @@ export default function ChecksPanel(): React.JSX.Element {
       }
       setChecksLoading(true)
       try {
-        const requestKey = checksPanelAsyncResultKey(repo.id, branch, targetPRNumber)
-        const result = await fetchPRChecks(repo.path, targetPRNumber, branch, pr?.headSha, {
-          force,
-          repoId: repo.id
-        })
+        const requestKey = checksPanelAsyncResultKey(repo.id, branch, targetPRNumber, pr?.prRepo)
+        const result = await fetchPRChecks(
+          repo.path,
+          targetPRNumber,
+          branch,
+          pr?.headSha,
+          pr?.prRepo,
+          {
+            force,
+            repoId: repo.id
+          }
+        )
         if (!isCurrentAsyncResult(requestKey)) {
           return
         }
@@ -260,18 +292,26 @@ export default function ChecksPanel(): React.JSX.Element {
             : 30_000
         prevChecksRef.current = signature
       } catch (err) {
-        if (!isCurrentAsyncResult(checksPanelAsyncResultKey(repo.id, branch, targetPRNumber))) {
+        if (
+          !isCurrentAsyncResult(
+            checksPanelAsyncResultKey(repo.id, branch, targetPRNumber, pr?.prRepo)
+          )
+        ) {
           return
         }
         console.warn('Failed to fetch PR checks:', err)
         setChecks([])
       } finally {
-        if (isCurrentAsyncResult(checksPanelAsyncResultKey(repo.id, branch, targetPRNumber))) {
+        if (
+          isCurrentAsyncResult(
+            checksPanelAsyncResultKey(repo.id, branch, targetPRNumber, pr?.prRepo)
+          )
+        ) {
           setChecksLoading(false)
         }
       }
     },
-    [repo, prNumber, branch, pr?.headSha, fetchPRChecks, isCurrentAsyncResult]
+    [repo, prNumber, branch, pr?.headSha, pr?.prRepo, fetchPRChecks, isCurrentAsyncResult]
   )
 
   // Fetch checks on mount + poll with exponential backoff
@@ -312,33 +352,51 @@ export default function ChecksPanel(): React.JSX.Element {
   const fetchComments = useCallback(
     async ({
       force = false,
-      prNumberOverride
-    }: { force?: boolean; prNumberOverride?: number | null } = {}) => {
+      prNumberOverride,
+      prRepoOverride
+    }: {
+      force?: boolean
+      prNumberOverride?: number | null
+      prRepoOverride?: PRInfo['prRepo'] | null
+    } = {}) => {
       const targetPRNumber = prNumberOverride ?? prNumber
+      const targetPRRepo = prRepoOverride ?? pr?.prRepo
       if (!repo || !targetPRNumber) {
         return
       }
       setCommentsLoading(true)
       try {
-        const requestKey = checksPanelAsyncResultKey(repo.id, branch, targetPRNumber)
-        const result = await fetchPRComments(repo.path, targetPRNumber, { force, repoId: repo.id })
+        const requestKey = checksPanelAsyncResultKey(repo.id, branch, targetPRNumber, targetPRRepo)
+        const result = await fetchPRComments(repo.path, targetPRNumber, {
+          force,
+          repoId: repo.id,
+          prRepo: targetPRRepo
+        })
         if (!isCurrentAsyncResult(requestKey)) {
           return
         }
         setComments(result)
       } catch (err) {
-        if (!isCurrentAsyncResult(checksPanelAsyncResultKey(repo.id, branch, targetPRNumber))) {
+        if (
+          !isCurrentAsyncResult(
+            checksPanelAsyncResultKey(repo.id, branch, targetPRNumber, targetPRRepo)
+          )
+        ) {
           return
         }
         console.warn('Failed to fetch PR comments:', err)
         setComments([])
       } finally {
-        if (isCurrentAsyncResult(checksPanelAsyncResultKey(repo.id, branch, targetPRNumber))) {
+        if (
+          isCurrentAsyncResult(
+            checksPanelAsyncResultKey(repo.id, branch, targetPRNumber, targetPRRepo)
+          )
+        ) {
           setCommentsLoading(false)
         }
       }
     },
-    [repo, prNumber, fetchPRComments, branch, isCurrentAsyncResult]
+    [repo, prNumber, pr?.prRepo, fetchPRComments, branch, isCurrentAsyncResult]
   )
 
   useEffect(() => {
@@ -350,7 +408,7 @@ export default function ChecksPanel(): React.JSX.Element {
     // state after the user switches worktrees, showing the wrong PR's comments.
     let cancelled = false
     setCommentsLoading(true)
-    void fetchPRComments(repo.path, prNumber, { repoId: repo.id }).then(
+    void fetchPRComments(repo.path, prNumber, { repoId: repo.id, prRepo: pr?.prRepo }).then(
       (result) => {
         if (!cancelled) {
           setComments(result)
@@ -367,14 +425,16 @@ export default function ChecksPanel(): React.JSX.Element {
     return () => {
       cancelled = true
     }
-  }, [repo, prNumber, isPanelVisible, fetchPRComments])
+  }, [repo, prNumber, pr?.prRepo, isPanelVisible, fetchPRComments])
 
   const handleRefresh = useCallback(async () => {
     if (!repo || !branch) {
       return
     }
-    const initialRequestKey = checksPanelAsyncResultKey(repo.id, branch, prNumber)
-    let activeRefreshKey = initialRequestKey
+    const initialRequestKey = checksPanelAsyncResultKey(repo.id, branch, prNumber, pr?.prRepo)
+    const refreshRequestKey = `${activeWorktreeId ?? ''}::${repo.id}::${branch}::${Date.now()}::${Math.random()}`
+    refreshRequestKeyRef.current = refreshRequestKey
+    const isCurrentRequest = (): boolean => refreshRequestKeyRef.current === refreshRequestKey
     setIsRefreshing(true)
     try {
       const refreshedPR = await fetchPRForBranch(repo.path, branch, {
@@ -382,6 +442,9 @@ export default function ChecksPanel(): React.JSX.Element {
         repoId: repo.id,
         linkedPRNumber: linkedPR
       })
+      if (!isCurrentRequest()) {
+        return
+      }
       await refreshHostedReviewCard(fetchHostedReviewForBranch, {
         repoPath: repo.path,
         repoId: repo.id,
@@ -389,15 +452,22 @@ export default function ChecksPanel(): React.JSX.Element {
         linkedGitHubPR: refreshedPR?.number ?? linkedPR,
         linkedGitLabMR
       })
+      if (!isCurrentRequest()) {
+        return
+      }
       if (refreshedPR) {
-        const requestKey = checksPanelAsyncResultKey(repo.id, branch, refreshedPR.number)
-        if (!isCurrentAsyncResult(initialRequestKey) && !isCurrentAsyncResult(requestKey)) {
+        const prRequestKey = checksPanelAsyncResultKey(
+          repo.id,
+          branch,
+          refreshedPR.number,
+          refreshedPR.prRepo
+        )
+        if (!isCurrentAsyncResult(initialRequestKey) && !isCurrentRequest()) {
           return
         }
         // Why: a forced PR refresh can discover the PR number before React has
         // repainted from prCache; make this refresh's follow-up checks current.
-        asyncResultKeyRef.current = requestKey
-        activeRefreshKey = requestKey
+        asyncResultKeyRef.current = prRequestKey
         // Why: call fetchPRChecks directly with the refreshed PR's headSha so
         // we don't pass the stale headSha captured by `fetchChecks`'s closure
         // before the PR refresh completed (covers external force-pushes and
@@ -407,10 +477,11 @@ export default function ChecksPanel(): React.JSX.Element {
           refreshedPR.number,
           branch,
           refreshedPR.headSha,
+          refreshedPR.prRepo,
           { force: true, repoId: repo.id }
         ).then(
           (result) => {
-            if (!isCurrentAsyncResult(requestKey)) {
+            if (!isCurrentRequest() || !isCurrentAsyncResult(prRequestKey)) {
               return
             }
             setChecks(result)
@@ -424,7 +495,7 @@ export default function ChecksPanel(): React.JSX.Element {
             prevChecksRef.current = signature
           },
           (err) => {
-            if (!isCurrentAsyncResult(requestKey)) {
+            if (!isCurrentRequest() || !isCurrentAsyncResult(prRequestKey)) {
               return
             }
             console.warn('Failed to fetch PR checks:', err)
@@ -432,39 +503,80 @@ export default function ChecksPanel(): React.JSX.Element {
           }
         )
         setChecksLoading(true)
-        const refreshedComments = fetchComments({
+        setCommentsLoading(true)
+        const refreshedComments = fetchPRComments(repo.path, refreshedPR.number, {
           force: true,
-          prNumberOverride: refreshedPR.number
-        })
+          repoId: repo.id,
+          prRepo: refreshedPR.prRepo
+        }).then(
+          (result) => {
+            if (isCurrentRequest() && isCurrentAsyncResult(prRequestKey)) {
+              setComments(result)
+            }
+          },
+          (err) => {
+            if (!isCurrentRequest() || !isCurrentAsyncResult(prRequestKey)) {
+              return
+            }
+            console.warn('Failed to fetch PR comments:', err)
+            setComments([])
+          }
+        )
         await Promise.all([
           refreshedChecks.finally(() => {
-            if (isCurrentAsyncResult(requestKey)) {
+            if (isCurrentRequest() && isCurrentAsyncResult(prRequestKey)) {
               setChecksLoading(false)
             }
           }),
-          refreshedComments
+          refreshedComments.finally(() => {
+            if (isCurrentRequest() && isCurrentAsyncResult(prRequestKey)) {
+              setCommentsLoading(false)
+            }
+          })
         ])
-      } else if (isCurrentAsyncResult(initialRequestKey)) {
+      } else if (isCurrentRequest()) {
         setChecks([])
         setComments([])
       }
     } finally {
-      if (isCurrentAsyncResult(activeRefreshKey)) {
+      if (isCurrentRequest()) {
         setIsRefreshing(false)
       }
     }
   }, [
     repo,
     branch,
+    activeWorktreeId,
     prNumber,
+    pr?.prRepo,
     linkedPR,
     linkedGitLabMR,
     fetchPRForBranch,
     fetchPRChecks,
-    fetchComments,
+    fetchPRComments,
     fetchHostedReviewForBranch,
     isCurrentAsyncResult
   ])
+
+  const handleEntryRefresh = useCallback(
+    (options: { refreshChecks: boolean; refreshComments: boolean }) => {
+      if (!repo || !branch || !activeWorktreeId) {
+        return
+      }
+      // Why: entering the Checks tab is automatic UI behavior, not an explicit
+      // user refresh. Route PR refresh through the coordinator so rate-limit
+      // guards still apply; only force detail panes that the entry freshness rule
+      // already proved stale, so tab entry stays fresh without broad fan-out.
+      enqueueGitHubPRRefresh(activeWorktreeId, 'active', 80)
+      if (options.refreshChecks) {
+        void fetchChecks({ force: true })
+      }
+      if (options.refreshComments) {
+        void fetchComments({ force: true })
+      }
+    },
+    [repo, branch, activeWorktreeId, enqueueGitHubPRRefresh, fetchChecks, fetchComments]
+  )
 
   // Why: force a freshness check on each "entry" into the Checks tab so PRs
   // opened outside Orca, externally force-pushed heads, and stale checks/comments
@@ -473,7 +585,7 @@ export default function ChecksPanel(): React.JSX.Element {
   // docs/refresh-on-checks-tab.md.
   const entryKey =
     isPanelVisible && repo && !isFolder && branch
-      ? `${activeWorktreeId ?? ''}::${repo.path}::${branch}`
+      ? `${activeWorktreeId ?? ''}::${repo.id}::${branch}`
       : ''
   const lastEntryKeyRef = useRef<string>('')
   useEffect(() => {
@@ -489,24 +601,30 @@ export default function ChecksPanel(): React.JSX.Element {
     }
     lastEntryKeyRef.current = entryKey
 
+    const now = Date.now()
     const stale = shouldEntryRefresh({
       prFetchedAt,
       checksFetchedAt,
       commentsFetchedAt,
       prNumber,
-      now: Date.now(),
+      now,
       graceMs: ENTRY_REFRESH_GRACE_MS
     })
     if (!stale) {
       return
     }
+    const cutoff = now - ENTRY_REFRESH_GRACE_MS
+    const refreshChecks =
+      prNumber !== null && (checksFetchedAt === undefined || checksFetchedAt < cutoff)
+    const refreshComments =
+      prNumber !== null && (commentsFetchedAt === undefined || commentsFetchedAt < cutoff)
 
     // Reset polling attention state so the forced fetch's signature establishes
     // a fresh baseline rather than colliding with the previous PR's backoff.
     pollIntervalRef.current = 30_000
     prevChecksRef.current = ''
-    void handleRefresh()
-  }, [entryKey, prFetchedAt, checksFetchedAt, commentsFetchedAt, prNumber, handleRefresh])
+    handleEntryRefresh({ refreshChecks, refreshComments })
+  }, [entryKey, prFetchedAt, checksFetchedAt, commentsFetchedAt, prNumber, handleEntryRefresh])
 
   const handleStartEdit = useCallback(() => {
     if (!pr) {
@@ -533,7 +651,8 @@ export default function ChecksPanel(): React.JSX.Element {
         repoPath: repo.path,
         repoId: repo.id,
         prNumber: pr.number,
-        title: titleDraft.trim()
+        title: titleDraft.trim(),
+        prRepo: pr.prRepo ?? null
       })
       if (ok) {
         // Re-fetch PR to get updated title
@@ -566,20 +685,21 @@ export default function ChecksPanel(): React.JSX.Element {
       if (!repo || !prNumber) {
         return
       }
-      void resolveReviewThread(repo.path, prNumber, threadId, resolve, { repoId: repo.id }).then(
-        (ok) => {
-          if (ok) {
-            // Update local state to match the optimistic store update
-            setComments((prev) =>
-              prev.map((c) => (c.threadId === threadId ? { ...c, isResolved: resolve } : c))
-            )
-          } else {
-            toast.error('Could not update review thread. Check the GitHub API budget.')
-          }
+      void resolveReviewThread(repo.path, prNumber, threadId, resolve, {
+        repoId: repo.id,
+        prRepo: pr?.prRepo
+      }).then((ok) => {
+        if (ok) {
+          // Update local state to match the optimistic store update
+          setComments((prev) =>
+            prev.map((c) => (c.threadId === threadId ? { ...c, isResolved: resolve } : c))
+          )
+        } else {
+          toast.error('Could not update review thread. Check the GitHub API budget.')
         }
-      )
+      })
     },
-    [repo, prNumber, resolveReviewThread]
+    [repo, prNumber, pr?.prRepo, resolveReviewThread]
   )
 
   // Refresh PR (passed to PRActions)
@@ -627,12 +747,23 @@ export default function ChecksPanel(): React.JSX.Element {
     }
   }, [activeWorktree, activeWorktreeId, fetchUpstreamStatus, pushBranch])
 
+  const handleBranchChangedByPullRequestGeneration = useCallback(async (): Promise<void> => {
+    if (!activeWorktreeId || !activeWorktree?.path) {
+      return
+    }
+    // Why: AI PR detail generation rebases before summarizing; if HEAD moved,
+    // the dialog must push before creating from the refreshed branch state.
+    setCreatePrPushFirst(true)
+    const connectionId = getConnectionId(activeWorktreeId) ?? undefined
+    await fetchUpstreamStatus(activeWorktreeId, activeWorktree.path, connectionId)
+  }, [activeWorktree?.path, activeWorktreeId, fetchUpstreamStatus])
+
   const handlePullRequestCreated = useCallback(
     async (result: { number: number; url: string }): Promise<void> => {
       if (!repo || !branch) {
         return
       }
-      const initialRequestKey = checksPanelAsyncResultKey(repo.id, branch, prNumber)
+      const initialRequestKey = checksPanelAsyncResultKey(repo.id, branch, prNumber, pr?.prRepo)
       setRightSidebarOpen(true)
       setRightSidebarTab('checks')
       try {
@@ -649,23 +780,36 @@ export default function ChecksPanel(): React.JSX.Element {
           linkedGitLabMR
         })
         if (refreshedPR) {
-          const requestKey = checksPanelAsyncResultKey(repo.id, branch, refreshedPR.number)
+          const requestKey = checksPanelAsyncResultKey(
+            repo.id,
+            branch,
+            refreshedPR.number,
+            refreshedPR.prRepo
+          )
           if (!isCurrentAsyncResult(initialRequestKey) && !isCurrentAsyncResult(requestKey)) {
             return
           }
           asyncResultKeyRef.current = requestKey
           await Promise.all([
-            fetchPRChecks(repo.path, refreshedPR.number, branch, refreshedPR.headSha, {
-              force: true,
-              repoId: repo.id
-            }).then((result) => {
+            fetchPRChecks(
+              repo.path,
+              refreshedPR.number,
+              branch,
+              refreshedPR.headSha,
+              refreshedPR.prRepo,
+              {
+                force: true,
+                repoId: repo.id
+              }
+            ).then((result) => {
               if (isCurrentAsyncResult(requestKey)) {
                 setChecks(result)
               }
             }),
             fetchPRComments(repo.path, refreshedPR.number, {
               force: true,
-              repoId: repo.id
+              repoId: repo.id,
+              prRepo: refreshedPR.prRepo
             }).then((result) => {
               if (isCurrentAsyncResult(requestKey)) {
                 setComments(result)
@@ -686,6 +830,7 @@ export default function ChecksPanel(): React.JSX.Element {
       isCurrentAsyncResult,
       linkedGitLabMR,
       prNumber,
+      pr?.prRepo,
       repo,
       setRightSidebarOpen,
       setRightSidebarTab
@@ -785,6 +930,10 @@ export default function ChecksPanel(): React.JSX.Element {
           : conflictOperation === 'cherry-pick'
             ? 'Cherry-pick'
             : null
+    const isQueuedPRRefresh = prRefreshState?.status === 'queued'
+    const isInFlightPRRefresh = prRefreshState?.status === 'in-flight'
+    const isPausedPRRefresh = prRefreshState?.status === 'paused'
+    const isErroredPRRefresh = prRefreshState?.status === 'error'
 
     const canCreate = hostedReviewCreation?.canCreate
     const canPushCreate = hostedReviewCreation?.blockedReason === 'needs_push'
@@ -802,19 +951,34 @@ export default function ChecksPanel(): React.JSX.Element {
             pushBeforeCreate={createPrPushFirst}
             onOpenChange={setCreatePrDialogOpen}
             onPushBeforeCreate={pushBeforeCreatePullRequest}
+            onBranchChangedByGeneration={handleBranchChangedByPullRequestGeneration}
             onCreated={handlePullRequestCreated}
           />
         )}
         <div className="px-4 py-6">
           <div className="text-sm font-medium text-foreground">
-            {operationInProgress ? `${operationLabel} in progress` : 'No pull request found'}
+            {operationInProgress
+              ? `${operationLabel} in progress`
+              : isErroredPRRefresh
+                ? 'Could not refresh pull request'
+                : isQueuedPRRefresh || isInFlightPRRefresh
+                  ? 'Checking for pull request'
+                  : 'No pull request found'}
           </div>
           <div className="mt-1 text-xs text-muted-foreground">
             {operationInProgress
               ? 'PR checks will be available after the operation completes'
-              : canPushCreate
-                ? 'Push your branch before creating a pull request.'
-                : 'Create a pull request to start checks and review.'}
+              : isErroredPRRefresh
+                ? 'GitHub status could not be refreshed. Existing cached data was preserved.'
+                : isQueuedPRRefresh
+                  ? 'Waiting to refresh GitHub status for this branch'
+                  : isInFlightPRRefresh
+                    ? 'Refreshing GitHub status for this branch'
+                    : isPausedPRRefresh
+                      ? 'GitHub refresh is paused by the current rate-limit budget'
+                      : canPushCreate
+                        ? 'Push your branch before creating a pull request.'
+                        : 'Create a pull request to start checks and review.'}
           </div>
           {!operationInProgress && (
             <div className="mt-3 flex flex-wrap gap-2">
@@ -931,7 +1095,7 @@ export default function ChecksPanel(): React.JSX.Element {
         {/* Updated at */}
         {pr.updatedAt && (
           <div className="text-[10px] text-muted-foreground/60">
-            Updated {new Date(pr.updatedAt).toLocaleString()}
+            PR updated {new Date(pr.updatedAt).toLocaleString()}
           </div>
         )}
 
@@ -948,7 +1112,7 @@ export default function ChecksPanel(): React.JSX.Element {
           </div>
         )}
 
-        {/* Merge / Delete Worktree actions */}
+        {/* Merge / Delete Workspace actions */}
         {activeWorktree && repo && (
           <PRActions pr={pr} repo={repo} worktree={activeWorktree} onRefreshPR={handleRefreshPR} />
         )}

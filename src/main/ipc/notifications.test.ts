@@ -113,6 +113,14 @@ describe('registerNotificationHandlers', () => {
     return call[1] as (event: unknown) => unknown
   }
 
+  function getNotificationEventHandler(eventName: string): () => void {
+    const call = notificationOnMock.mock.calls.find((c: unknown[]) => c[0] === eventName)
+    if (!call) {
+      throw new Error(`Notification ${eventName} handler not registered`)
+    }
+    return call[1] as () => void
+  }
+
   it('registers the IPC handler', () => {
     registerNotificationHandlers({
       getSettings: () => ({
@@ -197,6 +205,55 @@ describe('registerNotificationHandlers', () => {
       body: 'orca'
     })
     expect(notificationShowMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('focuses the originating terminal pane when a notification with paneKey is clicked', () => {
+    const webContentsSend = vi.fn()
+    const restore = vi.fn()
+    const focus = vi.fn()
+    getAllWindowsMock.mockReturnValue([
+      {
+        isDestroyed: () => false,
+        isFocused: () => false,
+        isMinimized: () => true,
+        restore,
+        focus,
+        webContents: { send: webContentsSend }
+      } as never
+    ])
+    registerNotificationHandlers({
+      getSettings: () => ({
+        notifications: {
+          enabled: true,
+          agentTaskComplete: true,
+          terminalBell: true,
+          suppressWhenFocused: true
+        }
+      })
+    } as never)
+
+    const paneKey = 'tab-1:11111111-1111-4111-8111-111111111111'
+    const handler = getDispatchHandler()
+    expect(
+      handler({}, { source: 'agent-task-complete', worktreeId: 'repo::wt1', paneKey })
+    ).toEqual({ delivered: true })
+
+    getNotificationEventHandler('click')()
+
+    expect(restore).toHaveBeenCalledTimes(1)
+    expect(focus).toHaveBeenCalledTimes(1)
+    expect(webContentsSend).toHaveBeenCalledWith('ui:activateWorktree', {
+      repoId: 'repo',
+      worktreeId: 'repo::wt1'
+    })
+    expect(webContentsSend).toHaveBeenCalledWith('ui:focusTerminal', {
+      tabId: 'tab-1',
+      worktreeId: 'repo::wt1',
+      leafId: '11111111-1111-4111-8111-111111111111',
+      ackPaneKeyOnSuccess: paneKey,
+      flashFocusedPane: true,
+      scrollToBottomIfOutputSinceLastView: true
+    })
   })
 
   it('formats agent-task-complete with the agent response when a status snapshot is present', () => {

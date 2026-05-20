@@ -22,6 +22,7 @@ import {
   clearPaneCacheState,
   createHookListenerState,
   getEndpointFileName,
+  hasPendingAgentResultText,
   HOOK_REQUEST_SLOWLORIS_MS,
   MAX_PANE_KEY_LEN,
   normalizeHookPayload,
@@ -35,10 +36,16 @@ import {
 } from '../../shared/agent-hook-listener'
 import type { AgentHookSource } from '../../shared/agent-hook-relay'
 import {
+  AGENT_STATUS_STALE_AFTER_MS,
   type AgentStatusIpcPayload,
+  type AgentType,
   type AgentStatusState,
   normalizeAgentStatusPayload
 } from '../../shared/agent-status-types'
+import {
+  isAgentInterruptInputIntent,
+  type AgentInterruptInferenceRequest
+} from '../../shared/agent-interrupt-intent'
 import { parseLegacyNumericPaneKey, parsePaneKey } from '../../shared/stable-pane-id'
 import type { LegacyPaneKeyAliasEntry } from '../../shared/types'
 
@@ -75,6 +82,9 @@ type PaneKeyAliasEntry = {
 // the endpoint file in userData/agent-hooks/ so all hook-server-owned cross-
 // restart artifacts stay co-located.
 const LAST_STATUS_FILE_NAME = 'last-status.json'
+const ASSISTANT_MESSAGE_RETRY_ATTEMPTS = 5
+const ASSISTANT_MESSAGE_RETRY_MS = 50
+const INTERRUPTED_DONE_LATE_WORKING_SUPPRESSION_MS = 15_000
 
 // Why: starts at 2 (not 1) because pre-merge dev iterations of this branch
 // wrote a v1 shape with no receivedAt / stateStartedAt. Bumping to 2 means a
@@ -101,6 +111,15 @@ const HYDRATE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 type LastStatusFile = {
   version: number
   entries: Record<string, EnrichedAgentHookEventPayload>
+}
+
+function equivalentInterruptAgentType(
+  actual: AgentType | undefined,
+  baseline: AgentType | undefined
+): boolean {
+  const normalizedActual = actual === 'unknown' ? undefined : actual
+  const normalizedBaseline = baseline === 'unknown' ? undefined : baseline
+  return normalizedActual === normalizedBaseline
 }
 
 // Why: paneKey is `${tabId}:${leafUuid}` — validate the durable leaf suffix
@@ -170,6 +189,7 @@ function sanitizeHydratedEntry(
     tabId: typeof tabId === 'string' ? tabId : undefined,
     worktreeId: typeof worktreeId === 'string' ? worktreeId : undefined,
     connectionId,
+    hasExplicitPrompt: record.hasExplicitPrompt === true ? true : undefined,
     payload,
     receivedAt,
     stateStartedAt
@@ -232,6 +252,7 @@ export class AgentHookServer {
   // Why: trailing-edge debounce timer. Captured per-instance so multiple
   // server instances in the same process (tests) don't share state.
   private statusPersistTimer: ReturnType<typeof setTimeout> | null = null
+  private assistantMessageRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   // Why: identity check — skip writes when the JSON-stringified contents
   // exactly match the last successful disk write. Cheap protection against
   // re-firing trailing timers when nothing changed.
@@ -275,6 +296,70 @@ export class AgentHookServer {
     )
   }
 
+  inferInterrupt(request: AgentInterruptInferenceRequest): boolean {
+    if (!isValidPaneKey(request.paneKey)) {
+      return false
+    }
+    if (!isAgentInterruptInputIntent(request.intent)) {
+      return false
+    }
+    const existing = this.state.lastStatusByPaneKey.get(request.paneKey) as
+      | EnrichedAgentHookEventPayload
+      | undefined
+    if (!existing) {
+      return false
+    }
+    const payload = existing.payload
+    const agentType: AgentType | undefined = payload.agentType
+    // Why: Droid's Ctrl+C does not interrupt the current turn; repeated Ctrl+C
+    // exits the CLI, which is handled by process/PTY lifecycle cleanup.
+    if (agentType === 'droid' && request.intent === 'ctrl-c') {
+      return false
+    }
+    // Why: these agents use the first Escape as a TUI/editor cancel. A single
+    // Escape can leave the turn running, so only a deliberate double Escape
+    // may infer an interrupted turn.
+    if (
+      (agentType === 'opencode' || agentType === 'copilot') &&
+      request.intent === 'plain-escape' &&
+      request.inputCount !== 2
+    ) {
+      return false
+    }
+    // Why: input-intent inference is a fallback for a missing final hook. A strict
+    // baseline match keeps a delayed timer from overwriting any newer hook,
+    // including same-millisecond prompt or agent identity changes.
+    if (
+      payload.state !== 'working' ||
+      !equivalentInterruptAgentType(agentType, request.baselineAgentType) ||
+      payload.prompt !== request.baselinePrompt ||
+      existing.receivedAt !== request.baselineUpdatedAt ||
+      existing.stateStartedAt !== request.baselineStateStartedAt ||
+      Date.now() - existing.receivedAt > AGENT_STATUS_STALE_AFTER_MS
+    ) {
+      return false
+    }
+
+    const inferred = this.applyNormalizedStatus({
+      paneKey: existing.paneKey,
+      tabId: existing.tabId,
+      worktreeId: existing.worktreeId,
+      connectionId: existing.connectionId,
+      payload: {
+        state: 'done',
+        prompt: payload.prompt,
+        agentType,
+        interrupted: true
+      }
+    })
+    console.debug('[agent-hooks] inferred interrupted agent status', {
+      paneKey: inferred.paneKey,
+      agentType,
+      intent: request.intent
+    })
+    return true
+  }
+
   getStatusChangeSnapshot(): AgentHookStatusChangeEntry[] {
     return Array.from(this.state.lastStatusByPaneKey.entries(), ([paneKey, entry]) => {
       const enriched = entry as EnrichedAgentHookEventPayload
@@ -311,6 +396,101 @@ export class AgentHookServer {
       ...payload,
       receivedAt: now,
       stateStartedAt
+    }
+  }
+
+  private applyNormalizedStatus(payload: AgentHookEventPayload): EnrichedAgentHookEventPayload {
+    const previous = this.state.lastStatusByPaneKey.get(payload.paneKey) as
+      | EnrichedAgentHookEventPayload
+      | undefined
+    // Why: some TUIs can emit a delayed tool/working hook after Ctrl+C already
+    // stopped the turn. Do not let that stale same-turn event resurrect the row.
+    if (
+      previous?.payload.state === 'done' &&
+      previous.payload.interrupted === true &&
+      payload.payload.state === 'done' &&
+      previous.payload.agentType === payload.payload.agentType &&
+      previous.payload.prompt === payload.payload.prompt &&
+      Date.now() - previous.receivedAt <= INTERRUPTED_DONE_LATE_WORKING_SUPPRESSION_MS
+    ) {
+      return previous
+    }
+    if (
+      previous?.payload.state === 'done' &&
+      previous.payload.interrupted === true &&
+      payload.payload.state === 'working' &&
+      previous.payload.agentType === payload.payload.agentType &&
+      previous.payload.prompt === payload.payload.prompt &&
+      (payload.isReplay === true ||
+        (payload.hasExplicitPrompt !== true &&
+          Date.now() - previous.receivedAt <= INTERRUPTED_DONE_LATE_WORKING_SUPPRESSION_MS))
+    ) {
+      return previous
+    }
+    if (payload.payload.state !== 'done' || payload.payload.lastAssistantMessage) {
+      this.clearAssistantMessageRetry(payload.paneKey)
+    }
+    const enriched = this.attachStatusTiming(payload)
+    this.runtimeObservedStatusPaneKeys.add(enriched.paneKey)
+    this.state.lastStatusByPaneKey.set(enriched.paneKey, enriched)
+    this.scheduleStatusPersist()
+    this.notifyStatusChangeListeners()
+    this.onAgentStatus?.(enriched)
+    return enriched
+  }
+
+  private clearAssistantMessageRetry(paneKey: string): void {
+    const timer = this.assistantMessageRetryTimers.get(paneKey)
+    if (!timer) {
+      return
+    }
+    clearTimeout(timer)
+    this.assistantMessageRetryTimers.delete(paneKey)
+  }
+
+  private scheduleAssistantMessageRetry(
+    source: AgentHookSource,
+    body: unknown,
+    original: EnrichedAgentHookEventPayload,
+    attempt = 1
+  ): void {
+    if (
+      original.payload.lastAssistantMessage ||
+      !hasPendingAgentResultText(source, body) ||
+      attempt > ASSISTANT_MESSAGE_RETRY_ATTEMPTS
+    ) {
+      return
+    }
+    this.clearAssistantMessageRetry(original.paneKey)
+    const timer = setTimeout(() => {
+      try {
+        this.assistantMessageRetryTimers.delete(original.paneKey)
+        const current = this.state.lastStatusByPaneKey.get(original.paneKey) as
+          | EnrichedAgentHookEventPayload
+          | undefined
+        if (
+          !current ||
+          current.payload.agentType !== original.payload.agentType ||
+          current.payload.prompt !== original.payload.prompt ||
+          current.payload.lastAssistantMessage
+        ) {
+          return
+        }
+        const normalized = normalizeHookPayload(this.state, source, body, this.env)
+        if (!normalized?.payload.lastAssistantMessage) {
+          this.scheduleAssistantMessageRetry(source, body, original, attempt + 1)
+          return
+        }
+        // Why: some agents POST Stop before their transcript/chat-history line
+        // is flushed. Retry from a timer so the hook request returns immediately.
+        this.applyNormalizedStatus(normalized)
+      } catch (err) {
+        console.error('[agent-hooks] assistant message retry failed:', err)
+      }
+    }, ASSISTANT_MESSAGE_RETRY_MS)
+    this.assistantMessageRetryTimers.set(original.paneKey, timer)
+    if (typeof timer.unref === 'function') {
+      timer.unref()
     }
   }
 
@@ -445,6 +625,8 @@ export class AgentHookServer {
       worktreeId?: string
       env?: string
       version?: string
+      hasExplicitPrompt?: boolean
+      isReplay?: boolean
       payload: unknown
     },
     connectionId: string
@@ -520,17 +702,18 @@ export class AgentHookServer {
       tabId,
       worktreeId,
       connectionId: trimmedConnectionId,
+      hasExplicitPrompt: envelope.hasExplicitPrompt === true ? true : undefined,
+      isReplay: envelope.isReplay === true ? true : undefined,
       payload: normalizedPayload
     }
-    const enriched = this.attachStatusTiming(event)
-    this.runtimeObservedStatusPaneKeys.add(paneKey)
-    this.state.lastStatusByPaneKey.set(paneKey, enriched)
-    this.scheduleStatusPersist()
-    this.notifyStatusChangeListeners()
-    this.onAgentStatus?.(enriched)
+    this.applyNormalizedStatus(event)
   }
 
-  async start(options?: { env?: string; userDataPath?: string }): Promise<void> {
+  async start(options?: {
+    env?: string
+    userDataPath?: string
+    endpointNamespace?: string
+  }): Promise<void> {
     if (this.server) {
       return
     }
@@ -539,7 +722,12 @@ export class AgentHookServer {
       this.env = options.env
     }
     if (options?.userDataPath) {
-      this.endpointDir = join(options.userDataPath, 'agent-hooks')
+      // Why: dev builds share one userData path, so callers can namespace the
+      // endpoint file by dev instance while packaged builds keep the stable path
+      // that lets long-lived PTYs reconnect after app restart.
+      this.endpointDir = options.endpointNamespace
+        ? join(options.userDataPath, 'agent-hooks', options.endpointNamespace)
+        : join(options.userDataPath, 'agent-hooks')
       this.endpointFilePathCache = join(this.endpointDir, getEndpointFileName())
       this.lastStatusFilePath = join(this.endpointDir, LAST_STATUS_FILE_NAME)
     }
@@ -584,19 +772,11 @@ export class AgentHookServer {
         }
 
         trackEmptyPaneKeyHook(body)
-        const normalized = normalizeHookPayload(
-          this.state,
-          source,
-          this.normalizeHookBodyPaneKeyAlias(body),
-          this.env
-        )
+        const aliasedBody = this.normalizeHookBodyPaneKeyAlias(body)
+        const normalized = normalizeHookPayload(this.state, source, aliasedBody, this.env)
         if (normalized) {
-          const enriched = this.attachStatusTiming(normalized)
-          this.runtimeObservedStatusPaneKeys.add(enriched.paneKey)
-          this.state.lastStatusByPaneKey.set(enriched.paneKey, enriched)
-          this.scheduleStatusPersist()
-          this.notifyStatusChangeListeners()
-          this.onAgentStatus?.(enriched)
+          const enriched = this.applyNormalizedStatus(normalized)
+          this.scheduleAssistantMessageRetry(source, aliasedBody, enriched)
         }
 
         res.writeHead(204)
@@ -647,6 +827,10 @@ export class AgentHookServer {
     this.token = ''
     this.env = 'production'
     this.onAgentStatus = null
+    for (const timer of this.assistantMessageRetryTimers.values()) {
+      clearTimeout(timer)
+    }
+    this.assistantMessageRetryTimers.clear()
     // Why: intentionally do NOT delete the endpoint file on stop(). A stale
     // file points at a dead port, which matches the fail-open policy. Unlink
     // would introduce a TOCTOU race vs. a concurrent Orca instance.
@@ -674,6 +858,7 @@ export class AgentHookServer {
       return
     }
     this.state.lastStatusByPaneKey.delete(resolvedPaneKey)
+    this.clearAssistantMessageRetry(resolvedPaneKey)
     this.runtimeObservedStatusPaneKeys.delete(resolvedPaneKey)
     this.scheduleStatusPersist()
     this.notifyStatusChangeListeners()
@@ -686,6 +871,7 @@ export class AgentHookServer {
     // event does not change the on-disk file, and skipping the write avoids
     // re-stat'ing on every dead-pane teardown.
     const hadStatus = this.state.lastStatusByPaneKey.has(resolvedPaneKey)
+    this.clearAssistantMessageRetry(resolvedPaneKey)
     clearPaneCacheState(this.state, resolvedPaneKey)
     let clearedAlias = false
     for (const [legacyPaneKey, stablePaneKey] of this.legacyPaneKeyAliases) {
@@ -716,6 +902,9 @@ export class AgentHookServer {
       ORCA_AGENT_HOOK_ENV: this.env,
       ORCA_AGENT_HOOK_VERSION: ORCA_HOOK_PROTOCOL_VERSION
     }
+    // Why: managed hooks source this file at invocation time. Packaged builds
+    // use a stable file for restart handoff; dev callers pass a per-instance
+    // namespace so parallel `pnpm dev` runs do not steal each other's hooks.
     if (this.endpointFileWritten && this.endpointFilePathCache) {
       env.ORCA_AGENT_HOOK_ENDPOINT = this.endpointFilePathCache
     }

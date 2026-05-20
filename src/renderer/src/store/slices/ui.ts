@@ -5,6 +5,7 @@ import { findPrevLiveWorktreeHistoryIndex } from './worktree-nav-history'
 import type {
   ChangelogData,
   CustomPet,
+  GitHubWorkItem,
   PersistedTrustedOrcaHooks,
   PersistedUIState,
   Space,
@@ -22,6 +23,7 @@ import {
   WORKSPACE_CLEANUP_CLASSIFIER_VERSION,
   type WorkspaceCleanupDismissal
 } from '../../../../shared/workspace-cleanup'
+import { normalizeFeatureTipIds, type FeatureTipId } from '../../../../shared/feature-tips'
 import { PER_REPO_FETCH_LIMIT } from '../../../../shared/work-items'
 import {
   normalizeVisibleTaskProviders,
@@ -29,7 +31,8 @@ import {
 } from '../../../../shared/task-providers'
 import {
   DEFAULT_STATUS_BAR_ITEMS,
-  DEFAULT_WORKTREE_CARD_PROPERTIES
+  DEFAULT_WORKTREE_CARD_PROPERTIES,
+  normalizeWorktreeCardProperties
 } from '../../../../shared/constants'
 import {
   WORKSPACE_BOARD_COLUMN_WIDTH_DEFAULT,
@@ -45,6 +48,11 @@ import { DEFAULT_PET_ID, isBundledPetId } from '../../components/pet/pet-models'
 import { revokeCustomPetBlobUrl } from '../../components/pet/pet-blob-cache'
 import { isGitRepoKind } from '../../../../shared/repo-kind'
 
+export type PendingSidebarWorktreeReveal = {
+  worktreeId: string
+  behavior: 'auto' | 'smooth'
+}
+
 function clampPetSize(size: number): number {
   if (!Number.isFinite(size)) {
     return PET_SIZE_DEFAULT
@@ -57,6 +65,7 @@ function clampPetSize(size: number): number {
 // openTaskPage warm exactly the cache key the page will read on mount.
 function presetToQuery(presetId: TaskViewPresetId | null): string {
   switch (presetId) {
+    case 'all':
     case 'issues':
       return 'is:issue is:open'
     case 'my-issues':
@@ -68,7 +77,7 @@ function presetToQuery(presetId: TaskViewPresetId | null): string {
     case 'my-prs':
       return 'author:@me is:pr is:open'
     default:
-      return 'is:open'
+      return 'is:issue is:open'
   }
 }
 
@@ -95,6 +104,7 @@ const MAX_LEFT_SIDEBAR_WIDTH = 500
 // cap on wide displays. Use a large hard ceiling purely as a safety net for
 // corrupted/manually-edited values rather than as a product limit.
 const MAX_RIGHT_SIDEBAR_WIDTH = 4000
+const LINEAR_TASK_PREFETCH_LIMIT = 36
 // Why: bound disk growth for acknowledgedAgentsByPaneKey across hard quits —
 // in-session cleanup (agent-status.ts) prunes on pane lifecycle, but crash/
 // forced-kill paths leave entries pinned. Mirrors HYDRATE_MAX_AGE_MS in
@@ -322,6 +332,8 @@ export type UISlice = {
   }
   taskResumeState: TaskResumeState | undefined
   setTaskResumeState: (updates: Partial<TaskResumeState>) => void
+  githubTaskDrawerWorkItem: GitHubWorkItem | null
+  setGithubTaskDrawerWorkItem: (item: GitHubWorkItem | null) => void
   newWorkspaceDraft: {
     repoId: string | null
     name: string
@@ -369,6 +381,7 @@ export type UISlice = {
       | 'input'
       | 'tasks'
       | 'terminal'
+      | 'notifications'
       | 'computer-use'
       | 'developer-permissions'
       | 'shortcuts'
@@ -397,11 +410,14 @@ export type UISlice = {
     | 'worktree-palette'
     | 'workspace-cleanup'
     | 'feature-wall'
+    | 'feature-tips'
     | 'new-workspace-composer'
     | 'confirm-orca-yaml-hooks'
   modalData: Record<string, unknown>
   openModal: (modal: UISlice['activeModal'], data?: Record<string, unknown>) => void
   closeModal: () => void
+  featureTipsSeenIds: FeatureTipId[]
+  markFeatureTipsSeen: (ids: FeatureTipId[]) => void
   featureTourNudgeVisible: boolean
   showFeatureTourNudge: () => void
   dismissFeatureTourNudge: () => void
@@ -415,8 +431,6 @@ export type UISlice = {
   clearOrcaHookTrustForRepo: (repoId: string) => void
   groupBy: 'none' | 'workspace-status' | 'repo' | 'pr-status'
   setGroupBy: (g: UISlice['groupBy']) => void
-  showWorkspaceLineage: boolean
-  setShowWorkspaceLineage: (v: boolean) => void
   sortBy: 'name' | 'smart' | 'recent' | 'repo'
   setSortBy: (s: UISlice['sortBy']) => void
   showActiveOnly: boolean
@@ -472,8 +486,11 @@ export type UISlice = {
    *  problem. */
   petSize: number
   setPetSize: (size: number) => void
-  pendingRevealWorktreeId: string | null
-  revealWorktreeInSidebar: (worktreeId: string) => void
+  pendingRevealWorktree: PendingSidebarWorktreeReveal | null
+  revealWorktreeInSidebar: (
+    worktreeId: string,
+    options?: { behavior?: PendingSidebarWorktreeReveal['behavior'] }
+  ) => void
   clearPendingRevealWorktreeId: () => void
   // Why: lets the SourceControl sidebar request that the diff editor scroll
   // to a specific note. Cleared by the diff decorator after it reveals the
@@ -573,6 +590,7 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
   setActiveView: (view) => set({ activeView: view }),
   taskPageData: {},
   taskResumeState: undefined,
+  githubTaskDrawerWorkItem: null,
   newWorkspaceDraft: null,
   openTaskPage: (data = {}) => {
     // Why: record a Tasks visit in the shared back/forward history so the
@@ -621,16 +639,29 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
       const resume = state.taskResumeState
       const defaultPreset = state.settings?.defaultTaskViewPreset ?? 'all'
       // Why: must match the exact query TaskPage's resume effect mounts with,
-      // otherwise the warm cache key (e.g. 'is:open') misses the page's actual
-      // fetch key (e.g. '') and the prefetch is wasted. When the user has an
-      // explicit cleared custom search (preset === null), preserve the empty
-      // query so both sides agree.
+      // otherwise the warm cache key (e.g. 'is:issue is:open') misses the
+      // page's actual fetch key and the prefetch is wasted. When the user has
+      // an explicit custom search (preset === null), preserve it so both sides
+      // agree.
       const query =
         resume?.githubItemsPreset === null
           ? (resume.githubItemsQuery ?? '').trim()
           : presetToQuery(resume?.githubItemsPreset ?? defaultPreset)
       for (const repo of selectedRepos) {
         state.prefetchWorkItems(repo.id, repo.path, PER_REPO_FETCH_LIMIT, query)
+      }
+    }
+    if (resolvedSource === 'linear' && typeof state.prefetchLinearIssues === 'function') {
+      const resume = state.taskResumeState
+      const query = (resume?.linearQuery ?? '').trim()
+      if (query) {
+        state.prefetchLinearIssues({ kind: 'search', query, limit: LINEAR_TASK_PREFETCH_LIMIT })
+      } else {
+        state.prefetchLinearIssues({
+          kind: 'list',
+          filter: resume?.linearPreset ?? 'all',
+          limit: LINEAR_TASK_PREFETCH_LIMIT
+        })
       }
     }
   },
@@ -640,6 +671,7 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
       window.api.ui.set({ taskResumeState: next }).catch(console.error)
       return { taskResumeState: next }
     }),
+  setGithubTaskDrawerWorkItem: (item) => set({ githubTaskDrawerWorkItem: item }),
   closeTaskPage: () =>
     set((state) => {
       // Why: Esc-close from Tasks must rewind the history index if we're
@@ -665,12 +697,16 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
         worktreeNavHistoryIndex: nextHistoryIndex
       }
     }),
-  openActivityPage: () =>
+  openActivityPage: () => {
+    if (get().settings?.experimentalActivity !== true) {
+      return
+    }
     set((state) => ({
       activeView: 'activity',
       previousViewBeforeActivity:
         state.activeView === 'activity' ? state.previousViewBeforeActivity : state.activeView
-    })),
+    }))
+  },
   closeActivityPage: () =>
     set((state) => ({
       activeView: state.previousViewBeforeActivity
@@ -720,9 +756,14 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
         state.activeView === 'settings' ? state.previousViewBeforeSettings : state.activeView
     })),
   closeSettingsPage: () =>
-    set((state) => ({
-      activeView: state.previousViewBeforeSettings
-    })),
+    set((state) => {
+      const previousView =
+        state.previousViewBeforeSettings === 'activity' &&
+        state.settings?.experimentalActivity !== true
+          ? 'terminal'
+          : state.previousViewBeforeSettings
+      return { activeView: previousView }
+    }),
   settingsNavigationTarget: null,
   openSettingsTarget: (target) => set({ settingsNavigationTarget: target }),
   clearSettingsTarget: () => set({ settingsNavigationTarget: null }),
@@ -733,12 +774,35 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
     set((state) => ({
       activeModal: modal,
       modalData: data,
-      featureTourNudgeVisible: modal === 'feature-wall' ? false : state.featureTourNudgeVisible
+      featureTourNudgeVisible:
+        modal === 'feature-wall' || modal === 'feature-tips' ? false : state.featureTourNudgeVisible
     })),
   closeModal: () => set({ activeModal: 'none', modalData: {} }),
+  featureTipsSeenIds: [],
+  markFeatureTipsSeen: (ids) =>
+    set((s) => {
+      if (ids.length === 0) {
+        return s
+      }
+      const current = new Set(s.featureTipsSeenIds)
+      let changed = false
+      for (const id of ids) {
+        if (!current.has(id)) {
+          current.add(id)
+          changed = true
+        }
+      }
+      if (!changed) {
+        return s
+      }
+      const next = [...current]
+      window.api.ui.set({ featureTipsSeenIds: next }).catch(console.error)
+      return { featureTipsSeenIds: next }
+    }),
   featureTourNudgeVisible: false,
   showFeatureTourNudge: () => {
-    if (get().activeModal !== 'feature-wall') {
+    const activeModal = get().activeModal
+    if (activeModal !== 'feature-wall' && activeModal !== 'feature-tips') {
       set({ featureTourNudgeVisible: true })
     }
   },
@@ -787,7 +851,7 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
       return { trustedOrcaHooks: next }
     }),
 
-  groupBy: 'repo',
+  groupBy: 'workspace-status',
   // Why: group keys are mode-specific (e.g. repo id vs PR status), so
   // collapsed state from one mode is meaningless in another. Clearing
   // also prevents unbounded accumulation of stale keys across mode switches.
@@ -795,9 +859,6 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
     window.api.ui.set({ collapsedGroups: [] }).catch(console.error)
     set({ groupBy: g, collapsedGroups: new Set<string>() })
   },
-
-  showWorkspaceLineage: false,
-  setShowWorkspaceLineage: (v) => set({ showWorkspaceLineage: v }),
 
   sortBy: 'recent',
   setSortBy: (s) => set({ sortBy: s }),
@@ -951,10 +1012,11 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
   worktreeCardProperties: [...DEFAULT_WORKTREE_CARD_PROPERTIES],
   toggleWorktreeCardProperty: (prop) =>
     set((s) => {
-      const current = s.worktreeCardProperties || DEFAULT_WORKTREE_CARD_PROPERTIES
-      const updated = current.includes(prop)
-        ? current.filter((p) => p !== prop)
-        : [...current, prop]
+      const current = normalizeWorktreeCardProperties(s.worktreeCardProperties)
+      const next = current.includes(prop) ? current.filter((p) => p !== prop) : [...current, prop]
+      // Why: retired property toggles no longer exist, so their fields must
+      // stay visible even if an older saved preference hid them.
+      const updated = normalizeWorktreeCardProperties(next)
       window.api.ui.set({ worktreeCardProperties: updated }).catch(console.error)
       return { worktreeCardProperties: updated }
     }),
@@ -1067,9 +1129,15 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
       return partial
     }),
 
-  pendingRevealWorktreeId: null,
-  revealWorktreeInSidebar: (worktreeId) => set({ pendingRevealWorktreeId: worktreeId }),
-  clearPendingRevealWorktreeId: () => set({ pendingRevealWorktreeId: null }),
+  pendingRevealWorktree: null,
+  revealWorktreeInSidebar: (worktreeId, options) =>
+    set({
+      pendingRevealWorktree: {
+        worktreeId,
+        behavior: options?.behavior ?? 'smooth'
+      }
+    }),
+  clearPendingRevealWorktreeId: () => set({ pendingRevealWorktree: null }),
   scrollToDiffCommentId: null,
   setScrollToDiffCommentId: (id) => set({ scrollToDiffCommentId: id }),
   persistedUIReady: false,
@@ -1126,7 +1194,6 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
           MAX_RIGHT_SIDEBAR_WIDTH
         ),
         groupBy: (ui.groupBy as UISlice['groupBy'] | 'parent') === 'parent' ? 'repo' : ui.groupBy,
-        showWorkspaceLineage: ui.showWorkspaceLineage ?? false,
         sortBy,
         // Why: "Active only" is part of the user's sidebar working set, not a
         // transient render detail. Restoring it on launch keeps the filtered
@@ -1140,7 +1207,7 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
         collapsedGroups: new Set(ui.collapsedGroups ?? []),
         uiZoomLevel: ui.uiZoomLevel ?? 0,
         editorFontZoomLevel: ui.editorFontZoomLevel ?? 0,
-        worktreeCardProperties: ui.worktreeCardProperties ?? [...DEFAULT_WORKTREE_CARD_PROPERTIES],
+        worktreeCardProperties: normalizeWorktreeCardProperties(ui.worktreeCardProperties),
         workspaceStatuses: normalizeWorkspaceStatuses(ui.workspaceStatuses),
         workspaceBoardOpacity: clampWorkspaceBoardOpacity(ui.workspaceBoardOpacity),
         workspaceBoardCompact: normalizeWorkspaceBoardCompact(ui.workspaceBoardCompact),
@@ -1175,6 +1242,7 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
         browserDefaultSearchEngine: ui.browserDefaultSearchEngine ?? null,
         browserKagiSessionLink: normalizeKagiSessionLink(ui.browserKagiSessionLink ?? ''),
         taskResumeState: sanitizeTaskResumeState(ui.taskResumeState),
+        featureTipsSeenIds: normalizeFeatureTipIds(ui.featureTipsSeenIds),
         trustedOrcaHooks: filterTrustedOrcaHooksToValidRepos(
           ui.trustedOrcaHooks ?? {},
           validRepoIds

@@ -228,6 +228,10 @@ export class DaemonPtyAdapter implements IPtyProvider {
     })
   }
 
+  hasPty(id: string): boolean {
+    return this.activeSessionIds.has(id)
+  }
+
   write(id: string, data: string): void {
     this.markSessionDirty(id)
     this.client.notify('write', { sessionId: id, data })

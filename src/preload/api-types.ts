@@ -10,6 +10,7 @@ import type {
 import type { AppIdentity } from '../shared/app-identity'
 import type {
   BaseRefDefaultResult,
+  BaseRefSearchResult,
   BrowserCookieImportResult,
   BrowserLoadError,
   BrowserSessionProfile,
@@ -37,6 +38,7 @@ import type {
   GitHubPRFileContents,
   GitHubPRReviewCommentInput,
   GitHubCommentResult,
+  GitHubOwnerRepo,
   GitHubWorkItem,
   GitHubWorkItemDetails,
   GitHubViewer,
@@ -63,10 +65,14 @@ import type {
   LinearWorkflowState,
   LinearLabel,
   LinearMember,
+  LinearProjectSummary,
   LinearTeam,
   MarkdownDocument,
   FloatingTerminalCwdRequest,
   GitHubIssueUpdate,
+  GitHubPRRefreshCandidate,
+  GitHubPRRefreshEvent,
+  GitHubPRRefreshReason,
   GetRateLimitResult,
   NotificationDispatchRequest,
   NotificationDispatchResult,
@@ -77,8 +83,10 @@ import type {
   PathSource,
   PersistedUIState,
   PRCheckDetail,
+  PRCheckRunDetails,
   PRComment,
   PRInfo,
+  PRRefreshOutcome,
   Repo,
   ShellHydrationFailureReason,
   SparsePreset,
@@ -98,6 +106,7 @@ import type {
 } from '../shared/types'
 import type { GitHistoryOptions, GitHistoryResult } from '../shared/git-history'
 import type { PublicKnownRuntimeEnvironment } from '../shared/runtime-environments'
+import type { RuntimeAccessGrant } from '../shared/runtime-access-grants'
 import type { RuntimeRpcResponse } from '../shared/runtime-rpc-envelope'
 import type {
   AddIssueCommentBySlugArgs,
@@ -156,11 +165,18 @@ import type {
   AgentStatusIpcPayload,
   MigrationUnsupportedPtyEntry
 } from '../shared/agent-status-types'
+import type { AgentInterruptInferenceRequest } from '../shared/agent-interrupt-intent'
 import type {
+  RuntimeBrowserDriverState,
+  RuntimeMobileSessionTabMove,
   RuntimeStatus,
   RuntimeSyncWindowGraph,
   RuntimeTerminalDriverState
 } from '../shared/runtime-types'
+import type {
+  CommitMessageAgentCapability,
+  CommitMessageModelCapability
+} from '../shared/commit-message-agent-spec'
 import type { ShellOpenLocalPathResult } from '../shared/shell-open-types'
 import type { SkillDiscoveryResult } from '../shared/skills'
 import type {
@@ -200,11 +216,23 @@ import type {
   ClaudeUsageSummary
 } from '../shared/claude-usage-types'
 import type { RateLimitState } from '../shared/rate-limit-types'
-import type { SpeechModelManifest, SpeechModelState } from '../shared/speech-types'
+import type {
+  SpeechErrorEvent,
+  SpeechLifecycleEvent,
+  SpeechModelManifest,
+  SpeechModelState,
+  SpeechTranscriptEvent
+} from '../shared/speech-types'
 import type {
   WorkspaceSpaceAnalyzeResult,
   WorkspaceSpaceScanProgress
 } from '../shared/workspace-space-types'
+import type {
+  WorkspacePortKillRequest,
+  WorkspacePortKillResult,
+  WorkspacePortScanRequest,
+  WorkspacePortScanResult
+} from '../shared/workspace-ports'
 import type { GhAuthDiagnostic } from '../shared/github-auth-types'
 import type {
   SshConnectionState,
@@ -385,9 +413,9 @@ export type RefreshAgentsResult = {
 }
 
 export type PreflightApi = {
-  check: (args?: { force?: boolean }) => Promise<PreflightStatus>
-  detectAgents: () => Promise<string[]>
-  refreshAgents: () => Promise<RefreshAgentsResult>
+  check: (args?: { force?: boolean; wslDistro?: string | null }) => Promise<PreflightStatus>
+  detectAgents: (args?: { wslDistro?: string | null }) => Promise<string[]>
+  refreshAgents: (args?: { wslDistro?: string | null }) => Promise<RefreshAgentsResult>
   detectRemoteAgents: (args: { connectionId: string }) => Promise<string[]>
 }
 
@@ -516,6 +544,9 @@ export type AppApi = {
    *  by settings panes that need a full restart to apply changes (e.g. the
    *  terminal-window blur setting in TerminalWindowSection). */
   relaunch: () => Promise<void>
+  /** Reloads the current app renderer through main so expected renderer
+   *  teardown can be classified before Electron emits process-gone events. */
+  reload: () => Promise<void>
   /** Returns the macOS `AppleCurrentKeyboardLayoutInputSourceID` when
    *  available (e.g. `com.apple.keylayout.PolishPro`). Used by the
    *  keyboard-layout probe to distinguish layouts whose base layer matches
@@ -577,6 +608,11 @@ export type PreloadApi = {
     getGitUsername: (args: { repoId: string }) => Promise<string>
     getBaseRefDefault: (args: { repoId: string }) => Promise<BaseRefDefaultResult>
     searchBaseRefs: (args: { repoId: string; query: string; limit?: number }) => Promise<string[]>
+    searchBaseRefDetails: (args: {
+      repoId: string
+      query: string
+      limit?: number
+    }) => Promise<BaseRefSearchResult[]>
     onChanged: (callback: () => void) => () => void
   }
   sparsePresets: {
@@ -637,6 +673,10 @@ export type PreloadApi = {
     cancel: () => Promise<boolean>
     onProgress: (callback: (progress: WorkspaceSpaceScanProgress) => void) => () => void
   }
+  workspacePorts: {
+    scan: (args: WorkspacePortScanRequest) => Promise<WorkspacePortScanResult>
+    kill: (args: WorkspacePortKillRequest) => Promise<WorkspacePortKillResult>
+  }
   pty: {
     spawn: (opts: {
       cols: number
@@ -673,6 +713,7 @@ export type PreloadApi = {
       coldRestore?: { scrollback: string; cwd: string }
     }>
     write: (id: string, data: string) => void
+    writeAccepted: (id: string, data: string) => Promise<boolean>
     resize: (id: string, cols: number, rows: number) => void
     reportGeometry: (id: string, cols: number, rows: number) => void
     signal: (id: string, signal: string) => void
@@ -732,6 +773,17 @@ export type PreloadApi = {
       branch: string
       linkedPRNumber?: number | null
     }) => Promise<PRInfo | null>
+    refreshPRNow: (args: { candidate: GitHubPRRefreshCandidate }) => Promise<PRRefreshOutcome>
+    enqueuePRRefresh: (args: {
+      candidate: GitHubPRRefreshCandidate
+      reason: GitHubPRRefreshReason
+      priority?: number
+    }) => Promise<boolean>
+    reportVisiblePRRefreshCandidates: (args: {
+      candidates: GitHubPRRefreshCandidate[]
+      generation: number
+    }) => Promise<boolean>
+    onPRRefreshEvent: (callback: (event: GitHubPRRefreshEvent) => void) => () => void
     issue: (args: {
       repoPath: string
       repoId?: string
@@ -791,12 +843,30 @@ export type PreloadApi = {
       repoId?: string
       prNumber: number
       headSha?: string
+      prRepo?: GitHubOwnerRepo | null
       noCache?: boolean
     }) => Promise<PRCheckDetail[]>
+    prCheckDetails: (args: {
+      repoPath: string
+      repoId?: string
+      checkRunId?: number
+      workflowRunId?: number
+      checkName?: string
+      url?: string | null
+      prRepo?: GitHubOwnerRepo | null
+    }) => Promise<PRCheckRunDetails | null>
+    rerunPRChecks: (args: {
+      repoPath: string
+      repoId?: string
+      prNumber: number
+      headSha?: string
+      failedOnly?: boolean
+    }) => Promise<{ ok: true; count: number } | { ok: false; error: string }>
     prComments: (args: {
       repoPath: string
       repoId?: string
       prNumber: number
+      prRepo?: GitHubOwnerRepo | null
       noCache?: boolean
     }) => Promise<PRComment[]>
     resolveReviewThread: (args: {
@@ -818,12 +888,32 @@ export type PreloadApi = {
       repoId?: string
       prNumber: number
       title: string
+      prRepo?: GitHubOwnerRepo | null
     }) => Promise<boolean>
     mergePR: (args: {
       repoPath: string
       repoId?: string
       prNumber: number
       method?: 'merge' | 'squash' | 'rebase'
+      prRepo?: GitHubOwnerRepo | null
+    }) => Promise<{ ok: true } | { ok: false; error: string }>
+    updatePRState: (args: {
+      repoPath: string
+      repoId?: string
+      prNumber: number
+      updates: { state: 'open' | 'closed' }
+    }) => Promise<{ ok: true } | { ok: false; error: string }>
+    requestPRReviewers: (args: {
+      repoPath: string
+      repoId?: string
+      prNumber: number
+      reviewers: string[]
+    }) => Promise<{ ok: true } | { ok: false; error: string }>
+    removePRReviewers: (args: {
+      repoPath: string
+      repoId?: string
+      prNumber: number
+      reviewers: string[]
     }) => Promise<{ ok: true } | { ok: false; error: string }>
     updateIssue: (args: {
       repoPath: string
@@ -1036,8 +1126,11 @@ export type PreloadApi = {
       title: string
       description?: string
       workspaceId?: string
+      parentIssueId?: string
+      projectId?: string | null
     }) => Promise<
-      { ok: true; id: string; identifier: string; url: string } | { ok: false; error: string }
+      | { ok: true; id: string; identifier: string; title: string; url: string }
+      | { ok: false; error: string }
     >
     getIssue: (args: { id: string; workspaceId?: string }) => Promise<LinearIssue | null>
     updateIssue: (args: {
@@ -1052,6 +1145,11 @@ export type PreloadApi = {
     }) => Promise<{ ok: true; id: string } | { ok: false; error: string }>
     issueComments: (args: { issueId: string; workspaceId?: string }) => Promise<LinearComment[]>
     listTeams: (args?: { workspaceId?: LinearWorkspaceSelection }) => Promise<LinearTeam[]>
+    listProjects: (args?: {
+      query?: string
+      limit?: number
+      workspaceId?: LinearWorkspaceSelection
+    }) => Promise<LinearProjectSummary[]>
     teamStates: (args: { teamId: string; workspaceId?: string }) => Promise<LinearWorkflowState[]>
     teamLabels: (args: { teamId: string; workspaceId?: string }) => Promise<LinearLabel[]>
     teamMembers: (args: { teamId: string; workspaceId?: string }) => Promise<LinearMember[]>
@@ -1116,9 +1214,11 @@ export type PreloadApi = {
     claudeStatus: () => Promise<AgentHookInstallStatus>
     codexStatus: () => Promise<AgentHookInstallStatus>
     geminiStatus: () => Promise<AgentHookInstallStatus>
+    antigravityStatus: () => Promise<AgentHookInstallStatus>
     cursorStatus: () => Promise<AgentHookInstallStatus>
     droidStatus: () => Promise<AgentHookInstallStatus>
     grokStatus: () => Promise<AgentHookInstallStatus>
+    copilotStatus: () => Promise<AgentHookInstallStatus>
     hermesStatus: () => Promise<AgentHookInstallStatus>
   }
   agentTrust: {
@@ -1133,7 +1233,7 @@ export type PreloadApi = {
     openSystemSettings: () => Promise<void>
     getPermissionStatus: () => Promise<NotificationPermissionStatusResult>
     requestPermission: () => Promise<NotificationPermissionStatusResult>
-    playSound: (options?: { force?: boolean }) => Promise<NotificationSoundResult>
+    playSound: (options?: { force?: boolean; volume?: number }) => Promise<NotificationSoundResult>
   }
   onboarding: {
     get: () => Promise<OnboardingState>
@@ -1359,6 +1459,11 @@ export type PreloadApi = {
       connectionId?: string
       includeIgnored?: boolean
     }) => Promise<GitStatusResult>
+    checkIgnored: (args: {
+      worktreePath: string
+      paths: string[]
+      connectionId?: string
+    }) => Promise<string[]>
     history: (
       args: { worktreePath: string; connectionId?: string } & GitHistoryOptions
     ) => Promise<GitHistoryResult>
@@ -1426,6 +1531,19 @@ export type PreloadApi = {
     }) => Promise<
       | { success: true; message: string; agentLabel?: string }
       | { success: false; error: string; canceled?: boolean }
+    >
+    discoverCommitMessageModels: (args: {
+      agentId: string
+      worktreePath?: string
+      connectionId?: string
+    }) => Promise<
+      | {
+          success: true
+          capability: CommitMessageAgentCapability
+          models: CommitMessageModelCapability[]
+          defaultModelId: string
+        }
+      | { success: false; error: string }
     >
     cancelGenerateCommitMessage: (args: {
       worktreePath: string
@@ -1552,6 +1670,8 @@ export type PreloadApi = {
         activate?: boolean
         tabId?: string
         leafId?: string
+        splitFromLeafId?: string
+        splitDirection?: 'horizontal' | 'vertical'
       }) => void
     ) => () => void
     onRequestTerminalCreate: (
@@ -1559,6 +1679,7 @@ export type PreloadApi = {
         requestId: string
         worktreeId?: string
         afterTabId?: string
+        targetGroupId?: string
         command?: string
         title?: string
         activate?: boolean
@@ -1582,7 +1703,14 @@ export type PreloadApi = {
       callback: (data: { tabId: string; title: string | null }) => void
     ) => () => void
     onFocusTerminal: (
-      callback: (data: { tabId: string; worktreeId: string; leafId?: string | null }) => void
+      callback: (data: {
+        tabId: string
+        worktreeId: string
+        leafId?: string | null
+        ackPaneKeyOnSuccess?: string
+        flashFocusedPane?: boolean
+        scrollToBottomIfOutputSinceLastView?: boolean
+      }) => void
     ) => () => void
     onFocusEditorTab: (
       callback: (data: { tabId: string; worktreeId: string }) => void
@@ -1590,8 +1718,19 @@ export type PreloadApi = {
     onCloseSessionTab: (
       callback: (data: { tabId: string; worktreeId: string }) => void
     ) => () => void
+    onMoveSessionTab: (
+      callback: (data: { worktreeId: string } & RuntimeMobileSessionTabMove) => void
+    ) => () => void
     onOpenFileFromMobile: (
       callback: (data: { worktreeId: string; filePath: string; relativePath: string }) => void
+    ) => () => void
+    onOpenDiffFromMobile: (
+      callback: (data: {
+        worktreeId: string
+        filePath: string
+        relativePath: string
+        staged: boolean
+      }) => void
     ) => () => void
     onMobileMarkdownRequest: (
       callback: (request: RuntimeMobileMarkdownRequest) => void
@@ -1604,7 +1743,9 @@ export type PreloadApi = {
     onTerminalZoom: (callback: (direction: 'in' | 'out' | 'reset') => void) => () => void
     readClipboardText: () => Promise<string>
     readSelectionClipboardText: () => Promise<string>
-    saveClipboardImageAsTempFile: () => Promise<string | null>
+    saveClipboardImageAsTempFile: (args?: {
+      connectionId?: string | null
+    }) => Promise<string | null>
     writeClipboardText: (text: string) => Promise<void>
     writeSelectionClipboardText: (text: string) => Promise<void>
     writeClipboardImage: (dataUrl: string) => Promise<void>
@@ -1647,7 +1788,14 @@ export type PreloadApi = {
         driver: RuntimeTerminalDriverState
       }[]
     >
+    getBrowserDrivers: () => Promise<
+      {
+        browserPageId: string
+        driver: RuntimeBrowserDriverState
+      }[]
+    >
     restoreTerminalFit: (ptyId: string) => Promise<{ restored: boolean }>
+    reclaimBrowserForDesktop: (browserPageId: string) => Promise<{ reclaimed: boolean }>
     onTerminalFitOverrideChanged: (
       callback: (event: {
         ptyId: string
@@ -1658,6 +1806,9 @@ export type PreloadApi = {
     ) => () => void
     onTerminalDriverChanged: (
       callback: (event: { ptyId: string; driver: RuntimeTerminalDriverState }) => void
+    ) => () => void
+    onBrowserDriverChanged: (
+      callback: (event: { browserPageId: string; driver: RuntimeBrowserDriverState }) => void
     ) => () => void
   }
   runtimeEnvironments: {
@@ -1713,6 +1864,7 @@ export type PreloadApi = {
     connect: (args: { targetId: string }) => Promise<SshConnectionState | null>
     disconnect: (args: { targetId: string }) => Promise<void>
     terminateSessions: (args: { targetId: string }) => Promise<void>
+    resetRelay: (args: { targetId: string }) => Promise<void>
     getState: (args: { targetId: string }) => Promise<SshConnectionState | null>
     needsPassphrasePrompt: (args: { targetId: string }) => Promise<boolean>
     testConnection: (args: {
@@ -1788,6 +1940,7 @@ export type PreloadApi = {
     onSet: (callback: (data: AgentStatusIpcPayload) => void) => () => void
     /** Return the current main-process hook cache after renderer hydration. */
     getSnapshot: () => Promise<AgentStatusIpcPayload[]>
+    inferInterrupt: (request: AgentInterruptInferenceRequest) => Promise<boolean>
     /** Listen for PTYs that still use a legacy numeric pane key but have
      *  registry-backed UUID pane proof. */
     onMigrationUnsupported: (callback: (entry: MigrationUnsupportedPtyEntry) => void) => () => void
@@ -1825,6 +1978,8 @@ export type PreloadApi = {
       devices: { deviceId: string; name: string; pairedAt: number; lastSeenAt: number }[]
     }>
     revokeDevice: (args: { deviceId: string }) => Promise<{ revoked: boolean }>
+    listRuntimeAccessGrants: () => Promise<{ grants: RuntimeAccessGrant[] }>
+    revokeRuntimeAccess: (args: { deviceId: string }) => Promise<{ revoked: boolean }>
     isWebSocketReady: () => Promise<{ ready: boolean; endpoint: string | null }>
   }
   speech: {
@@ -1833,17 +1988,21 @@ export type PreloadApi = {
     downloadModel: (modelId: string) => Promise<void>
     cancelDownload: (modelId: string) => Promise<void>
     deleteModel: (modelId: string) => Promise<void>
-    startDictation: (modelId: string, hotwords?: string[]) => Promise<void>
-    feedAudio: (samples: Float32Array, sampleRate: number) => Promise<void>
-    stopDictation: () => Promise<void>
-    onPartialTranscript: (callback: (text: string) => void) => () => void
-    onFinalTranscript: (callback: (text: string) => void) => () => void
+    startDictation: (
+      modelId: string,
+      hotwords: string[] | undefined,
+      sessionId: string
+    ) => Promise<void>
+    feedAudio: (samples: Float32Array, sampleRate: number, sessionId?: string) => Promise<void>
+    stopDictation: (sessionId?: string) => Promise<void>
+    onPartialTranscript: (callback: (data: SpeechTranscriptEvent) => void) => () => void
+    onFinalTranscript: (callback: (data: SpeechTranscriptEvent) => void) => () => void
     onDownloadProgress: (
       callback: (data: { modelId: string; progress: number }) => void
     ) => () => void
-    onReady: (callback: () => void) => () => void
-    onStopped: (callback: () => void) => () => void
-    onError: (callback: (error: string) => void) => () => void
+    onReady: (callback: (data: SpeechLifecycleEvent) => void) => () => void
+    onStopped: (callback: (data: SpeechLifecycleEvent) => void) => () => void
+    onError: (callback: (data: SpeechErrorEvent) => void) => () => void
   }
 }
 

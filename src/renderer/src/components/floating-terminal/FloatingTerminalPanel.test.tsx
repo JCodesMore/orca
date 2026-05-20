@@ -1,6 +1,10 @@
+/* eslint-disable max-lines -- Why: these tests mock the floating panel's
+ * React/store environment directly so close and bootstrap behavior can be
+ * asserted without mounting the full Electron renderer. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FLOATING_TERMINAL_WORKTREE_ID } from '../../../../shared/constants'
-import type { TerminalTab } from '../../../../shared/types'
+import type { BrowserTab, Tab, TabGroup, TerminalTab } from '../../../../shared/types'
+import type { OpenFile } from '@/store/slices/editor'
 
 type EffectCallback = () => void | (() => void)
 
@@ -11,22 +15,44 @@ type ReactElementLike = {
 
 type FloatingPanelStoreState = {
   tabsByWorktree: Record<string, TerminalTab[]>
+  browserTabsByWorktree: Record<string, BrowserTab[]>
+  browserPagesByWorkspace: Record<string, unknown[]>
+  groupsByWorktree: Record<string, TabGroup[]>
+  unifiedTabsByWorktree: Record<string, Tab[]>
+  openFiles: OpenFile[]
   activeTabIdByWorktree: Record<string, string | null>
   expandedPaneByTabId: Record<string, boolean>
   createTab: (
     worktreeId: string,
     groupId?: string,
     shellOverride?: string,
-    options?: { activate?: boolean }
+    options?: { activate?: boolean; pendingActivationSpawn?: boolean; initialPtyId?: string }
   ) => TerminalTab
+  createBrowserTab: (
+    worktreeId: string,
+    url: string,
+    options?: {
+      activate?: boolean
+      focusAddressBar?: boolean
+      sessionProfileId?: string | null
+      title?: string
+      targetGroupId?: string
+    }
+  ) => BrowserTab
   closeTab: (tabId: string) => void
-  setActiveTabForWorktree: (worktreeId: string, tabId: string) => void
-  setTabBarOrder: (worktreeId: string, order: string[]) => void
+  closeBrowserTab: (tabId: string) => void
+  closeFile: (fileId: string) => void
+  markFileDirty: (fileId: string, dirty: boolean) => void
+  activateTab: (tabId: string) => void
+  setActiveTab: (tabId: string) => void
   setTabCustomTitle: (tabId: string, title: string | null) => void
   setTabColor: (tabId: string, color: string | null) => void
   setTabPaneExpanded: (tabId: string, expanded: boolean) => void
+  pinFile: (fileId: string, tabId?: string) => void
+  openFile: (file: unknown, options?: unknown) => void
+  browserDefaultUrl: string
   tabBarOrderByWorktree: Record<string, string[]>
-  settings: { floatingTerminalCwd?: string }
+  settings: { activeRuntimeEnvironmentId?: string | null; floatingTerminalCwd?: string }
 }
 
 const hookRuntime = vi.hoisted(() => ({
@@ -40,16 +66,31 @@ const storeBox = vi.hoisted(() => ({
 }))
 
 const mocks = vi.hoisted(() => ({
+  activateTab: vi.fn(),
+  activateWebRuntimeSessionTab: vi.fn(),
+  closeBrowserTab: vi.fn(),
+  closeWebRuntimeSessionTab: vi.fn(),
+  closeFile: vi.fn(),
   closeTab: vi.fn(),
+  createBrowserTab: vi.fn(),
   createTab: vi.fn(),
+  createWebRuntimeSessionBrowserTab: vi.fn(),
+  createWebRuntimeSessionTerminal: vi.fn(),
   focusTerminalTabSurface: vi.fn(),
   getFloatingTerminalCwd: vi.fn(),
   getInstallStatus: vi.fn(),
-  setActiveTabForWorktree: vi.fn(),
-  setTabBarOrder: vi.fn(),
+  isWebRuntimeSessionActive: vi.fn(),
+  markFileDirty: vi.fn(),
+  openFile: vi.fn(),
+  pinFile: vi.fn(),
+  setActiveTab: vi.fn(),
   setTabColor: vi.fn(),
   setTabCustomTitle: vi.fn(),
   setTabPaneExpanded: vi.fn()
+}))
+
+const saveDialogBox = vi.hoisted(() => ({
+  fileId: null as string | null
 }))
 
 vi.mock('react', async () => {
@@ -110,10 +151,101 @@ vi.mock('@/components/terminal-pane/TerminalPane', () => ({
   }
 }))
 
+vi.mock('@/components/browser-pane/BrowserPane', () => ({
+  default: function BrowserPane() {
+    return null
+  }
+}))
+
+vi.mock('@/components/editor/EditorPanel', () => ({
+  default: function EditorPanel() {
+    return null
+  }
+}))
+
 vi.mock('@/components/ui/button', () => ({
   Button: function Button() {
     return null
   }
+}))
+
+vi.mock('@/components/ui/dialog', () => ({
+  Dialog: function Dialog(props: { children?: unknown }) {
+    return props.children
+  },
+  DialogContent: function DialogContent(props: { children?: unknown }) {
+    return props.children
+  },
+  DialogDescription: function DialogDescription(props: { children?: unknown }) {
+    return props.children
+  },
+  DialogFooter: function DialogFooter(props: { children?: unknown }) {
+    return props.children
+  },
+  DialogHeader: function DialogHeader(props: { children?: unknown }) {
+    return props.children
+  },
+  DialogTitle: function DialogTitle(props: { children?: unknown }) {
+    return props.children
+  }
+}))
+
+vi.mock('@/components/terminal/useTerminalSaveDialog', () => ({
+  useTerminalSaveDialog: () => ({
+    handleSaveDialogCancel: () => {
+      saveDialogBox.fileId = null
+    },
+    handleSaveDialogDiscard: () => {
+      if (saveDialogBox.fileId) {
+        mocks.markFileDirty(saveDialogBox.fileId, false)
+        mocks.closeFile(saveDialogBox.fileId)
+      }
+      saveDialogBox.fileId = null
+    },
+    handleSaveDialogSave: () => {
+      saveDialogBox.fileId = null
+    },
+    requestCloseFile: (fileId: string) => {
+      const file = (storeBox.state as FloatingPanelStoreState).openFiles.find(
+        (candidate) => candidate.id === fileId
+      )
+      if (file?.isDirty) {
+        saveDialogBox.fileId = fileId
+        return
+      }
+      mocks.closeFile(fileId)
+    },
+    saveDialogFile: saveDialogBox.fileId
+      ? ((storeBox.state as FloatingPanelStoreState).openFiles.find(
+          (file) => file.id === saveDialogBox.fileId
+        ) ?? null)
+      : null,
+    saveDialogFileId: saveDialogBox.fileId
+  })
+}))
+
+vi.mock('@/runtime/web-runtime-session', () => ({
+  activateWebRuntimeSessionTab: mocks.activateWebRuntimeSessionTab,
+  closeWebRuntimeSessionTab: mocks.closeWebRuntimeSessionTab,
+  createWebRuntimeSessionBrowserTab: mocks.createWebRuntimeSessionBrowserTab,
+  createWebRuntimeSessionTerminal: mocks.createWebRuntimeSessionTerminal,
+  isWebRuntimeSessionActive: mocks.isWebRuntimeSessionActive
+}))
+
+vi.mock('@/lib/connection-context', () => ({
+  getConnectionId: () => undefined
+}))
+
+vi.mock('@/lib/create-untitled-markdown', () => ({
+  createUntitledMarkdownFile: vi.fn()
+}))
+
+vi.mock('@/lib/ipc-error', () => ({
+  extractIpcErrorMessage: (_err: unknown, fallback: string) => fallback
+}))
+
+vi.mock('sonner', () => ({
+  toast: { error: vi.fn() }
 }))
 
 vi.mock('@/lib/focus-terminal-tab-surface', () => ({
@@ -172,25 +304,106 @@ function makeTab(overrides: Partial<TerminalTab> = {}): TerminalTab {
   }
 }
 
+function makeFile(overrides: Partial<OpenFile> = {}): OpenFile {
+  const id = overrides.id ?? 'file-1'
+  return {
+    id,
+    filePath: overrides.filePath ?? `/tmp/orca/${id}.md`,
+    relativePath: overrides.relativePath ?? `${id}.md`,
+    worktreeId: overrides.worktreeId ?? FLOATING_TERMINAL_WORKTREE_ID,
+    language: overrides.language ?? 'markdown',
+    isDirty: overrides.isDirty ?? false,
+    mode: overrides.mode ?? 'edit',
+    ...overrides
+  }
+}
+
 function setFloatingTabs(tabs: TerminalTab[]): void {
   const state = storeBox.state as FloatingPanelStoreState
+  const groupId = 'floating-group'
+  const unifiedTabs = tabs.map<Tab>((tab, index) => ({
+    id: tab.id,
+    entityId: tab.id,
+    groupId,
+    worktreeId: FLOATING_TERMINAL_WORKTREE_ID,
+    contentType: 'terminal',
+    label: tab.title,
+    customLabel: tab.customTitle,
+    color: tab.color,
+    sortOrder: index,
+    createdAt: tab.createdAt
+  }))
   state.tabsByWorktree = { [FLOATING_TERMINAL_WORKTREE_ID]: tabs }
+  state.unifiedTabsByWorktree = { [FLOATING_TERMINAL_WORKTREE_ID]: unifiedTabs }
+  state.groupsByWorktree = {
+    [FLOATING_TERMINAL_WORKTREE_ID]: [
+      {
+        id: groupId,
+        worktreeId: FLOATING_TERMINAL_WORKTREE_ID,
+        activeTabId: unifiedTabs[0]?.id ?? null,
+        tabOrder: unifiedTabs.map((tab) => tab.id),
+        recentTabIds: unifiedTabs.map((tab) => tab.id)
+      }
+    ]
+  }
   state.activeTabIdByWorktree = { [FLOATING_TERMINAL_WORKTREE_ID]: tabs[0]?.id ?? null }
   state.tabBarOrderByWorktree = { [FLOATING_TERMINAL_WORKTREE_ID]: tabs.map((tab) => tab.id) }
+}
+
+function setFloatingEditorTabs(files: OpenFile[]): void {
+  const state = storeBox.state as FloatingPanelStoreState
+  const groupId = 'floating-group'
+  const unifiedTabs = files.map<Tab>((file, index) => ({
+    id: `tab-${file.id}`,
+    entityId: file.id,
+    groupId,
+    worktreeId: FLOATING_TERMINAL_WORKTREE_ID,
+    contentType: 'editor',
+    label: file.relativePath,
+    customLabel: null,
+    color: null,
+    sortOrder: index,
+    createdAt: index
+  }))
+  state.openFiles = files
+  state.unifiedTabsByWorktree = { [FLOATING_TERMINAL_WORKTREE_ID]: unifiedTabs }
+  state.groupsByWorktree = {
+    [FLOATING_TERMINAL_WORKTREE_ID]: [
+      {
+        id: groupId,
+        worktreeId: FLOATING_TERMINAL_WORKTREE_ID,
+        activeTabId: unifiedTabs[0]?.id ?? null,
+        tabOrder: unifiedTabs.map((tab) => tab.id),
+        recentTabIds: unifiedTabs.map((tab) => tab.id)
+      }
+    ]
+  }
 }
 
 function resetStore(tabs: TerminalTab[] = []): void {
   storeBox.state = {
     tabsByWorktree: { [FLOATING_TERMINAL_WORKTREE_ID]: tabs },
+    browserTabsByWorktree: {},
+    browserPagesByWorkspace: {},
+    groupsByWorktree: {},
+    unifiedTabsByWorktree: {},
+    openFiles: [],
     activeTabIdByWorktree: { [FLOATING_TERMINAL_WORKTREE_ID]: tabs[0]?.id ?? null },
     expandedPaneByTabId: {},
+    activateTab: mocks.activateTab,
+    closeBrowserTab: mocks.closeBrowserTab,
+    closeFile: mocks.closeFile,
     createTab: mocks.createTab,
+    createBrowserTab: mocks.createBrowserTab,
     closeTab: mocks.closeTab,
-    setActiveTabForWorktree: mocks.setActiveTabForWorktree,
-    setTabBarOrder: mocks.setTabBarOrder,
+    markFileDirty: mocks.markFileDirty,
+    openFile: mocks.openFile,
+    pinFile: mocks.pinFile,
+    setActiveTab: mocks.setActiveTab,
     setTabCustomTitle: mocks.setTabCustomTitle,
     setTabColor: mocks.setTabColor,
     setTabPaneExpanded: mocks.setTabPaneExpanded,
+    browserDefaultUrl: 'about:blank',
     tabBarOrderByWorktree: { [FLOATING_TERMINAL_WORKTREE_ID]: tabs.map((tab) => tab.id) },
     settings: { floatingTerminalCwd: '~' }
   } satisfies FloatingPanelStoreState
@@ -238,6 +451,11 @@ function runEffects(): void {
   }
 }
 
+async function flushAsyncWork(): Promise<void> {
+  await Promise.resolve()
+  await Promise.resolve()
+}
+
 async function renderPanel(open: boolean, onOpenChange = vi.fn()): Promise<unknown> {
   hookRuntime.index = 0
   const { FloatingTerminalPanel } = await import('./FloatingTerminalPanel')
@@ -250,14 +468,19 @@ describe('FloatingTerminalPanel close behavior', () => {
     hookRuntime.effects = []
     hookRuntime.index = 0
     hookRuntime.values = []
+    saveDialogBox.fileId = null
     resetStore()
     mocks.createTab.mockReturnValue(makeTab({ id: 'created-tab' }))
+    mocks.createWebRuntimeSessionBrowserTab.mockResolvedValue(false)
+    mocks.createWebRuntimeSessionTerminal.mockResolvedValue(false)
     mocks.getFloatingTerminalCwd.mockResolvedValue('/tmp/orca')
     mocks.getInstallStatus.mockResolvedValue({ state: 'installed' })
+    mocks.isWebRuntimeSessionActive.mockReturnValue(false)
     vi.stubGlobal('window', {
       addEventListener: vi.fn(),
       api: {
         app: { getFloatingTerminalCwd: mocks.getFloatingTerminalCwd },
+        browser: { notifyActiveTabChanged: vi.fn() },
         cli: { getInstallStatus: mocks.getInstallStatus }
       },
       innerWidth: 1200,
@@ -273,25 +496,51 @@ describe('FloatingTerminalPanel close behavior', () => {
   it('bootstraps a terminal tab only when the panel opens', async () => {
     await renderPanel(false)
     runEffects()
+    await flushAsyncWork()
     expect(mocks.createTab).not.toHaveBeenCalled()
 
     await renderPanel(true)
     runEffects()
+    await flushAsyncWork()
     expect(mocks.createTab).toHaveBeenCalledTimes(1)
-    expect(mocks.setActiveTabForWorktree).toHaveBeenCalledWith(
+    expect(mocks.createTab).toHaveBeenCalledWith(
       FLOATING_TERMINAL_WORKTREE_ID,
-      'created-tab'
+      undefined,
+      undefined,
+      { activate: false }
     )
+    expect(mocks.activateTab).toHaveBeenCalledWith('created-tab')
+    expect(mocks.focusTerminalTabSurface).toHaveBeenCalledWith('created-tab')
 
     await renderPanel(true)
     runEffects()
+    await flushAsyncWork()
     expect(mocks.createTab).toHaveBeenCalledTimes(1)
 
     await renderPanel(false)
     runEffects()
     await renderPanel(true)
     runEffects()
+    await flushAsyncWork()
     expect(mocks.createTab).toHaveBeenCalledTimes(2)
+  })
+
+  it('creates new floating terminal tabs without globally activating createTab', async () => {
+    setFloatingTabs([makeTab({ id: 'tab-1' })])
+
+    const element = await renderPanel(true)
+    const tabBar = findByTypeName(element, 'TabBar')
+    ;(tabBar.props.onNewTerminalTab as () => void)()
+    await flushAsyncWork()
+
+    expect(mocks.createTab).toHaveBeenCalledWith(
+      FLOATING_TERMINAL_WORKTREE_ID,
+      'floating-group',
+      undefined,
+      { activate: false }
+    )
+    expect(mocks.activateTab).toHaveBeenCalledWith('created-tab')
+    expect(mocks.focusTerminalTabSurface).toHaveBeenCalledWith('created-tab')
   })
 
   it('closes the panel when the explicit close action removes the last tab', async () => {
@@ -341,6 +590,74 @@ describe('FloatingTerminalPanel close behavior', () => {
     expect(onOpenChange).toHaveBeenCalledWith(false)
   })
 
+  it('routes floating terminal create and close through active web runtime sessions', async () => {
+    const onOpenChange = vi.fn()
+    setFloatingTabs([makeTab({ id: 'tab-1' })])
+    ;(storeBox.state as FloatingPanelStoreState).settings.activeRuntimeEnvironmentId = 'runtime-1'
+    mocks.isWebRuntimeSessionActive.mockReturnValue(true)
+    mocks.createWebRuntimeSessionTerminal.mockResolvedValue(true)
+
+    const element = await renderPanel(true, onOpenChange)
+    const tabBar = findByTypeName(element, 'TabBar')
+    ;(tabBar.props.onNewTerminalTab as () => void)()
+    await flushAsyncWork()
+
+    expect(mocks.createWebRuntimeSessionTerminal).toHaveBeenCalledWith({
+      worktreeId: FLOATING_TERMINAL_WORKTREE_ID,
+      targetGroupId: 'floating-group',
+      command: undefined,
+      activate: true,
+      selectWorktree: false
+    })
+    expect(mocks.createTab).not.toHaveBeenCalled()
+
+    ;(tabBar.props.onClose as (tabId: string) => void)('tab-1')
+    expect(mocks.closeWebRuntimeSessionTab).toHaveBeenCalledWith({
+      worktreeId: FLOATING_TERMINAL_WORKTREE_ID,
+      tabId: 'tab-1',
+      environmentId: 'runtime-1'
+    })
+    expect(mocks.closeTab).not.toHaveBeenCalled()
+    expect(onOpenChange).not.toHaveBeenCalled()
+  })
+
+  it('queues dirty editor closes from close-all-files instead of overwriting the dialog id', async () => {
+    setFloatingEditorTabs([
+      makeFile({ id: 'file-a', isDirty: true }),
+      makeFile({ id: 'file-b', isDirty: true })
+    ])
+
+    const element = await renderPanel(true)
+    const tabBar = findByTypeName(element, 'TabBar')
+    ;(tabBar.props.onCloseAllFiles as () => void)()
+
+    expect(saveDialogBox.fileId).toBe('file-a')
+    expect(mocks.closeFile).not.toHaveBeenCalledWith('file-a')
+    expect(mocks.closeFile).not.toHaveBeenCalledWith('file-b')
+  })
+
+  it('queues dirty editor closes from close-others and close-to-right one file at a time', async () => {
+    setFloatingEditorTabs([
+      makeFile({ id: 'file-a', isDirty: true }),
+      makeFile({ id: 'file-b', isDirty: true }),
+      makeFile({ id: 'file-c', isDirty: true })
+    ])
+
+    const element = await renderPanel(true)
+    const tabBar = findByTypeName(element, 'TabBar')
+    ;(tabBar.props.onCloseOthers as (tabId: string) => void)('tab-file-b')
+    expect(saveDialogBox.fileId).toBe('file-a')
+
+    saveDialogBox.fileId = null
+    mocks.closeFile.mockClear()
+    hookRuntime.values = []
+    const nextElement = await renderPanel(true)
+    const nextTabBar = findByTypeName(nextElement, 'TabBar')
+    ;(nextTabBar.props.onCloseToRight as (tabId: string) => void)('tab-file-a')
+    expect(saveDialogBox.fileId).toBe('file-b')
+    expect(mocks.closeFile).not.toHaveBeenCalledWith('file-c')
+  })
+
   it('reads the current tab list for bulk close actions', async () => {
     setFloatingTabs([makeTab({ id: 'old-left' }), makeTab({ id: 'old-keep' })])
 
@@ -373,6 +690,9 @@ describe('FloatingTerminalPanel close behavior', () => {
     ;(storeBox.state as FloatingPanelStoreState).tabBarOrderByWorktree = {
       [FLOATING_TERMINAL_WORKTREE_ID]: ['tab-c', 'tab-a', 'tab-b']
     }
+    ;(storeBox.state as FloatingPanelStoreState).groupsByWorktree[
+      FLOATING_TERMINAL_WORKTREE_ID
+    ][0].tabOrder = ['tab-c', 'tab-a', 'tab-b']
 
     const element = await renderPanel(true)
     const tabBar = findByTypeName(element, 'TabBar')

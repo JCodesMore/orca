@@ -6,11 +6,13 @@ type ListenerRecord = {
   options?: boolean | AddEventListenerOptions
 }
 
-function createWebview(): Electron.WebviewTag {
+function createWebview(overrides: Partial<Electron.WebviewTag> = {}): Electron.WebviewTag {
   return {
     style: {},
+    blur: vi.fn(),
     remove: vi.fn(),
-    contains: vi.fn(() => false)
+    contains: vi.fn(() => false),
+    ...overrides
   } as unknown as Electron.WebviewTag
 }
 
@@ -95,5 +97,40 @@ describe('webview registry drag listeners', () => {
     registerPersistentWebview('page-2', createWebview())
 
     expect(addedListeners).toHaveLength(3)
+  })
+
+  it('moves focus back to the renderer before detaching the focused webview', async () => {
+    const { moveFocusToRendererBeforeWebviewDetach } = await import('./webview-registry')
+    const webview = createWebview()
+    vi.stubGlobal('document', { activeElement: webview })
+
+    moveFocusToRendererBeforeWebviewDetach(webview)
+
+    expect(webview.blur).toHaveBeenCalledTimes(1)
+    expect(window.focus).toHaveBeenCalledTimes(1)
+  })
+
+  it('moves focus back to the renderer before detaching a webview that contains focus', async () => {
+    const { moveFocusToRendererBeforeWebviewDetach } = await import('./webview-registry')
+    const activeElement = { blur: vi.fn() } as unknown as HTMLElement
+    const webview = createWebview({ contains: vi.fn(() => true) })
+    vi.stubGlobal('document', { activeElement })
+
+    moveFocusToRendererBeforeWebviewDetach(webview)
+
+    expect(activeElement.blur).toHaveBeenCalledTimes(1)
+    expect(window.focus).toHaveBeenCalledTimes(1)
+  })
+
+  it('leaves focus alone before detaching an unfocused webview', async () => {
+    const { moveFocusToRendererBeforeWebviewDetach } = await import('./webview-registry')
+    const activeElement = { blur: vi.fn() } as unknown as HTMLElement
+    const webview = createWebview()
+    vi.stubGlobal('document', { activeElement })
+
+    moveFocusToRendererBeforeWebviewDetach(webview)
+
+    expect(activeElement.blur).not.toHaveBeenCalled()
+    expect(window.focus).not.toHaveBeenCalled()
   })
 })

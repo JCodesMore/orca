@@ -2,6 +2,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { buildWorktreeComparator } from '@/components/sidebar/smart-sort'
 import type * as AgentStatusModule from '@/lib/agent-status'
+import { getDefaultSettings } from '../../../../shared/constants'
 
 // Mock sonner (imported by repos.ts)
 vi.mock('sonner', () => ({ toast: { info: vi.fn(), success: vi.fn(), error: vi.fn() } }))
@@ -411,6 +412,63 @@ describe('setActiveWorktree', () => {
     expect(worktrees.map((worktree) => worktree.id)).toEqual([backgroundId, focusedId])
   })
 
+  it('restores the remembered right sidebar tab per worktree', () => {
+    const store = createTestStore()
+    const wt1 = 'repo1::/path/wt1'
+    const wt2 = 'repo1::/path/wt2'
+
+    seedStore(store, {
+      worktreesByRepo: {
+        repo1: [
+          makeWorktree({ id: wt1, repoId: 'repo1', path: '/path/wt1' }),
+          makeWorktree({ id: wt2, repoId: 'repo1', path: '/path/wt2' })
+        ]
+      },
+      rightSidebarTabByWorktree: { [wt1]: 'search', [wt2]: 'checks' }
+    })
+
+    store.getState().setActiveWorktree(wt1)
+    expect(store.getState().rightSidebarTab).toBe('search')
+
+    store.getState().setActiveWorktree(wt2)
+    expect(store.getState().rightSidebarTab).toBe('checks')
+
+    store.getState().setActiveWorktree(wt1)
+    expect(store.getState().rightSidebarTab).toBe('search')
+  })
+
+  it('defaults new worktrees without remembered right sidebar state to explorer', () => {
+    const store = createTestStore()
+    const wt = 'repo1::/path/wt1'
+
+    seedStore(store, {
+      worktreesByRepo: {
+        repo1: [makeWorktree({ id: wt, repoId: 'repo1', path: '/path/wt1' })]
+      },
+      rightSidebarTab: 'checks'
+    })
+
+    store.getState().setActiveWorktree(wt)
+
+    expect(store.getState().rightSidebarTab).toBe('explorer')
+  })
+
+  it('does not clobber the current right sidebar tab when clearing the active worktree', () => {
+    const store = createTestStore()
+
+    seedStore(store, {
+      activeWorktreeId: 'repo1::/path/wt1',
+      rightSidebarTab: 'checks',
+      rightSidebarTabByWorktree: { 'repo1::/path/wt1': 'search' }
+    })
+
+    store.getState().setActiveWorktree(null)
+
+    expect(store.getState().activeWorktreeId).toBeNull()
+    expect(store.getState().rightSidebarTab).toBe('checks')
+    expect(store.getState().rightSidebarTabByWorktree).toEqual({ 'repo1::/path/wt1': 'search' })
+  })
+
   it('falls back to the worktree browser tab when the restored editor id belongs to a different worktree', () => {
     const store = createTestStore()
     const wt1 = 'repo1::/path/wt1'
@@ -626,6 +684,75 @@ describe('setActiveWorktree', () => {
     )
     expect(groups[0].activeTabId).toBe(terminal.id)
     expect(groups[0].tabOrder).toEqual([terminal.id])
+  })
+
+  it('stamps the Windows default shell onto new terminal tabs', () => {
+    const originalNavigator = globalThis.navigator
+    Object.defineProperty(globalThis, 'navigator', {
+      value: { userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+      configurable: true
+    })
+    try {
+      const store = createTestStore()
+      const wt = 'repo1::/path/wt1'
+
+      seedStore(store, {
+        settings: { ...getDefaultSettings('/tmp'), terminalWindowsShell: 'wsl.exe' },
+        worktreesByRepo: {
+          repo1: [makeWorktree({ id: wt, repoId: 'repo1', path: '/path/wt1' })]
+        }
+      })
+
+      const terminal = store.getState().createTab(wt)
+      expect(terminal.shellOverride).toBe('wsl.exe')
+
+      store.setState({
+        settings: { ...store.getState().settings!, terminalWindowsShell: 'cmd.exe' }
+      })
+      expect(store.getState().tabsByWorktree[wt][0].shellOverride).toBe('wsl.exe')
+    } finally {
+      Object.defineProperty(globalThis, 'navigator', {
+        value: originalNavigator,
+        configurable: true
+      })
+    }
+  })
+
+  it('does not stamp local Windows shell icons onto SSH terminal tabs', () => {
+    const originalNavigator = globalThis.navigator
+    Object.defineProperty(globalThis, 'navigator', {
+      value: { userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+      configurable: true
+    })
+    try {
+      const store = createTestStore()
+      const wt = 'remote-repo::/path/wt1'
+
+      seedStore(store, {
+        repos: [
+          {
+            id: 'remote-repo',
+            path: '/remote/repo',
+            displayName: 'Remote Repo',
+            badgeColor: '#000',
+            addedAt: 0,
+            connectionId: 'ssh-1'
+          }
+        ],
+        settings: { ...getDefaultSettings('/tmp'), terminalWindowsShell: 'wsl.exe' },
+        worktreesByRepo: {
+          'remote-repo': [makeWorktree({ id: wt, repoId: 'remote-repo', path: '/path/wt1' })]
+        }
+      })
+
+      const terminal = store.getState().createTab(wt, undefined, 'cmd.exe')
+      expect(terminal.shellOverride).toBeUndefined()
+    } finally {
+      Object.defineProperty(globalThis, 'navigator', {
+        value: originalNavigator,
+        configurable: true
+      })
+    }
   })
 
   it('publishes the first terminal and root tab group atomically', () => {
@@ -1733,6 +1860,30 @@ describe('createTab tabId hint', () => {
     try {
       const tab = store.getState().createTab(wt, undefined, undefined, { id: '' })
       expect(tab.id).not.toBe('')
+      expect(warn).not.toHaveBeenCalled()
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('ignores web mirror id hints instead of making them canonical host tab ids', () => {
+    const store = createTestStore()
+    const wt = 'repo1::/path/wt-web-hint'
+    seedStore(store, {
+      worktreesByRepo: {
+        repo1: [makeWorktree({ id: wt, repoId: 'repo1', path: '/path/wt-web-hint' })]
+      },
+      groupsByWorktree: {},
+      activeGroupIdByWorktree: {},
+      unifiedTabsByWorktree: {}
+    })
+
+    const hintedId = 'web-terminal-host-tab-1'
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const tab = store.getState().createTab(wt, undefined, undefined, { id: hintedId })
+      expect(tab.id).not.toBe(hintedId)
+      expect(tab.id).not.toMatch(/^web-terminal-/)
       expect(warn).not.toHaveBeenCalled()
     } finally {
       warn.mockRestore()

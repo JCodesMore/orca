@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- Why: default persisted settings live in one schema-shaped object so migrations and tests compare against one source of truth. */
 import type {
   GlobalSettings,
   NotificationSettings,
@@ -6,8 +7,7 @@ import type {
   PersistedState,
   PersistedUIState,
   RepoHookSettings,
-  WorkspaceSessionState,
-  WorktreeCardProperty
+  WorkspaceSessionState
 } from './types'
 import { DEFAULT_STATUS_BAR_ITEMS } from './status-bar-defaults'
 import { DEFAULT_TERMINAL_FONT_WEIGHT } from './terminal-fonts'
@@ -15,15 +15,21 @@ import { getDefaultTerminalQuickCommands } from './terminal-quick-commands'
 import type { VoiceSettings } from './speech-types'
 import { cloneDefaultWorkspaceStatuses } from './workspace-statuses'
 import { TASK_PROVIDERS } from './task-providers'
+import { DEFAULT_WORKTREE_CARD_PROPERTIES } from './worktree-card-properties'
 
 export { DEFAULT_STATUS_BAR_ITEMS } from './status-bar-defaults'
+export {
+  ALWAYS_VISIBLE_WORKTREE_CARD_PROPERTIES,
+  DEFAULT_WORKTREE_CARD_PROPERTIES,
+  normalizeWorktreeCardProperties
+} from './worktree-card-properties'
 
 export const SCHEMA_VERSION = 1
 export const DEFAULT_APP_FONT_FAMILY = 'Geist'
 
 // Why: the onboarding wizard's last step index. Centralized so backfill,
 // clamps, and UI step references all agree on the same upper bound.
-export const ONBOARDING_FINAL_STEP = 4
+export const ONBOARDING_FINAL_STEP = 5
 
 export const ORCA_BROWSER_PARTITION = 'persist:orca-browser'
 // Why: blank browser tabs must start from an inert guest URL that does not
@@ -83,20 +89,6 @@ export const MAX_EDITOR_AUTO_SAVE_DELAY_MS = 10_000
 // in starNagNextThreshold, so this constant is only the first-time seed.
 export const STAR_NAG_INITIAL_THRESHOLD = 35
 
-export const DEFAULT_WORKTREE_CARD_PROPERTIES: WorktreeCardProperty[] = [
-  'status',
-  'unread',
-  'ci',
-  'issue',
-  'pr',
-  'comment',
-  // Why: agent activity is the primary reason users opt into the feature, so
-  // show it inline on each card by default. Unchecking this from the
-  // Workspaces view options hides the inline list entirely — there is no
-  // alternative agent-activity surface in the sidebar.
-  'inline-agents'
-]
-
 /** Synthetic worktree id used by the memory collector to bucket PTYs that
  *  are not associated with any worktree. Shared across main and renderer so
  *  the collector and the status-bar popover agree on the sentinel. */
@@ -125,7 +117,8 @@ export function getDefaultNotificationSettings(): NotificationSettings {
     agentTaskComplete: true,
     terminalBell: false,
     suppressWhenFocused: true,
-    customSoundPath: null
+    customSoundPath: null,
+    customSoundVolume: 100
   }
 }
 
@@ -213,6 +206,7 @@ export function getDefaultSettings(homedir: string): GlobalSettings {
     openInApplications: [],
     rightSidebarOpenByDefault: true,
     showGitIgnoredFiles: true,
+    sourceControlViewMode: 'list',
     showTitlebarAppName: true,
     showTasksButton: true,
     ctrlTabOrderMode: 'mru',
@@ -259,7 +253,8 @@ export function getDefaultSettings(homedir: string): GlobalSettings {
     // Why: off by default — opt-in cosmetic joke feature. Leaving the default
     // false keeps the overlay unmounted for users who never enable it.
     experimentalPet: false,
-    experimentalActivity: true,
+    experimentalActivity: false,
+    experimentalActivityDefaultedOffForAllUsers: true,
     experimentalWorktreeSymlinks: false,
     // Why: local desktop remains the default server until the user explicitly
     // selects a saved runtime environment.
@@ -282,6 +277,9 @@ export function getDefaultSettings(homedir: string): GlobalSettings {
       enabled: true,
       agentId: null,
       selectedModelByAgent: {},
+      discoveredModelsByAgent: {},
+      selectedModelByAgentByHost: {},
+      discoveredModelsByAgentByHost: {},
       selectedThinkingByModel: {},
       customPrompt: '',
       customAgentCommand: ''
@@ -306,6 +304,7 @@ export function getDefaultRepoHookSettings(): RepoHookSettings {
   return {
     mode: 'auto',
     setupRunPolicy: 'run-by-default',
+    commandSourcePolicy: 'shared-only',
     scripts: {
       setup: '',
       archive: ''
@@ -340,8 +339,7 @@ export function getDefaultUIState(): PersistedUIState {
     lastActiveWorktreeId: null,
     sidebarWidth: 280,
     rightSidebarWidth: 350,
-    groupBy: 'repo',
-    showWorkspaceLineage: false,
+    groupBy: 'workspace-status',
     sortBy: 'recent',
     showActiveOnly: false,
     hideDefaultBranchWorkspace: false,
@@ -363,7 +361,8 @@ export function getDefaultUIState(): PersistedUIState {
     lastUpdateCheckAt: null,
     trustedOrcaHooks: {},
     acknowledgedAgentsByPaneKey: {},
-    workspaceCleanup: { dismissals: {} }
+    workspaceCleanup: { dismissals: {} },
+    featureTipsSeenIds: []
   }
 }
 

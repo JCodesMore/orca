@@ -11,7 +11,7 @@ consistent across every repo-scoped subprocess call. */
  */
 import { execFile, execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'child_process'
 import { promisify } from 'util'
-import { parseWslPath, toWindowsWslPath, type WslPathInfo } from '../wsl'
+import { getDefaultWslDistro, parseWslPath, toWindowsWslPath, type WslPathInfo } from '../wsl'
 
 const execFileAsync = promisify(execFile)
 
@@ -121,6 +121,26 @@ function resolveHostGitHubCli(command: 'gh', args: string[]): ResolvedCommand {
   }
 }
 
+function resolveDefaultWslCli(command: 'gh' | 'glab', args: string[]): ResolvedCommand | null {
+  const distro = getDefaultWslDistro()
+  return distro ? resolveCommand(command, args, undefined, distro) : null
+}
+
+function isHostCommandMissing(err: unknown, command: 'gh' | 'glab'): boolean {
+  if (!err || typeof err !== 'object') {
+    return false
+  }
+  const e = err as { code?: unknown; message?: unknown; syscall?: unknown; path?: unknown }
+  if (e.code === 'ENOENT') {
+    return true
+  }
+  const message = typeof e.message === 'string' ? e.message.toLowerCase() : ''
+  return (
+    message.includes('enoent') &&
+    (message.includes(command) || e.path === command || e.syscall === 'spawn')
+  )
+}
+
 /**
  * Given a command, its arguments, and a working directory, resolve whether
  * the invocation should be routed through wsl.exe.
@@ -190,6 +210,15 @@ type GitExecOptions = {
   maxBuffer?: number
   timeout?: number
   env?: NodeJS.ProcessEnv
+}
+
+export function gitOptionalLocksDisabledEnv(
+  env: NodeJS.ProcessEnv = process.env
+): NodeJS.ProcessEnv {
+  return {
+    ...env,
+    GIT_OPTIONAL_LOCKS: '0'
+  }
 }
 
 /**
@@ -502,6 +531,7 @@ export async function ghExecFileAsync(
   let resolved = resolveCommand('gh', args, options.cwd, options.wslDistro)
   let lastError: unknown
   let attemptedHostFallback = false
+  let attemptedDefaultWslFallback = false
   for (let attempt = 0; attempt <= GH_RETRY_DELAYS_MS.length; attempt++) {
     try {
       const { stdout, stderr } = await execFileAsync(resolved.binary, resolved.args, {
@@ -515,6 +545,24 @@ export async function ghExecFileAsync(
     } catch (err) {
       lastError = err
       const { stderr } = extractExecError(err)
+      if (
+        process.platform === 'win32' &&
+        !attemptedDefaultWslFallback &&
+        resolved.wsl === null &&
+        !options.cwd &&
+        !options.wslDistro &&
+        isHostCommandMissing(err, 'gh')
+      ) {
+        const wslResolved = resolveDefaultWslCli('gh', args)
+        if (wslResolved) {
+          // Why: WSL-only Windows installs have no gh.exe on the host PATH, but
+          // global calls like rate_limit/auth do not carry a repo cwd to route by.
+          resolved = wslResolved
+          attemptedDefaultWslFallback = true
+          attempt = -1
+          continue
+        }
+      }
       if (!attemptedHostFallback && canFallBackToHostGitHubCli('gh', args, resolved, stderr)) {
         resolved = resolveHostGitHubCli('gh', args)
         attemptedHostFallback = true
@@ -578,8 +626,9 @@ export async function glabExecFileAsync(
   args: string[],
   options: GlabExecOptions = {}
 ): Promise<{ stdout: string; stderr: string }> {
-  const resolved = resolveCommand('glab', args, options.cwd, options.wslDistro)
+  let resolved = resolveCommand('glab', args, options.cwd, options.wslDistro)
   let lastError: unknown
+  let attemptedDefaultWslFallback = false
   for (let attempt = 0; attempt <= GH_RETRY_DELAYS_MS.length; attempt++) {
     try {
       const { stdout, stderr } = await execFileAsync(resolved.binary, resolved.args, {
@@ -593,6 +642,23 @@ export async function glabExecFileAsync(
     } catch (err) {
       lastError = err
       const { stderr } = extractExecError(err)
+      if (
+        process.platform === 'win32' &&
+        !attemptedDefaultWslFallback &&
+        resolved.wsl === null &&
+        !options.cwd &&
+        !options.wslDistro &&
+        isHostCommandMissing(err, 'glab')
+      ) {
+        const wslResolved = resolveDefaultWslCli('glab', args)
+        if (wslResolved) {
+          // Why: mirror gh's WSL-only fallback for global GitLab project/auth calls.
+          resolved = wslResolved
+          attemptedDefaultWslFallback = true
+          attempt = -1
+          continue
+        }
+      }
       const isLastAttempt = attempt >= GH_RETRY_DELAYS_MS.length
       // Why: mirror gh's write-safety gate. A transient error after GitLab
       // applies a POST/PATCH/PUT/DELETE must not create duplicate comments,

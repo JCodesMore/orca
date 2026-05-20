@@ -19,6 +19,10 @@ import { callRuntimeRpc, getActiveRuntimeTarget } from '../../runtime/runtime-rp
 import { getHostedReviewCacheKey } from './hosted-review'
 export type { WorktreeSlice, WorktreeDeleteState } from './worktree-helpers'
 
+// Why: the runtime RPC default is intentionally bounded for CLI calls, but the
+// UI must hydrate the same large repo lists the desktop IPC path sees.
+const REMOTE_WORKTREE_LIST_PARITY_LIMIT = 10_000
+
 function arraysShallowEqual(a: string[] | undefined, b: string[] | undefined): boolean {
   if (a === b) {
     return true
@@ -104,10 +108,57 @@ function toVisibleTabType(contentType: string): WorkspaceVisibleTabType {
   return contentType === 'browser' ? 'browser' : contentType === 'terminal' ? 'terminal' : 'editor'
 }
 
+function toRuntimeWorktreeIdSelector(worktreeId: string): string {
+  return `id:${worktreeId}`
+}
+
 type WorktreeWithLineage = Worktree & {
   parentWorktreeId?: string | null
   childWorktreeIds?: string[]
   lineage?: WorktreeLineage | null
+}
+
+function isRuntimeSelectorNotFoundError(error: unknown): boolean {
+  if (
+    error &&
+    typeof error === 'object' &&
+    'cause' in error &&
+    isRuntimeSelectorNotFoundError((error as { cause?: unknown }).cause)
+  ) {
+    return true
+  }
+  const code =
+    error &&
+    typeof error === 'object' &&
+    'code' in error &&
+    typeof (error as { code: unknown }).code === 'string'
+      ? (error as { code: string }).code
+      : null
+  const responseCode =
+    error &&
+    typeof error === 'object' &&
+    'response' in error &&
+    typeof (error as { response?: { error?: { code?: unknown } } }).response?.error?.code ===
+      'string'
+      ? (error as { response: { error: { code: string } } }).response.error.code
+      : null
+  const responseMessage =
+    error &&
+    typeof error === 'object' &&
+    'response' in error &&
+    typeof (error as { response?: { error?: { message?: unknown } } }).response?.error?.message ===
+      'string'
+      ? (error as { response: { error: { message: string } } }).response.error.message
+      : null
+  const message = error instanceof Error ? error.message : String(error)
+  return (
+    message === 'selector_not_found' ||
+    message.includes('selector_not_found') ||
+    code === 'selector_not_found' ||
+    responseCode === 'selector_not_found' ||
+    responseMessage === 'selector_not_found' ||
+    String(error).includes('selector_not_found')
+  )
 }
 
 function replaceWorktreeInRepoLists(
@@ -138,7 +189,7 @@ async function listWorktreesForRepo(
   const result = await callRuntimeRpc<{ worktrees: Worktree[] }>(
     target,
     'worktree.list',
-    { repo: repoId },
+    { repo: repoId, limit: REMOTE_WORKTREE_LIST_PARITY_LIMIT },
     // Why: remote environment hydration crosses the network. Bound the call
     // so startup can recover instead of leaving the renderer waiting forever.
     { timeoutMs: 15_000 }
@@ -192,9 +243,139 @@ async function persistWorktreeMeta(
   await callRuntimeRpc(
     target,
     'worktree.set',
-    { worktree: worktreeId, ...updates },
+    { worktree: toRuntimeWorktreeIdSelector(worktreeId), ...updates },
     { timeoutMs: 15_000 }
   )
+}
+
+function buildWorktreePurgeState(s: AppState, worktreeIds: string[]): Partial<AppState> {
+  const worktreeIdSet = new Set(worktreeIds)
+
+  // Collect every tab id (and removed file id) we are about to orphan.
+  const doomedTabIds = new Set<string>()
+  const removedFileIds = new Set<string>()
+  for (const id of worktreeIdSet) {
+    for (const tab of s.tabsByWorktree[id] ?? []) {
+      doomedTabIds.add(tab.id)
+    }
+  }
+  for (const file of s.openFiles) {
+    if (worktreeIdSet.has(file.worktreeId)) {
+      removedFileIds.add(file.id)
+    }
+  }
+
+  const omitByWorktree = <T>(obj: Record<string, T>): Record<string, T> => {
+    let changed = false
+    const out = { ...obj }
+    for (const id of worktreeIdSet) {
+      if (id in out) {
+        delete out[id]
+        changed = true
+      }
+    }
+    return changed ? out : obj
+  }
+  const omitByTabId = <T>(obj: Record<string, T>): Record<string, T> => {
+    let changed = false
+    const out = { ...obj }
+    for (const tabId of doomedTabIds) {
+      if (tabId in out) {
+        delete out[tabId]
+        changed = true
+      }
+    }
+    return changed ? out : obj
+  }
+  const omitByFileId = <T>(obj: Record<string, T>): Record<string, T> => {
+    let changed = false
+    const out = { ...obj }
+    for (const fileId of removedFileIds) {
+      if (fileId in out) {
+        delete out[fileId]
+        changed = true
+      }
+    }
+    return changed ? out : obj
+  }
+
+  const nextOpenFiles = s.openFiles.some((f) => worktreeIdSet.has(f.worktreeId))
+    ? s.openFiles.filter((f) => !worktreeIdSet.has(f.worktreeId))
+    : s.openFiles
+
+  const removedActive = s.activeWorktreeId != null && worktreeIdSet.has(s.activeWorktreeId)
+  const activeFileCleared = s.activeFileId != null && removedFileIds.has(s.activeFileId)
+  const activeTabCleared = s.activeTabId != null && doomedTabIds.has(s.activeTabId)
+
+  const nextEverActivatedWorktreeIds = (() => {
+    let hit = false
+    for (const id of worktreeIdSet) {
+      if (s.everActivatedWorktreeIds.has(id)) {
+        hit = true
+        break
+      }
+    }
+    if (!hit) {
+      return s.everActivatedWorktreeIds
+    }
+    const next = new Set(s.everActivatedWorktreeIds)
+    for (const id of worktreeIdSet) {
+      next.delete(id)
+    }
+    return next
+  })()
+
+  return {
+    // Worktree-scoped terminal/tab state
+    worktreeLineageById: omitByWorktree(s.worktreeLineageById),
+    tabsByWorktree: omitByWorktree(s.tabsByWorktree),
+    terminalLayoutsByTabId: omitByTabId(s.terminalLayoutsByTabId),
+    ptyIdsByTabId: omitByTabId(s.ptyIdsByTabId),
+    runtimePaneTitlesByTabId: omitByTabId(s.runtimePaneTitlesByTabId),
+    // Delete state
+    deleteStateByWorktreeId: omitByWorktree(s.deleteStateByWorktreeId),
+    baseStatusByWorktreeId: omitByWorktree(s.baseStatusByWorktreeId),
+    remoteBranchConflictByWorktreeId: omitByWorktree(s.remoteBranchConflictByWorktreeId),
+    // File search
+    fileSearchStateByWorktree: omitByWorktree(s.fileSearchStateByWorktree),
+    // Browser state
+    browserTabsByWorktree: omitByWorktree(s.browserTabsByWorktree),
+    recentlyClosedBrowserTabsByWorktree: omitByWorktree(s.recentlyClosedBrowserTabsByWorktree),
+    activeBrowserTabIdByWorktree: omitByWorktree(s.activeBrowserTabIdByWorktree),
+    // Editor state
+    activeFileIdByWorktree: omitByWorktree(s.activeFileIdByWorktree),
+    activeTabTypeByWorktree: omitByWorktree(s.activeTabTypeByWorktree),
+    activeTabIdByWorktree: omitByWorktree(s.activeTabIdByWorktree),
+    tabBarOrderByWorktree: omitByWorktree(s.tabBarOrderByWorktree),
+    pendingReconnectTabByWorktree: omitByWorktree(s.pendingReconnectTabByWorktree),
+    rightSidebarTabByWorktree: omitByWorktree(s.rightSidebarTabByWorktree),
+    // Split-tab / unified tab state
+    unifiedTabsByWorktree: omitByWorktree(s.unifiedTabsByWorktree),
+    groupsByWorktree: omitByWorktree(s.groupsByWorktree),
+    layoutByWorktree: omitByWorktree(s.layoutByWorktree),
+    activeGroupIdByWorktree: omitByWorktree(s.activeGroupIdByWorktree),
+    // Git status caches
+    gitStatusByWorktree: omitByWorktree(s.gitStatusByWorktree),
+    gitIgnoredPathsByWorktree: omitByWorktree(s.gitIgnoredPathsByWorktree),
+    gitConflictOperationByWorktree: omitByWorktree(s.gitConflictOperationByWorktree),
+    trackedConflictPathsByWorktree: omitByWorktree(s.trackedConflictPathsByWorktree),
+    gitBranchChangesByWorktree: omitByWorktree(s.gitBranchChangesByWorktree),
+    gitBranchCompareSummaryByWorktree: omitByWorktree(s.gitBranchCompareSummaryByWorktree),
+    gitBranchCompareRequestKeyByWorktree: omitByWorktree(s.gitBranchCompareRequestKeyByWorktree),
+    expandedDirs: omitByWorktree(s.expandedDirs),
+    // Per-file editor state for removed files
+    editorDrafts: omitByFileId(s.editorDrafts),
+    markdownViewMode: omitByFileId(s.markdownViewMode),
+    // Top-level actives
+    openFiles: nextOpenFiles,
+    everActivatedWorktreeIds: nextEverActivatedWorktreeIds,
+    lastVisitedAtByWorktreeId: omitByWorktree(s.lastVisitedAtByWorktreeId),
+    activeWorktreeId: removedActive ? null : s.activeWorktreeId,
+    activeFileId: activeFileCleared ? null : s.activeFileId,
+    activeBrowserTabId: removedActive ? null : s.activeBrowserTabId,
+    activeTabId: activeTabCleared ? null : s.activeTabId,
+    activeTabType: removedActive || activeFileCleared ? 'terminal' : s.activeTabType
+  }
 }
 
 export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> = (set, get) => ({
@@ -230,13 +411,21 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
         return
       }
 
-      set((s) => ({
-        // Why: active worktrees can change branches entirely from a terminal.
-        // We refresh that live git identity into renderer state, but only bump
-        // sortEpoch when git actually reports a different worktree payload.
-        worktreesByRepo: { ...s.worktreesByRepo, [repoId]: worktrees },
-        sortEpoch: s.sortEpoch + 1
-      }))
+      set((s) => {
+        const nextIds = new Set(worktrees.map((worktree) => worktree.id))
+        const removedIds = (s.worktreesByRepo[repoId] ?? [])
+          .map((worktree) => worktree.id)
+          .filter((id) => !nextIds.has(id))
+
+        return {
+          // Why: active worktrees can change branches entirely from a terminal.
+          // We refresh that live git identity into renderer state, but only bump
+          // sortEpoch when git actually reports a different worktree payload.
+          worktreesByRepo: { ...s.worktreesByRepo, [repoId]: worktrees },
+          sortEpoch: s.sortEpoch + 1,
+          ...(removedIds.length > 0 ? buildWorktreePurgeState(s, removedIds) : {})
+        }
+      })
       await refreshRemoteWorktreeLineageBestEffort(settings, set)
     } catch (err) {
       console.error(`Failed to fetch worktrees for repo ${repoId}:`, err)
@@ -328,7 +517,7 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
               target,
               'worktree.set',
               {
-                worktree: worktreeId,
+                worktree: toRuntimeWorktreeIdSelector(worktreeId),
                 ...(args.parentWorktreeId ? { parentWorktree: `id:${args.parentWorktreeId}` } : {}),
                 ...(args.noParent === true ? { noParent: true } : {})
               },
@@ -423,24 +612,34 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
     pushTarget,
     createdWithAgent,
     linkedLinearIssue,
+    branchNameOverride,
     workspaceStatus
   ) => {
     const retryableConflictPatterns = [
       /already exists locally/i,
       /already exists on a remote/i,
+      /^Branch ".+" already exists\./i,
       /already has pr #\d+/i
     ]
     const nextCandidateName = (current: string, attempt: number): string =>
       attempt === 0 ? current : `${current}-${attempt + 1}`
+    const nextCandidateBranchName = (
+      current: string | undefined,
+      attempt: number
+    ): string | undefined => (current ? nextCandidateName(current, attempt) : undefined)
 
     try {
       for (let attempt = 0; attempt < 25; attempt += 1) {
         const candidateName = nextCandidateName(name, attempt)
+        const candidateBranchNameOverride = nextCandidateBranchName(branchNameOverride, attempt)
         try {
           const createArgs = {
             repoId,
             name: candidateName,
             baseBranch,
+            ...(candidateBranchNameOverride
+              ? { branchNameOverride: candidateBranchNameOverride }
+              : {}),
             setupDecision,
             sparseCheckout,
             ...(displayName ? { displayName } : {}),
@@ -463,6 +662,9 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
                     repo: repoId,
                     name: candidateName,
                     baseBranch,
+                    ...(candidateBranchNameOverride
+                      ? { branchNameOverride: candidateBranchNameOverride }
+                      : {}),
                     setupDecision,
                     sparseCheckout,
                     ...(displayName ? { displayName } : {}),
@@ -845,6 +1047,10 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
         })
       }
     } catch (err) {
+      if (isRuntimeSelectorNotFoundError(err)) {
+        void get().fetchWorktrees(getRepoIdFromWorktreeId(worktreeId))
+        return
+      }
       console.error('Failed to update worktree meta:', err)
       void get().fetchWorktrees(getRepoIdFromWorktreeId(worktreeId))
     }
@@ -871,6 +1077,10 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
         try {
           await persistWorktreeMeta(settings, worktreeId, updates)
         } catch (err) {
+          if (isRuntimeSelectorNotFoundError(err)) {
+            void get().fetchWorktrees(getRepoIdFromWorktreeId(worktreeId))
+            return
+          }
           console.error('Failed to update worktree meta:', err)
           void get().fetchWorktrees(getRepoIdFromWorktreeId(worktreeId))
         }
@@ -909,6 +1119,10 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
       isUnread: true,
       lastActivityAt: now
     }).catch((err) => {
+      if (isRuntimeSelectorNotFoundError(err)) {
+        void get().fetchWorktrees(getRepoIdFromWorktreeId(worktreeId))
+        return
+      }
       console.error('Failed to persist unread worktree state:', err)
       void get().fetchWorktrees(getRepoIdFromWorktreeId(worktreeId))
     })
@@ -938,6 +1152,10 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
     }
 
     void persistWorktreeMeta(get().settings, worktreeId, { isUnread: false }).catch((err) => {
+      if (isRuntimeSelectorNotFoundError(err)) {
+        void get().fetchWorktrees(getRepoIdFromWorktreeId(worktreeId))
+        return
+      }
       console.error('Failed to persist cleared unread worktree state:', err)
       void get().fetchWorktrees(getRepoIdFromWorktreeId(worktreeId))
     })
@@ -945,11 +1163,13 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
 
   bumpWorktreeActivity: (worktreeId) => {
     const now = Date.now()
+    let shouldPersist = false
     set((s) => {
       const worktree = findWorktreeById(s.worktreesByRepo, worktreeId)
       if (!worktree) {
         return {}
       }
+      shouldPersist = true
       // Skip sortEpoch bump for the active worktree. Terminal events
       // (PTY spawn, PTY exit) in the active worktree are side-effects of
       // the user clicking the card or interacting with the terminal —
@@ -968,7 +1188,14 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
       }
     })
 
+    if (!shouldPersist) {
+      return
+    }
+
     void persistWorktreeMeta(get().settings, worktreeId, { lastActivityAt: now }).catch((err) => {
+      if (isRuntimeSelectorNotFoundError(err)) {
+        return
+      }
       console.error('Failed to persist worktree activity timestamp:', err)
       void get().fetchWorktrees(getRepoIdFromWorktreeId(worktreeId))
     })
@@ -1073,6 +1300,7 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
       const restoredFileId = s.activeFileIdByWorktree[worktreeId] ?? null
       const restoredBrowserTabId = s.activeBrowserTabIdByWorktree[worktreeId] ?? null
       const restoredTabType = s.activeTabTypeByWorktree[worktreeId] ?? 'terminal'
+      const restoredRightSidebarTab = s.rightSidebarTabByWorktree[worktreeId] ?? 'explorer'
       const activeGroupId =
         s.activeGroupIdByWorktree[worktreeId] ?? s.groupsByWorktree[worktreeId]?.[0]?.id ?? null
       const activeGroup = activeGroupId
@@ -1236,6 +1464,7 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
         activeFileId,
         activeBrowserTabId,
         activeTabType,
+        rightSidebarTab: restoredRightSidebarTab,
         activeTabTypeByWorktree: { ...s.activeTabTypeByWorktree, [worktreeId]: activeTabType },
         activeTabId,
         everActivatedWorktreeIds: nextEverActivated,
@@ -1246,9 +1475,8 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
       }
     })
 
-    // Why: force-refreshing GitHub data on every switch burned API rate limit
-    // quota and added 200-800ms latency. Only refresh when cache is actually
-    // stale (>5 min old). Users can still force-refresh via the sidebar button.
+    // Why: activation is explicit enough to revalidate PR state immediately;
+    // the GitHub coordinator still coalesces requests and applies rate guards.
     if (worktreeId) {
       get().refreshGitHubForWorktreeIfStale(worktreeId)
     }
@@ -1263,6 +1491,10 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
       }
 
       void persistWorktreeMeta(get().settings, worktreeId, updates).catch((err) => {
+        if (isRuntimeSelectorNotFoundError(err)) {
+          void get().fetchWorktrees(getRepoIdFromWorktreeId(worktreeId))
+          return
+        }
         console.error('Failed to persist worktree activation state:', err)
         void get().fetchWorktrees(getRepoIdFromWorktreeId(worktreeId))
       })
@@ -1275,135 +1507,6 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
     if (worktreeIds.length === 0) {
       return
     }
-    set((s) => {
-      const worktreeIdSet = new Set(worktreeIds)
-
-      // Collect every tab id (and removed file id) we are about to orphan.
-      const doomedTabIds = new Set<string>()
-      const removedFileIds = new Set<string>()
-      for (const id of worktreeIdSet) {
-        for (const tab of s.tabsByWorktree[id] ?? []) {
-          doomedTabIds.add(tab.id)
-        }
-      }
-      for (const file of s.openFiles) {
-        if (worktreeIdSet.has(file.worktreeId)) {
-          removedFileIds.add(file.id)
-        }
-      }
-
-      const omitByWorktree = <T>(obj: Record<string, T>): Record<string, T> => {
-        let changed = false
-        const out = { ...obj }
-        for (const id of worktreeIdSet) {
-          if (id in out) {
-            delete out[id]
-            changed = true
-          }
-        }
-        return changed ? out : obj
-      }
-      const omitByTabId = <T>(obj: Record<string, T>): Record<string, T> => {
-        let changed = false
-        const out = { ...obj }
-        for (const tabId of doomedTabIds) {
-          if (tabId in out) {
-            delete out[tabId]
-            changed = true
-          }
-        }
-        return changed ? out : obj
-      }
-      const omitByFileId = <T>(obj: Record<string, T>): Record<string, T> => {
-        let changed = false
-        const out = { ...obj }
-        for (const fileId of removedFileIds) {
-          if (fileId in out) {
-            delete out[fileId]
-            changed = true
-          }
-        }
-        return changed ? out : obj
-      }
-
-      const nextOpenFiles = s.openFiles.some((f) => worktreeIdSet.has(f.worktreeId))
-        ? s.openFiles.filter((f) => !worktreeIdSet.has(f.worktreeId))
-        : s.openFiles
-
-      const removedActive = s.activeWorktreeId != null && worktreeIdSet.has(s.activeWorktreeId)
-      const activeFileCleared = s.activeFileId != null && removedFileIds.has(s.activeFileId)
-      const activeTabCleared = s.activeTabId != null && doomedTabIds.has(s.activeTabId)
-
-      const nextEverActivatedWorktreeIds = (() => {
-        let hit = false
-        for (const id of worktreeIdSet) {
-          if (s.everActivatedWorktreeIds.has(id)) {
-            hit = true
-            break
-          }
-        }
-        if (!hit) {
-          return s.everActivatedWorktreeIds
-        }
-        const next = new Set(s.everActivatedWorktreeIds)
-        for (const id of worktreeIdSet) {
-          next.delete(id)
-        }
-        return next
-      })()
-
-      return {
-        // Worktree-scoped terminal/tab state
-        worktreeLineageById: omitByWorktree(s.worktreeLineageById),
-        tabsByWorktree: omitByWorktree(s.tabsByWorktree),
-        terminalLayoutsByTabId: omitByTabId(s.terminalLayoutsByTabId),
-        ptyIdsByTabId: omitByTabId(s.ptyIdsByTabId),
-        runtimePaneTitlesByTabId: omitByTabId(s.runtimePaneTitlesByTabId),
-        // Delete state
-        deleteStateByWorktreeId: omitByWorktree(s.deleteStateByWorktreeId),
-        baseStatusByWorktreeId: omitByWorktree(s.baseStatusByWorktreeId),
-        remoteBranchConflictByWorktreeId: omitByWorktree(s.remoteBranchConflictByWorktreeId),
-        // File search
-        fileSearchStateByWorktree: omitByWorktree(s.fileSearchStateByWorktree),
-        // Browser state
-        browserTabsByWorktree: omitByWorktree(s.browserTabsByWorktree),
-        recentlyClosedBrowserTabsByWorktree: omitByWorktree(s.recentlyClosedBrowserTabsByWorktree),
-        activeBrowserTabIdByWorktree: omitByWorktree(s.activeBrowserTabIdByWorktree),
-        // Editor state
-        activeFileIdByWorktree: omitByWorktree(s.activeFileIdByWorktree),
-        activeTabTypeByWorktree: omitByWorktree(s.activeTabTypeByWorktree),
-        activeTabIdByWorktree: omitByWorktree(s.activeTabIdByWorktree),
-        tabBarOrderByWorktree: omitByWorktree(s.tabBarOrderByWorktree),
-        pendingReconnectTabByWorktree: omitByWorktree(s.pendingReconnectTabByWorktree),
-        // Split-tab / unified tab state
-        unifiedTabsByWorktree: omitByWorktree(s.unifiedTabsByWorktree),
-        groupsByWorktree: omitByWorktree(s.groupsByWorktree),
-        layoutByWorktree: omitByWorktree(s.layoutByWorktree),
-        activeGroupIdByWorktree: omitByWorktree(s.activeGroupIdByWorktree),
-        // Git status caches
-        gitStatusByWorktree: omitByWorktree(s.gitStatusByWorktree),
-        gitIgnoredPathsByWorktree: omitByWorktree(s.gitIgnoredPathsByWorktree),
-        gitConflictOperationByWorktree: omitByWorktree(s.gitConflictOperationByWorktree),
-        trackedConflictPathsByWorktree: omitByWorktree(s.trackedConflictPathsByWorktree),
-        gitBranchChangesByWorktree: omitByWorktree(s.gitBranchChangesByWorktree),
-        gitBranchCompareSummaryByWorktree: omitByWorktree(s.gitBranchCompareSummaryByWorktree),
-        gitBranchCompareRequestKeyByWorktree: omitByWorktree(
-          s.gitBranchCompareRequestKeyByWorktree
-        ),
-        expandedDirs: omitByWorktree(s.expandedDirs),
-        // Per-file editor state for removed files
-        editorDrafts: omitByFileId(s.editorDrafts),
-        markdownViewMode: omitByFileId(s.markdownViewMode),
-        // Top-level actives
-        openFiles: nextOpenFiles,
-        everActivatedWorktreeIds: nextEverActivatedWorktreeIds,
-        lastVisitedAtByWorktreeId: omitByWorktree(s.lastVisitedAtByWorktreeId),
-        activeWorktreeId: removedActive ? null : s.activeWorktreeId,
-        activeFileId: activeFileCleared ? null : s.activeFileId,
-        activeBrowserTabId: removedActive ? null : s.activeBrowserTabId,
-        activeTabId: activeTabCleared ? null : s.activeTabId,
-        activeTabType: removedActive || activeFileCleared ? 'terminal' : s.activeTabType
-      }
-    })
+    set((s) => buildWorktreePurgeState(s, worktreeIds))
   }
 })

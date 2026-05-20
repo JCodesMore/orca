@@ -83,6 +83,7 @@ export type PtySpawnResult = {
 export type IPtyProvider = {
   spawn(opts: PtySpawnOptions): Promise<PtySpawnResult>
   attach(id: string): Promise<void>
+  hasPty?: (id: string) => boolean
   write(id: string, data: string): void
   resize(id: string, cols: number, rows: number): void
   shutdown(id: string, opts: { immediate?: boolean; keepHistory?: boolean }): Promise<void>
@@ -121,6 +122,7 @@ export type FileReadResult = {
 export type IFilesystemProvider = {
   readDir(dirPath: string): Promise<DirEntry[]>
   readFile(filePath: string): Promise<FileReadResult>
+  getTempDir?(): Promise<string>
   writeFile(filePath: string, content: string): Promise<void>
   writeFileBase64(filePath: string, contentBase64: string): Promise<void>
   writeFileBase64Chunk(filePath: string, contentBase64: string, append: boolean): Promise<void>
@@ -145,6 +147,7 @@ export type IFilesystemProvider = {
 
 export type IGitProvider = {
   getStatus(worktreePath: string, options?: { includeIgnored?: boolean }): Promise<GitStatusResult>
+  checkIgnoredPaths(worktreePath: string, relativePaths: string[]): Promise<string[]>
   getHistory(worktreePath: string, options?: GitHistoryOptions): Promise<GitHistoryResult>
   commit(worktreePath: string, message: string): Promise<{ success: boolean; error?: string }>
   getStagedCommitContext(worktreePath: string): Promise<CommitMessageDraftContext | null>

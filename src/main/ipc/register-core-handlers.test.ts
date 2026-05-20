@@ -44,7 +44,8 @@ const {
   registerOnboardingHandlersMock,
   registerSpeechHandlersMock,
   registerSkillsHandlersMock,
-  registerWorkspaceSpaceHandlersMock
+  registerWorkspaceSpaceHandlersMock,
+  registerWorkspacePortHandlersMock
 } = vi.hoisted(() => ({
   registerCliHandlersMock: vi.fn(),
   registerPreflightHandlersMock: vi.fn(),
@@ -87,7 +88,8 @@ const {
   registerOnboardingHandlersMock: vi.fn(),
   registerSpeechHandlersMock: vi.fn(),
   registerSkillsHandlersMock: vi.fn(),
-  registerWorkspaceSpaceHandlersMock: vi.fn()
+  registerWorkspaceSpaceHandlersMock: vi.fn(),
+  registerWorkspacePortHandlersMock: vi.fn()
 }))
 
 vi.mock('./onboarding', () => ({
@@ -164,6 +166,10 @@ vi.mock('./skills', () => ({
 
 vi.mock('./workspace-space', () => ({
   registerWorkspaceSpaceHandlers: registerWorkspaceSpaceHandlersMock
+}))
+
+vi.mock('./workspace-ports', () => ({
+  registerWorkspacePortHandlers: registerWorkspacePortHandlersMock
 }))
 
 vi.mock('./telemetry', () => ({
@@ -297,6 +303,7 @@ describe('registerCoreHandlers', () => {
     registerSpeechHandlersMock.mockReset()
     registerSkillsHandlersMock.mockReset()
     registerWorkspaceSpaceHandlersMock.mockReset()
+    registerWorkspacePortHandlersMock.mockReset()
   })
 
   it('passes the store through to handler registrars that need it', () => {
@@ -309,6 +316,7 @@ describe('registerCoreHandlers', () => {
     const codexAccounts = { marker: 'codexAccounts' }
     const claudeAccounts = { marker: 'claudeAccounts' }
     const rateLimits = { marker: 'rateLimits' }
+    const agentAwakeService = { marker: 'agentAwakeService' }
 
     registerCoreHandlers(
       store as never,
@@ -319,7 +327,11 @@ describe('registerCoreHandlers', () => {
       openCodeUsage as never,
       codexAccounts as never,
       claudeAccounts as never,
-      rateLimits as never
+      rateLimits as never,
+      null,
+      undefined,
+      undefined,
+      agentAwakeService as never
     )
 
     expect(registerClaudeUsageHandlersMock).toHaveBeenCalledWith(claudeUsage)
@@ -341,9 +353,10 @@ describe('registerCoreHandlers', () => {
     expect(registerNotificationHandlersMock).toHaveBeenCalledWith(store, runtime)
     expect(registerDeveloperPermissionHandlersMock).toHaveBeenCalled()
     expect(registerComputerUsePermissionHandlersMock).toHaveBeenCalled()
-    expect(registerSettingsHandlersMock).toHaveBeenCalledWith(store, undefined)
+    expect(registerSettingsHandlersMock).toHaveBeenCalledWith(store, agentAwakeService)
     expect(registerSkillsHandlersMock).toHaveBeenCalledWith(store)
     expect(registerWorkspaceSpaceHandlersMock).toHaveBeenCalledWith(store)
+    expect(registerWorkspacePortHandlersMock).toHaveBeenCalledWith(store)
     expect(registerTelemetryHandlersMock).toHaveBeenCalledWith(store)
     expect(registerSessionHandlersMock).toHaveBeenCalledWith(store)
     expect(registerUIHandlersMock).toHaveBeenCalledWith(store)

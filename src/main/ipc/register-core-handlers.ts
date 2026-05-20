@@ -32,6 +32,7 @@ import { registerSessionHandlers } from './session'
 import { registerSettingsHandlers } from './settings'
 import { registerSkillsHandlers } from './skills'
 import { registerWorkspaceSpaceHandlers } from './workspace-space'
+import { registerWorkspacePortHandlers } from './workspace-ports'
 import { registerAutomationHandlers } from './automations'
 import { registerTelemetryHandlers } from './telemetry'
 import { registerBrowserHandlers } from './browser'
@@ -131,6 +132,7 @@ export function registerCoreHandlers(
   registerSessionHandlers(store)
   registerUIHandlers(store)
   registerWorkspaceSpaceHandlers(store)
+  registerWorkspacePortHandlers(store)
   if (commitMessageAgentEnv) {
     registerFilesystemHandlers(store, commitMessageAgentEnv)
   } else {

@@ -6,7 +6,7 @@ import {
   isDefaultBranchWorkspace,
   sidebarHasActiveFilters
 } from './visible-worktrees'
-import type { Repo, TerminalTab, Worktree } from '../../../../shared/types'
+import type { Repo, TerminalTab, Worktree, WorktreeLineage } from '../../../../shared/types'
 
 function makeTab(id: string, worktreeId: string, ptyId: string | null): TerminalTab {
   return {
@@ -21,9 +21,10 @@ function makeTab(id: string, worktreeId: string, ptyId: string | null): Terminal
   }
 }
 
-function makeWorktree(id: string, repoId = 'repo1'): Worktree {
+function makeWorktree(id: string, repoId = 'repo1'): Worktree & { instanceId: string } {
   return {
     id,
+    instanceId: `${id}-instance`,
     repoId,
     path: `/tmp/${id}`,
     head: 'abc123',
@@ -40,6 +41,23 @@ function makeWorktree(id: string, repoId = 'repo1'): Worktree {
     isPinned: false,
     sortOrder: 0,
     lastActivityAt: 0
+  }
+}
+
+function makeWorktreeLineage(
+  child: Worktree & { instanceId: string },
+  parent: Worktree & { instanceId: string },
+  overrides: Partial<WorktreeLineage> = {}
+): WorktreeLineage {
+  return {
+    worktreeId: child.id,
+    worktreeInstanceId: child.instanceId,
+    parentWorktreeId: parent.id,
+    parentWorktreeInstanceId: parent.instanceId,
+    origin: 'cli',
+    capture: { source: 'terminal-context', confidence: 'inferred' },
+    createdAt: 1,
+    ...overrides
   }
 }
 
@@ -66,6 +84,7 @@ function visibleOptions(overrides: Partial<VisibleOptions> = {}): VisibleOptions
     repoMap,
     activeSpaceId: null,
     repoSpaceAssignments: {},
+    worktreeLineageById: {},
     ...overrides
   }
 }
@@ -127,6 +146,22 @@ describe('computeVisibleWorktreeIds', () => {
     )
 
     expect(result).toEqual([])
+  })
+
+  it('treats paired web host terminal mirrors as active while their stream handle is pending', () => {
+    const wt = makeWorktree('wt-web-pending')
+
+    const result = computeVisibleWorktreeIds(
+      { repo1: [wt] },
+      [wt.id],
+      visibleOptions({
+        showActiveOnly: true,
+        tabsByWorktree: { [wt.id]: [makeTab('web-terminal-host-tab-1', wt.id, null)] },
+        ptyIdsByTabId: {}
+      })
+    )
+
+    expect(result).toEqual([wt.id])
   })
 
   it('hides branch-backed main worktrees when default branch workspaces are hidden', () => {
@@ -256,6 +291,101 @@ describe('computeVisibleWorktreeIds', () => {
     )
 
     expect(result).toEqual([feature2.id])
+  })
+
+  it('includes valid lineage parents even when another filter would hide the parent', () => {
+    const parent = makeWorktree('parent')
+    const child = makeWorktree('child')
+    const lineage = makeWorktreeLineage(child, parent)
+
+    const result = computeVisibleWorktreeIds(
+      { repo1: [parent, child] },
+      [child.id, parent.id],
+      visibleOptions({
+        showActiveOnly: true,
+        tabsByWorktree: { [child.id]: [makeTab('t-child', child.id, 'p-child')] },
+        ptyIdsByTabId: { 't-child': ['p-child'] },
+        worktreeLineageById: { [child.id]: lineage }
+      })
+    )
+
+    expect(result).toEqual([parent.id, child.id])
+  })
+
+  it('does not resurrect stale lineage parents', () => {
+    const parent = makeWorktree('parent')
+    const child = makeWorktree('child')
+    const lineage = makeWorktreeLineage(child, parent, {
+      parentWorktreeInstanceId: 'old-parent-instance'
+    })
+
+    const result = computeVisibleWorktreeIds(
+      { repo1: [parent, child] },
+      [child.id, parent.id],
+      visibleOptions({
+        showActiveOnly: true,
+        tabsByWorktree: { [child.id]: [makeTab('t-child', child.id, 'p-child')] },
+        ptyIdsByTabId: { 't-child': ['p-child'] },
+        worktreeLineageById: { [child.id]: lineage }
+      })
+    )
+
+    expect(result).toEqual([child.id])
+  })
+
+  it('does not resurrect archived lineage parents', () => {
+    const parent = makeWorktree('parent')
+    parent.isArchived = true
+    const child = makeWorktree('child')
+    const lineage = makeWorktreeLineage(child, parent)
+
+    const result = computeVisibleWorktreeIds(
+      { repo1: [parent, child] },
+      [child.id, parent.id],
+      visibleOptions({
+        showActiveOnly: true,
+        tabsByWorktree: { [child.id]: [makeTab('t-child', child.id, 'p-child')] },
+        ptyIdsByTabId: { 't-child': ['p-child'] },
+        worktreeLineageById: { [child.id]: lineage }
+      })
+    )
+
+    expect(result).toEqual([child.id])
+  })
+
+  it('includes default-branch parents hidden by the explicit setting when a visible child needs them', () => {
+    const parent = makeWorktree('parent')
+    parent.isMainWorktree = true
+    const child = makeWorktree('child')
+    const lineage = makeWorktreeLineage(child, parent)
+
+    const result = computeVisibleWorktreeIds(
+      { repo1: [parent, child] },
+      [child.id, parent.id],
+      visibleOptions({
+        hideDefaultBranchWorkspace: true,
+        worktreeLineageById: { [child.id]: lineage }
+      })
+    )
+
+    expect(result).toEqual([parent.id, child.id])
+  })
+
+  it('includes cross-repo parents when repo filtering leaves their valid child visible', () => {
+    const parent = makeWorktree('parent', 'repo1')
+    const child = makeWorktree('child', 'repo2')
+    const lineage = makeWorktreeLineage(child, parent)
+
+    const result = computeVisibleWorktreeIds(
+      { repo1: [parent], repo2: [child] },
+      [child.id, parent.id],
+      visibleOptions({
+        filterRepoIds: ['repo2'],
+        worktreeLineageById: { [child.id]: lineage }
+      })
+    )
+
+    expect(result).toEqual([parent.id, child.id])
   })
 })
 

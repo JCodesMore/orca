@@ -36,6 +36,7 @@ import type {
   WorktreeMeta,
   WorktreeLineage,
   GlobalSettings,
+  NotificationSettings,
   OnboardingChecklistState,
   OnboardingOutcome,
   OnboardingState,
@@ -57,6 +58,7 @@ import {
   getDefaultUIState,
   getDefaultRepoHookSettings,
   getDefaultWorkspaceSession,
+  normalizeWorktreeCardProperties,
   ONBOARDING_FINAL_STEP
 } from '../shared/constants'
 import { parseWorkspaceSession } from '../shared/workspace-session-schema'
@@ -182,6 +184,22 @@ function normalizeSortBy(sortBy: unknown): 'name' | 'smart' | 'recent' | 'repo' 
   return getDefaultUIState().sortBy
 }
 
+function normalizeNotificationSettings(value: unknown): NotificationSettings {
+  const defaults = getDefaultNotificationSettings()
+  const candidate =
+    value && typeof value === 'object' ? (value as Partial<NotificationSettings>) : {}
+  const rawVolume = candidate.customSoundVolume
+  const customSoundVolume =
+    typeof rawVolume === 'number' && Number.isFinite(rawVolume)
+      ? Math.min(100, Math.max(0, rawVolume))
+      : defaults.customSoundVolume
+  return {
+    ...defaults,
+    ...candidate,
+    customSoundVolume
+  }
+}
+
 function normalizeAutomationRunWorkspaceDisplayName(value: string | null): string | null {
   const trimmed = value?.trim()
   return trimmed ? trimmed : null
@@ -205,6 +223,13 @@ function normalizeAutomationRunOutputSnapshot(
         ? value.capturedAt
         : Date.now(),
     truncated: value.truncated === true
+  }
+}
+
+function normalizeAutomationSessionReuse(automation: Automation): Automation {
+  return {
+    ...automation,
+    reuseSession: automation.workspaceMode === 'existing' && automation.reuseSession === true
   }
 }
 
@@ -1210,6 +1235,13 @@ export class Store {
         const migratedFloatingTerminalEnabled = floatingTerminalDefaultedForAllUsers
           ? (parsed.settings?.floatingTerminalEnabled ?? true)
           : true
+        const experimentalActivityDefaultedOffForAllUsers =
+          parsed.settings?.experimentalActivityDefaultedOffForAllUsers === true
+        // Why: the Agents view moved back behind Experimental. Flip every
+        // pre-migration profile off once, then preserve future user opt-ins.
+        const migratedExperimentalActivity = experimentalActivityDefaultedOffForAllUsers
+          ? (parsed.settings?.experimentalActivity ?? false)
+          : false
         result = {
           ...defaults,
           ...parsed,
@@ -1221,10 +1253,8 @@ export class Store {
             // the old persisted flag forward once so enabled users don't lose it.
             experimentalPet:
               parsed.settings?.experimentalPet ?? readLegacySidekickFlag(parsed) ?? false,
-            // Why: Activity graduated from its experimental gate. Force the
-            // legacy flag on so existing profiles and rollback builds see the
-            // same default-on behavior as fresh installs.
-            experimentalActivity: true,
+            experimentalActivity: migratedExperimentalActivity,
+            experimentalActivityDefaultedOffForAllUsers: true,
             terminalMacOptionAsAlt: migratedOptionAsAlt,
             terminalMacOptionAsAltMigrated: true,
             floatingTerminalEnabled: migratedFloatingTerminalEnabled,
@@ -1236,10 +1266,7 @@ export class Store {
               parsed.settings?.visibleTaskProviders
             ),
             openInApplications: normalizeOpenInApplications(parsed.settings?.openInApplications),
-            notifications: {
-              ...getDefaultNotificationSettings(),
-              ...parsed.settings?.notifications
-            },
+            notifications: normalizeNotificationSettings(parsed.settings?.notifications),
             voice: {
               ...getDefaultVoiceSettings(),
               ...parsed.settings?.voice
@@ -1320,10 +1347,25 @@ export class Store {
               !deliberateUncheck &&
               Array.isArray(rawCardProps) &&
               !rawCardProps.includes('inline-agents')
-            const migratedCardProps =
-              needsInlineAgentsMigration && Array.isArray(rawCardProps)
+            const migratedCardProps = (() => {
+              if (!Array.isArray(rawCardProps)) {
+                return undefined
+              }
+              const candidate = needsInlineAgentsMigration
                 ? [...rawCardProps, 'inline-agents' as const]
-                : undefined
+                : rawCardProps
+              // Why: only Agent activity remains configurable; older hidden
+              // card fields must be restored because users can no longer
+              // toggle them back on from the sidebar menu.
+              const normalized = normalizeWorktreeCardProperties(candidate)
+              const changed =
+                normalized.length !== rawCardProps.length ||
+                normalized.some((property, index) => property !== rawCardProps[index])
+              return changed ? normalized : undefined
+            })()
+            if (migratedCardProps !== undefined || !inlineAgentsMigrated) {
+              this.loadNeedsSave = true
+            }
             return {
               ...defaults.ui,
               ...parsed.ui,
@@ -1813,9 +1855,9 @@ export class Store {
   // ── Automations ───────────────────────────────────────────────────
 
   listAutomations(): Automation[] {
-    return [...(this.state.automations ?? [])].sort((left, right) =>
-      left.name.localeCompare(right.name)
-    )
+    return (this.state.automations ?? [])
+      .map((automation) => normalizeAutomationSessionReuse(automation))
+      .sort((left, right) => left.name.localeCompare(right.name))
   }
 
   listAutomationRuns(automationId?: string): AutomationRun[] {
@@ -1841,6 +1883,7 @@ export class Store {
       workspaceMode: input.workspaceMode,
       workspaceId: input.workspaceMode === 'existing' ? (input.workspaceId ?? null) : null,
       baseBranch: input.workspaceMode === 'new_per_run' ? (input.baseBranch ?? null) : null,
+      reuseSession: input.workspaceMode === 'existing' ? (input.reuseSession ?? false) : false,
       timezone: input.timezone,
       rrule: input.rrule,
       dtstart: input.dtstart,
@@ -1891,6 +1934,10 @@ export class Store {
             ? (updates.baseBranch ?? null)
             : (current.baseBranch ?? null)
           : null,
+      reuseSession:
+        workspaceMode === 'existing'
+          ? (updates.reuseSession ?? current.reuseSession ?? false)
+          : false,
       rrule,
       dtstart,
       nextRunAt: scheduleChanged
@@ -2116,10 +2163,10 @@ export class Store {
     this.state.settings = {
       ...this.state.settings,
       ...sanitizedUpdates,
-      notifications: {
+      notifications: normalizeNotificationSettings({
         ...this.state.settings.notifications,
         ...sanitizedUpdates.notifications
-      },
+      }),
       ...(mergedTelemetry !== undefined ? { telemetry: mergedTelemetry } : {})
     }
     this.scheduleSave()
@@ -2134,6 +2181,9 @@ export class Store {
       ...this.state.ui,
       groupBy: normalizeGroupBy(this.state.ui?.groupBy),
       sortBy: normalizeSortBy(this.state.ui?.sortBy),
+      worktreeCardProperties: normalizeWorktreeCardProperties(
+        this.state.ui?.worktreeCardProperties
+      ),
       workspaceStatuses: normalizeWorkspaceStatuses(this.state.ui?.workspaceStatuses),
       workspaceBoardOpacity: clampWorkspaceBoardOpacity(this.state.ui?.workspaceBoardOpacity),
       workspaceBoardCompact: normalizeWorkspaceBoardCompact(this.state.ui?.workspaceBoardCompact),
@@ -2153,6 +2203,10 @@ export class Store {
       sortBy: updates.sortBy
         ? normalizeSortBy(updates.sortBy)
         : normalizeSortBy(this.state.ui?.sortBy),
+      worktreeCardProperties:
+        updates.worktreeCardProperties !== undefined
+          ? normalizeWorktreeCardProperties(updates.worktreeCardProperties)
+          : normalizeWorktreeCardProperties(this.state.ui?.worktreeCardProperties),
       workspaceStatuses:
         updates.workspaceStatuses !== undefined
           ? normalizeWorkspaceStatuses(updates.workspaceStatuses)

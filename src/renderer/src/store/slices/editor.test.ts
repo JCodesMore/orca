@@ -9,6 +9,7 @@ import {
   type RuntimeEnvironmentCallRequest
 } from '../../runtime/runtime-compatibility-test-fixture'
 import { clearRuntimeCompatibilityCacheForTests } from '../../runtime/runtime-rpc-client'
+import { FLOATING_TERMINAL_WORKTREE_ID } from '../../../../shared/constants'
 
 const { toastErrorMock } = vi.hoisted(() => ({
   toastErrorMock: vi.fn()
@@ -62,6 +63,88 @@ describe('createEditorSlice right sidebar state', () => {
     expect(store.getState().rightSidebarOpen).toBe(true)
     store.getState().toggleRightSidebar()
     expect(store.getState().rightSidebarOpen).toBe(false)
+  })
+
+  it('setRightSidebarTab writes the active worktree entry', () => {
+    const store = createEditorStore()
+
+    store.getState().setRightSidebarTab('search')
+
+    expect(store.getState().rightSidebarTab).toBe('search')
+    expect(store.getState().rightSidebarTabByWorktree).toEqual({ 'wt-1': 'search' })
+  })
+
+  it('setRightSidebarTab with no active worktree does not mutate the worktree map', () => {
+    const store = createEditorStore()
+    const remembered = { 'wt-1': 'checks' as const }
+    store.setState({ activeWorktreeId: null, rightSidebarTabByWorktree: remembered })
+
+    store.getState().setRightSidebarTab('search')
+
+    expect(store.getState().rightSidebarTab).toBe('search')
+    expect(store.getState().rightSidebarTabByWorktree).toBe(remembered)
+  })
+
+  it('revealInExplorer records explorer for the target worktree', () => {
+    const store = createEditorStore()
+    store.setState({
+      activeWorktreeId: 'wt-1',
+      rightSidebarTab: 'search',
+      rightSidebarTabByWorktree: { 'wt-1': 'search', 'wt-2': 'checks' }
+    })
+
+    store.getState().revealInExplorer('wt-2', '/repo/file.ts')
+
+    expect(store.getState().rightSidebarOpen).toBe(true)
+    expect(store.getState().rightSidebarTab).toBe('explorer')
+    expect(store.getState().rightSidebarTabByWorktree).toEqual({
+      'wt-1': 'search',
+      'wt-2': 'explorer'
+    })
+    expect(store.getState().pendingExplorerReveal).toMatchObject({
+      worktreeId: 'wt-2',
+      filePath: '/repo/file.ts'
+    })
+  })
+
+  it('collapses all expanded directories for one worktree', () => {
+    const store = createEditorStore()
+    store.setState({
+      expandedDirs: {
+        'wt-1': new Set(['/repo/src', '/repo/src/components']),
+        'wt-2': new Set(['/other/packages'])
+      }
+    })
+
+    store.getState().collapseAllDirs('wt-1')
+
+    expect(store.getState().expandedDirs['wt-1']).toEqual(new Set())
+    expect(store.getState().expandedDirs['wt-2']).toEqual(new Set(['/other/packages']))
+  })
+
+  it('keeps collapse all stable when the worktree has no expanded directories', () => {
+    const store = createEditorStore()
+    const expandedDirs = { 'wt-2': new Set(['/other/packages']) }
+    store.setState({ expandedDirs })
+
+    store.getState().collapseAllDirs('wt-1')
+
+    expect(store.getState().expandedDirs).toBe(expandedDirs)
+  })
+
+  it('collapses one directory subtree without touching sibling directories', () => {
+    const store = createEditorStore()
+    store.setState({
+      expandedDirs: {
+        'wt-1': new Set(['/repo/src', '/repo/src/components', '/repo/src2', '/repo/tests']),
+        'wt-2': new Set(['/other/src'])
+      }
+    })
+
+    store.getState().collapseDirSubtree('wt-1', '/repo/src')
+
+    expect(store.getState().expandedDirs['wt-1']).toEqual(new Set(['/repo/src2', '/repo/tests']))
+    expect(store.getState().expandedDirs['wt-2']).toEqual(new Set(['/other/src']))
   })
 })
 
@@ -166,6 +249,34 @@ describe('createEditorSlice openDiff', () => {
       })
     ])
     expect(store.getState().activeFileId).toBe('wt-1::diff::staged::file.ts')
+  })
+})
+
+describe('createEditorSlice floating editor activation', () => {
+  it('opens floating markdown tabs without changing the main active editor surface', () => {
+    const store = createEditorStore()
+    store.setState({
+      activeFileId: '/repo/main.md',
+      activeTabType: 'editor',
+      activeFileIdByWorktree: { 'wt-1': '/repo/main.md' },
+      activeTabTypeByWorktree: { 'wt-1': 'editor' }
+    } as Partial<AppState>)
+
+    store.getState().openFile({
+      filePath: '/tmp/orca/untitled.md',
+      relativePath: 'untitled.md',
+      worktreeId: FLOATING_TERMINAL_WORKTREE_ID,
+      language: 'markdown',
+      isUntitled: true,
+      mode: 'edit'
+    })
+
+    expect(store.getState().activeFileId).toBe('/repo/main.md')
+    expect(store.getState().activeTabType).toBe('editor')
+    expect(store.getState().activeFileIdByWorktree[FLOATING_TERMINAL_WORKTREE_ID]).toBe(
+      '/tmp/orca/untitled.md'
+    )
+    expect(store.getState().activeTabTypeByWorktree[FLOATING_TERMINAL_WORKTREE_ID]).toBe('editor')
   })
 })
 
@@ -791,6 +902,47 @@ describe('createEditorSlice conflict status reconciliation', () => {
         conflictStatusSource: 'session'
       }
     ])
+  })
+
+  it('keeps the conflict review active when selecting a conflict from its tree', () => {
+    const store = createEditorStore()
+
+    store
+      .getState()
+      .openConflictReview(
+        'wt-1',
+        '/repo',
+        [{ path: 'src/conflict.ts', conflictKind: 'both_modified' }],
+        'live-summary'
+      )
+    store.getState().openConflictReviewFile(
+      'wt-1::conflict-review',
+      'wt-1',
+      '/repo',
+      {
+        path: 'src/conflict.ts',
+        status: 'modified',
+        area: 'unstaged',
+        conflictKind: 'both_modified',
+        conflictStatus: 'unresolved',
+        conflictStatusSource: 'git'
+      },
+      'typescript'
+    )
+
+    const reviewFile = store
+      .getState()
+      .openFiles.find((file) => file.id === 'wt-1::conflict-review')
+
+    expect(store.getState().activeFileId).toBe('wt-1::conflict-review')
+    expect(reviewFile?.conflictReview?.selectedFileId).toBe('/repo/src/conflict.ts')
+    expect(store.getState().openFiles).toContainEqual(
+      expect.objectContaining({
+        id: '/repo/src/conflict.ts',
+        mode: 'edit',
+        conflict: expect.objectContaining({ conflictStatus: 'unresolved' })
+      })
+    )
   })
 
   it('marks tracked conflicts as resolved locally after live conflict state disappears', () => {

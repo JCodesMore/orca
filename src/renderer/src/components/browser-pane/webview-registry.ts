@@ -100,6 +100,17 @@ export function unregisterPersistentWebview(browserTabId: string): void {
   }
 }
 
+export function moveFocusToRendererBeforeWebviewDetach(webview: Electron.WebviewTag): void {
+  // Why: if this webview currently owns focus, removing it lets macOS hand
+  // activation back to the previously-active app (Slack, etc.) because the
+  // focused webContents is gone with no replacement. Move focus back into the
+  // main renderer first so Electron keeps focus inside the Orca window.
+  if (webview === document.activeElement || webview.contains(document.activeElement)) {
+    ;(document.activeElement as HTMLElement | null)?.blur?.()
+    window.focus()
+  }
+}
+
 export function destroyPersistentWebview(browserTabId: string): void {
   const webview = webviewRegistry.get(browserTabId)
   if (!webview) {
@@ -109,14 +120,7 @@ export function destroyPersistentWebview(browserTabId: string): void {
     return
   }
   void window.api.browser.unregisterGuest({ browserPageId: browserTabId })
-  // Why: if this webview currently owns focus, removing it lets macOS hand
-  // activation back to the previously-active app (Slack, etc.) because the
-  // focused webContents is gone with no replacement. Move focus back into the
-  // main renderer first so Electron keeps focus inside the Orca window.
-  if (webview === document.activeElement || webview.contains(document.activeElement)) {
-    ;(document.activeElement as HTMLElement | null)?.blur?.()
-    window.focus()
-  }
+  moveFocusToRendererBeforeWebviewDetach(webview)
   webview.remove()
   unregisterPersistentWebview(browserTabId)
   registeredWebContentsIds.delete(browserTabId)

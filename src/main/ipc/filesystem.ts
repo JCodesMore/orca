@@ -17,7 +17,8 @@ import type {
   GitStatusResult,
   MarkdownDocument,
   SearchOptions,
-  SearchResult
+  SearchResult,
+  TuiAgent
 } from '../../shared/types'
 import type { GitHistoryOptions, GitHistoryResult } from '../../shared/git-history'
 import {
@@ -49,16 +50,21 @@ import { getHistory } from '../git/history'
 import {
   cancelGenerateCommitMessageLocal,
   cancelGeneratePullRequestFieldsLocal,
+  discoverCommitMessageModelsLocal,
+  discoverCommitMessageModelsRemote,
   generateCommitMessageFromContext,
   generatePullRequestFieldsFromContext,
   resolveCommitMessageSettings,
+  type DiscoverCommitMessageModelsResult,
   type GenerateCommitMessageResult,
   type GeneratePullRequestFieldsResult
 } from '../text-generation/commit-message-text-generation'
 import { getPullRequestDraftContext } from '../text-generation/pull-request-context'
 import { getUpstreamStatus } from '../git/upstream'
 import { gitFetch, gitPull, gitPush } from '../git/remote'
+import { checkIgnoredPaths } from '../git/check-ignored-paths'
 import { assertGitPushTargetShape } from '../../shared/git-push-target-validation'
+import { getCommitMessageModelDiscoveryHostKey } from '../../shared/commit-message-host-key'
 import { validateGitPushTarget } from '../git/push-target-validation'
 import { getRemoteFileUrl } from '../git/repo'
 import {
@@ -73,8 +79,14 @@ import { registerFilesystemMutationHandlers } from './filesystem-mutations'
 import { searchWithGitGrep } from './filesystem-search-git'
 import { listMarkdownDocuments, markdownDocumentsFromRelativePaths } from './markdown-documents'
 import { checkRgAvailable } from './rg-availability'
-import { getSshFilesystemProvider } from '../providers/ssh-filesystem-dispatch'
-import { getSshGitProvider } from '../providers/ssh-git-dispatch'
+import {
+  getSshFilesystemProvider,
+  requireSshFilesystemProvider
+} from '../providers/ssh-filesystem-dispatch'
+import {
+  getSshGitProvider,
+  SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE
+} from '../providers/ssh-git-dispatch'
 import {
   prepareLocalCommitMessageAgentEnv,
   type CommitMessageAgentEnvironmentResolvers
@@ -168,10 +180,7 @@ export function registerFilesystemHandlers(
     'fs:readDir',
     async (_event, args: { dirPath: string; connectionId?: string }): Promise<DirEntry[]> => {
       if (args.connectionId) {
-        const provider = getSshFilesystemProvider(args.connectionId)
-        if (!provider) {
-          throw new Error(`No filesystem provider for connection "${args.connectionId}"`)
-        }
+        const provider = requireSshFilesystemProvider(args.connectionId)
         return provider.readDir(args.dirPath)
       }
       const dirPath = await resolveAuthorizedPath(args.dirPath, store)
@@ -201,10 +210,7 @@ export function registerFilesystemHandlers(
       args: { filePath: string; connectionId?: string }
     ): Promise<{ content: string; isBinary: boolean; isImage?: boolean; mimeType?: string }> => {
       if (args.connectionId) {
-        const provider = getSshFilesystemProvider(args.connectionId)
-        if (!provider) {
-          throw new Error(`No filesystem provider for connection "${args.connectionId}"`)
-        }
+        const provider = requireSshFilesystemProvider(args.connectionId)
         return provider.readFile(args.filePath)
       }
       const filePath = await resolveAuthorizedPath(args.filePath, store)
@@ -253,10 +259,7 @@ export function registerFilesystemHandlers(
       args: { rootPath: string; connectionId?: string }
     ): Promise<MarkdownDocument[]> => {
       if (args.connectionId) {
-        const provider = getSshFilesystemProvider(args.connectionId)
-        if (!provider) {
-          throw new Error(`No filesystem provider for connection "${args.connectionId}"`)
-        }
+        const provider = requireSshFilesystemProvider(args.connectionId)
         const relativePaths = await provider.listFiles(args.rootPath)
         return markdownDocumentsFromRelativePaths(args.rootPath, relativePaths)
       }
@@ -273,10 +276,7 @@ export function registerFilesystemHandlers(
       args: { filePath: string; content: string; connectionId?: string }
     ): Promise<void> => {
       if (args.connectionId) {
-        const provider = getSshFilesystemProvider(args.connectionId)
-        if (!provider) {
-          throw new Error(`No filesystem provider for connection "${args.connectionId}"`)
-        }
+        const provider = requireSshFilesystemProvider(args.connectionId)
         return provider.writeFile(args.filePath, args.content)
       }
       const filePath = await resolveAuthorizedPath(args.filePath, store)
@@ -303,10 +303,7 @@ export function registerFilesystemHandlers(
       args: { targetPath: string; connectionId?: string; recursive?: boolean }
     ): Promise<void> => {
       if (args.connectionId) {
-        const provider = getSshFilesystemProvider(args.connectionId)
-        if (!provider) {
-          throw new Error(`No filesystem provider for connection "${args.connectionId}"`)
-        }
+        const provider = requireSshFilesystemProvider(args.connectionId)
         return provider.deletePath(args.targetPath, args.recursive)
       }
       // Why: deleting must operate on the symlink itself, not its target.
@@ -344,10 +341,7 @@ export function registerFilesystemHandlers(
       args: { filePath: string; connectionId?: string }
     ): Promise<{ size: number; isDirectory: boolean; mtime: number }> => {
       if (args.connectionId) {
-        const provider = getSshFilesystemProvider(args.connectionId)
-        if (!provider) {
-          throw new Error(`No filesystem provider for connection "${args.connectionId}"`)
-        }
+        const provider = requireSshFilesystemProvider(args.connectionId)
         const s = await provider.stat(args.filePath)
         return { size: s.size, isDirectory: s.type === 'directory', mtime: s.mtime }
       }
@@ -366,10 +360,7 @@ export function registerFilesystemHandlers(
     'fs:search',
     async (event, args: SearchOptions & { connectionId?: string }): Promise<SearchResult> => {
       if (args.connectionId) {
-        const provider = getSshFilesystemProvider(args.connectionId)
-        if (!provider) {
-          throw new Error(`No filesystem provider for connection "${args.connectionId}"`)
-        }
+        const provider = requireSshFilesystemProvider(args.connectionId)
         return provider.search(args)
       }
       const rootPath = await resolveAuthorizedPath(args.rootPath, store)
@@ -507,12 +498,32 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.getStatus(args.worktreePath, options)
       }
       const worktreePath = await resolveRegisteredWorktreePath(args.worktreePath, store)
       return getStatus(worktreePath, options)
+    }
+  )
+
+  ipcMain.handle(
+    'git:checkIgnored',
+    async (
+      _event,
+      args: { worktreePath: string; paths: string[]; connectionId?: string }
+    ): Promise<string[]> => {
+      if (args.connectionId) {
+        const paths = args.paths.map((p) => validateGitRelativeFilePath(args.worktreePath, p))
+        const provider = getSshGitProvider(args.connectionId)
+        if (!provider) {
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
+        }
+        return provider.checkIgnoredPaths(args.worktreePath, paths)
+      }
+      const worktreePath = await resolveRegisteredWorktreePath(args.worktreePath, store)
+      const paths = args.paths.map((p) => validateGitRelativeFilePath(worktreePath, p))
+      return checkIgnoredPaths(worktreePath, paths)
     }
   )
 
@@ -526,7 +537,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.getHistory(args.worktreePath, options)
       }
@@ -547,7 +558,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.detectConflictOperation(args.worktreePath)
       }
@@ -571,7 +582,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.getDiff(
           args.worktreePath,
@@ -599,7 +610,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.commit(args.worktreePath, args.message)
       }
@@ -617,7 +628,8 @@ export function registerFilesystemHandlers(
         connectionId?: string
       }
     ): Promise<GenerateCommitMessageResult> => {
-      const resolvedSettings = resolveCommitMessageSettings(store.getSettings())
+      const discoveryHostKey = getCommitMessageModelDiscoveryHostKey(args.connectionId ?? null)
+      const resolvedSettings = resolveCommitMessageSettings(store.getSettings(), discoveryHostKey)
       if (!resolvedSettings.ok) {
         return { success: false, error: resolvedSettings.error }
       }
@@ -626,7 +638,7 @@ export function registerFilesystemHandlers(
         if (!provider) {
           return {
             success: false,
-            error: `No git provider for connection "${args.connectionId}"`
+            error: SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE
           }
         }
         let context
@@ -696,6 +708,44 @@ export function registerFilesystemHandlers(
   )
 
   ipcMain.handle(
+    'git:discoverCommitMessageModels',
+    async (
+      _event,
+      args: { agentId: string; worktreePath?: string; connectionId?: string }
+    ): Promise<DiscoverCommitMessageModelsResult> => {
+      const agentId = args.agentId
+      const agentCommandOverride = store.getSettings().agentCmdOverrides?.[agentId as TuiAgent]
+      if (args.connectionId) {
+        if (!args.worktreePath) {
+          return { success: false, error: 'Missing worktree path for remote model discovery.' }
+        }
+        const provider = getSshGitProvider(args.connectionId)
+        if (!provider) {
+          return {
+            success: false,
+            error: `No git provider for connection "${args.connectionId}"`
+          }
+        }
+        return discoverCommitMessageModelsRemote(
+          agentId as TuiAgent,
+          args.worktreePath,
+          (plan, cwd, timeoutMs) => provider.executeCommitMessagePlan(plan, cwd, timeoutMs),
+          agentCommandOverride
+        )
+      }
+      const localEnv = await prepareLocalCommitMessageAgentEnv(agentId, commitMessageAgentEnv)
+      if (!localEnv.ok) {
+        return { success: false, error: localEnv.error }
+      }
+      return discoverCommitMessageModelsLocal(
+        agentId as TuiAgent,
+        localEnv.env,
+        agentCommandOverride
+      )
+    }
+  )
+
+  ipcMain.handle(
     'git:generatePullRequestFields',
     async (
       _event,
@@ -708,7 +758,8 @@ export function registerFilesystemHandlers(
         connectionId?: string
       }
     ): Promise<GeneratePullRequestFieldsResult> => {
-      const resolvedSettings = resolveCommitMessageSettings(store.getSettings())
+      const discoveryHostKey = getCommitMessageModelDiscoveryHostKey(args.connectionId ?? null)
+      const resolvedSettings = resolveCommitMessageSettings(store.getSettings(), discoveryHostKey)
       if (!resolvedSettings.ok) {
         return { success: false, error: resolvedSettings.error }
       }
@@ -717,18 +768,27 @@ export function registerFilesystemHandlers(
         if (!provider) {
           return {
             success: false,
-            error: `No git provider for connection "${args.connectionId}"`
+            error: SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE
           }
         }
-        const context = await getPullRequestDraftContext(
-          (argv) => provider.exec(argv, args.worktreePath),
-          {
-            base: args.base,
-            currentTitle: args.title,
-            currentBody: args.body,
-            currentDraft: args.draft
+        let context: Awaited<ReturnType<typeof getPullRequestDraftContext>>
+        try {
+          context = await getPullRequestDraftContext(
+            (argv) => provider.exec(argv, args.worktreePath),
+            {
+              base: args.base,
+              currentTitle: args.title,
+              currentBody: args.body,
+              currentDraft: args.draft
+            }
+          )
+        } catch (error) {
+          return {
+            success: false,
+            error:
+              error instanceof Error ? error.message : 'Failed to prepare branch for PR details.'
           }
-        )
+        }
         if (!context) {
           return { success: false, error: 'No branch changes to summarize.' }
         }
@@ -742,15 +802,23 @@ export function registerFilesystemHandlers(
       }
 
       const worktreePath = await resolveRegisteredWorktreePath(args.worktreePath, store)
-      const context = await getPullRequestDraftContext(
-        (argv, options) => gitExecFileAsync(argv, { cwd: worktreePath, ...options }),
-        {
-          base: args.base,
-          currentTitle: args.title,
-          currentBody: args.body,
-          currentDraft: args.draft
+      let context: Awaited<ReturnType<typeof getPullRequestDraftContext>>
+      try {
+        context = await getPullRequestDraftContext(
+          (argv, options) => gitExecFileAsync(argv, { cwd: worktreePath, ...options }),
+          {
+            base: args.base,
+            currentTitle: args.title,
+            currentBody: args.body,
+            currentDraft: args.draft
+          }
+        )
+      } catch (error) {
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : 'Failed to prepare branch for PR details.'
         }
-      )
+      }
       if (!context) {
         return { success: false, error: 'No branch changes to summarize.' }
       }
@@ -794,7 +862,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.getBranchCompare(args.worktreePath, args.baseRef)
       }
@@ -813,7 +881,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.getCommitCompare(args.worktreePath, commitId)
       }
@@ -831,7 +899,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.getUpstreamStatus(args.worktreePath)
       }
@@ -846,7 +914,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.fetchRemote(args.worktreePath)
       }
@@ -876,7 +944,7 @@ export function registerFilesystemHandlers(
         }
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.pushBranch(args.worktreePath, publish, args.pushTarget)
       }
@@ -894,7 +962,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.pullBranch(args.worktreePath)
       }
@@ -923,7 +991,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         const results = await provider.getBranchDiff(args.worktreePath, args.compare.mergeBase, {
           includePatch: true,
@@ -972,7 +1040,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.getCommitDiff(args.worktreePath, {
           commitOid,
@@ -1004,7 +1072,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.stageFile(args.worktreePath, args.filePath)
       }
@@ -1023,7 +1091,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.unstageFile(args.worktreePath, args.filePath)
       }
@@ -1042,7 +1110,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.discardChanges(args.worktreePath, args.filePath)
       }
@@ -1061,7 +1129,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.bulkDiscardChanges(args.worktreePath, args.filePaths)
       }
@@ -1080,7 +1148,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.bulkStageFiles(args.worktreePath, args.filePaths)
       }
@@ -1099,7 +1167,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.bulkUnstageFiles(args.worktreePath, args.filePaths)
       }
@@ -1121,7 +1189,7 @@ export function registerFilesystemHandlers(
       if (args.connectionId) {
         const provider = getSshGitProvider(args.connectionId)
         if (!provider) {
-          throw new Error(`No git provider for connection "${args.connectionId}"`)
+          throw new Error(SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE)
         }
         return provider.getRemoteFileUrl(args.worktreePath, args.relativePath, args.line)
       }

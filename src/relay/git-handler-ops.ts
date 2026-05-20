@@ -11,7 +11,11 @@ import { bufferToBlob, buildDiffResult, parseBranchDiff } from './git-handler-ut
 
 // ─── Executor types ──────────────────────────────────────────────────
 
-export type GitExec = (args: string[], cwd: string) => Promise<{ stdout: string; stderr: string }>
+export type GitExec = (
+  args: string[],
+  cwd: string,
+  opts?: { maxBuffer?: number; disableOptionalLocks?: boolean }
+) => Promise<{ stdout: string; stderr: string }>
 
 export type GitBufferExec = (args: string[], cwd: string) => Promise<Buffer>
 
@@ -149,18 +153,33 @@ export async function branchCompare(
   }
 
   let headOid: string
+  let baseOid = ''
   try {
     const { stdout } = await git(['rev-parse', '--verify', 'HEAD'], worktreePath)
     headOid = stdout.trim()
     summary.headOid = headOid
   } catch {
+    try {
+      const { stdout } = await git(['rev-parse', '--verify', baseRef], worktreePath)
+      baseOid = stdout.trim()
+      summary.baseOid = baseOid
+      // Why: new remote worktrees can be on an unborn branch until the first
+      // commit. There are no committed branch changes yet; surfacing this as a
+      // compare error makes the source-control panel look broken.
+      summary.changedFiles = 0
+      summary.commitsAhead = 0
+      summary.status = 'ready'
+      return { summary, entries: [] }
+    } catch {
+      // Preserve the existing unborn-head message when even the base is not
+      // resolvable; callers cannot compare or present a useful empty state.
+    }
     summary.status = 'unborn-head'
     summary.errorMessage =
       'This branch does not have a committed HEAD yet, so compare-to-base is unavailable.'
     return { summary, entries: [] }
   }
 
-  let baseOid: string
   try {
     const { stdout } = await git(['rev-parse', '--verify', baseRef], worktreePath)
     baseOid = stdout.trim()

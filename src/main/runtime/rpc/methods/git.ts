@@ -4,9 +4,11 @@ import {
   GitBranchCompare,
   GitBranchDiff,
   GitBulkPaths,
+  GitCheckIgnored,
   GitCommit,
   GitCommitCompare,
   GitCommitDiff,
+  GitDiscoverCommitMessageModels,
   GitDiff,
   GitFilePath,
   GitGenerateCommitMessage,
@@ -26,6 +28,12 @@ export const GIT_METHODS: RpcMethod[] = [
       params.includeIgnored === undefined
         ? runtime.getRuntimeGitStatus(params.worktree)
         : runtime.getRuntimeGitStatus(params.worktree, { includeIgnored: params.includeIgnored })
+  }),
+  defineMethod({
+    name: 'git.checkIgnored',
+    params: GitCheckIgnored,
+    handler: async (params, { runtime }) =>
+      runtime.checkRuntimeGitIgnoredPaths(params.worktree, params.paths)
   }),
   defineMethod({
     name: 'git.history',
@@ -120,7 +128,8 @@ export const GIT_METHODS: RpcMethod[] = [
       if (
         params.commitMessageAi === undefined &&
         params.agentCmdOverrides === undefined &&
-        params.enableGitHubAttribution === undefined
+        params.enableGitHubAttribution === undefined &&
+        params.commitMessageDiscoveryHostKey === undefined
       ) {
         return runtime.generateRuntimeCommitMessage(params.worktree)
       }
@@ -135,9 +144,26 @@ export const GIT_METHODS: RpcMethod[] = [
           : {}),
         ...(params.enableGitHubAttribution !== undefined
           ? { enableGitHubAttribution: params.enableGitHubAttribution }
+          : {}),
+        ...(params.commitMessageDiscoveryHostKey !== undefined
+          ? { commitMessageDiscoveryHostKey: params.commitMessageDiscoveryHostKey }
           : {})
       })
     }
+  }),
+  defineMethod({
+    name: 'git.discoverCommitMessageModels',
+    params: GitDiscoverCommitMessageModels,
+    handler: async (params, { runtime }) =>
+      runtime.discoverRuntimeCommitMessageModels(
+        params.worktree,
+        params.agentId,
+        params.agentCmdOverrides !== undefined
+          ? {
+              agentCmdOverrides: params.agentCmdOverrides as GlobalSettings['agentCmdOverrides']
+            }
+          : {}
+      )
   }),
   defineMethod({
     name: 'git.cancelGenerateCommitMessage',
@@ -158,7 +184,8 @@ export const GIT_METHODS: RpcMethod[] = [
       if (
         params.commitMessageAi === undefined &&
         params.agentCmdOverrides === undefined &&
-        params.enableGitHubAttribution === undefined
+        params.enableGitHubAttribution === undefined &&
+        params.commitMessageDiscoveryHostKey === undefined
       ) {
         return runtime.generateRuntimePullRequestFields(params.worktree, input)
       }
@@ -173,6 +200,9 @@ export const GIT_METHODS: RpcMethod[] = [
           : {}),
         ...(params.enableGitHubAttribution !== undefined
           ? { enableGitHubAttribution: params.enableGitHubAttribution }
+          : {}),
+        ...(params.commitMessageDiscoveryHostKey !== undefined
+          ? { commitMessageDiscoveryHostKey: params.commitMessageDiscoveryHostKey }
           : {})
       })
     }

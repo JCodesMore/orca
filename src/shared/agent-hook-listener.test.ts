@@ -1,11 +1,12 @@
 /* eslint-disable max-lines -- Why: this fixture keeps cross-agent hook normalization and cache behavior together so regressions in shared listener state are visible. */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'fs'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
   createHookListenerState,
   getEndpointFileName,
+  hasPendingAgentResultText,
   isShellSafeEndpointValue,
   normalizeHookPayload,
   parseFormEncodedBody,
@@ -25,6 +26,10 @@ describe('shared agent-hook-listener', () => {
     state = createHookListenerState()
   })
 
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
   it('parses form-encoded bodies', () => {
     const decoded = parseFormEncodedBody('paneKey=tab-1%3A0&worktreeId=foo')
     expect(decoded.paneKey).toBe('tab-1:0')
@@ -34,6 +39,7 @@ describe('shared agent-hook-listener', () => {
   it('routes pathnames to a known source or null', () => {
     expect(resolveHookSource('/hook/claude')).toBe('claude')
     expect(resolveHookSource('/hook/cursor')).toBe('cursor')
+    expect(resolveHookSource('/hook/antigravity')).toBe('antigravity')
     expect(resolveHookSource('/hook/grok')).toBe('grok')
     expect(resolveHookSource('/hook/hermes')).toBe('hermes')
     expect(resolveHookSource('/hook/unknown')).toBeNull()
@@ -126,6 +132,322 @@ describe('shared agent-hook-listener', () => {
     expect(event!.payload.prompt).toBe('')
   })
 
+  it('normalizes Antigravity invocation and tool hooks', () => {
+    const started = normalizeHookPayload(
+      state,
+      'antigravity',
+      {
+        paneKey: PANE_KEY,
+        tabId: 'tab-1',
+        worktreeId: 'wt',
+        hook_event_name: 'PreInvocation',
+        payload: { prompt: 'run tests' }
+      },
+      'production'
+    )
+    expect(started?.payload).toMatchObject({
+      state: 'working',
+      prompt: 'run tests',
+      agentType: 'antigravity'
+    })
+
+    const tool = normalizeHookPayload(
+      state,
+      'antigravity',
+      {
+        paneKey: PANE_KEY,
+        tabId: 'tab-1',
+        hook_event_name: 'PreToolUse',
+        payload: {
+          toolCall: {
+            name: 'run_command',
+            args: { CommandLine: 'pnpm test' }
+          }
+        }
+      },
+      'production'
+    )
+    expect(tool?.payload).toMatchObject({
+      state: 'working',
+      prompt: 'run tests',
+      agentType: 'antigravity',
+      toolName: 'run_command',
+      toolInput: 'pnpm test'
+    })
+  })
+
+  it('reads Antigravity user requests from the transcript', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'orca-antigravity-prompt-'))
+    const transcriptPath = join(tmpDir, 'transcript.jsonl')
+    try {
+      writeFileSync(
+        transcriptPath,
+        `${JSON.stringify({
+          source: 'USER_EXPLICIT',
+          type: 'USER_INPUT',
+          content:
+            '<USER_REQUEST>\nFix the failing test\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nignored\n</ADDITIONAL_METADATA>'
+        })}\n`
+      )
+
+      const started = normalizeHookPayload(
+        state,
+        'antigravity',
+        {
+          paneKey: PANE_KEY,
+          hook_event_name: 'PreInvocation',
+          payload: { transcriptPath }
+        },
+        'production'
+      )
+
+      expect(started?.payload).toMatchObject({
+        state: 'working',
+        prompt: 'Fix the failing test',
+        agentType: 'antigravity'
+      })
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps the cached Antigravity prompt instead of rescanning the transcript', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'orca-antigravity-cached-prompt-'))
+    const transcriptPath = join(tmpDir, 'transcript.jsonl')
+    try {
+      writeFileSync(
+        transcriptPath,
+        `${JSON.stringify({
+          source: 'USER_EXPLICIT',
+          type: 'USER_INPUT',
+          content: '<USER_REQUEST>\nFirst request\n</USER_REQUEST>'
+        })}\n`
+      )
+
+      const started = normalizeHookPayload(
+        state,
+        'antigravity',
+        {
+          paneKey: PANE_KEY,
+          hook_event_name: 'PreInvocation',
+          payload: { transcriptPath }
+        },
+        'production'
+      )
+      expect(started?.payload.prompt).toBe('First request')
+
+      writeFileSync(
+        transcriptPath,
+        `${JSON.stringify({
+          source: 'USER_EXPLICIT',
+          type: 'USER_INPUT',
+          content: '<USER_REQUEST>\nSecond request\n</USER_REQUEST>'
+        })}\n`,
+        { flag: 'a' }
+      )
+
+      const tool = normalizeHookPayload(
+        state,
+        'antigravity',
+        {
+          paneKey: PANE_KEY,
+          hook_event_name: 'PostToolUse',
+          payload: { transcriptPath, toolCall: { name: 'run_command' } }
+        },
+        'production'
+      )
+
+      expect(tool?.payload.prompt).toBe('First request')
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('maps Antigravity feedback tools to waiting state', () => {
+    const question = normalizeHookPayload(
+      state,
+      'antigravity',
+      {
+        paneKey: PANE_KEY,
+        hook_event_name: 'PreToolUse',
+        payload: {
+          toolCall: {
+            name: 'ask_question',
+            args: { Prompt: 'Which path should I use?' }
+          }
+        }
+      },
+      'production'
+    )
+    expect(question?.payload).toMatchObject({
+      state: 'waiting',
+      agentType: 'antigravity',
+      toolName: 'ask_question',
+      toolInput: 'Which path should I use?'
+    })
+
+    const permission = normalizeHookPayload(
+      state,
+      'antigravity',
+      {
+        paneKey: PANE_KEY,
+        hook_event_name: 'PreToolUse',
+        payload: {
+          toolCall: {
+            name: 'ask_permission',
+            args: { Action: 'run command', Target: 'pnpm lint' }
+          }
+        }
+      },
+      'production'
+    )
+    expect(permission?.payload).toMatchObject({
+      state: 'waiting',
+      agentType: 'antigravity',
+      toolName: 'ask_permission',
+      toolInput: 'run command'
+    })
+  })
+
+  it('resets Antigravity tool state on a new invocation', () => {
+    normalizeHookPayload(
+      state,
+      'antigravity',
+      {
+        paneKey: PANE_KEY,
+        hook_event_name: 'PreToolUse',
+        payload: {
+          toolCall: { name: 'run_command', args: { CommandLine: 'pnpm test' } }
+        }
+      },
+      'production'
+    )
+
+    const nextTurn = normalizeHookPayload(
+      state,
+      'antigravity',
+      {
+        paneKey: PANE_KEY,
+        hook_event_name: 'PreInvocation',
+        payload: { prompt: 'new task' }
+      },
+      'production'
+    )
+
+    expect(nextTurn?.payload).toMatchObject({
+      state: 'working',
+      prompt: 'new task',
+      agentType: 'antigravity'
+    })
+    expect(nextTurn?.payload.toolName).toBeUndefined()
+    expect(nextTurn?.payload.toolInput).toBeUndefined()
+  })
+
+  it('normalizes Antigravity Stop hooks and reads final text from the transcript', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'orca-antigravity-transcript-'))
+    const transcriptPath = join(tmpDir, 'transcript.jsonl')
+    try {
+      writeFileSync(
+        transcriptPath,
+        `${[
+          JSON.stringify({ source: 'USER', type: 'REQUEST', content: 'hi' }),
+          JSON.stringify({
+            source: 'MODEL',
+            type: 'PLANNER_RESPONSE',
+            content: 'Antigravity is wired up.'
+          })
+        ].join('\n')}\n`
+      )
+
+      const done = normalizeHookPayload(
+        state,
+        'antigravity',
+        {
+          paneKey: PANE_KEY,
+          hook_event_name: 'Stop',
+          payload: { fullyIdle: true, transcriptPath }
+        },
+        'production'
+      )
+
+      expect(done?.payload).toMatchObject({
+        state: 'done',
+        prompt: 'hi',
+        agentType: 'antigravity',
+        lastAssistantMessage: 'Antigravity is wired up.'
+      })
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('normalizes Antigravity Stop to done even when fullyIdle is false', () => {
+    const event = normalizeHookPayload(
+      state,
+      'antigravity',
+      {
+        paneKey: PANE_KEY,
+        hook_event_name: 'Stop',
+        payload: { fullyIdle: false }
+      },
+      'production'
+    )
+
+    expect(event?.payload).toMatchObject({
+      state: 'done',
+      agentType: 'antigravity'
+    })
+  })
+
+  it('ignores late Antigravity tool hooks after a completed Stop for the same transcript', () => {
+    const transcriptPath = '/tmp/antigravity-transcript.jsonl'
+    const done = normalizeHookPayload(
+      state,
+      'antigravity',
+      {
+        paneKey: PANE_KEY,
+        hook_event_name: 'Stop',
+        payload: { transcriptPath, fullyIdle: true }
+      },
+      'production'
+    )
+    expect(done?.payload.state).toBe('done')
+
+    const lateTool = normalizeHookPayload(
+      state,
+      'antigravity',
+      {
+        paneKey: PANE_KEY,
+        hook_event_name: 'PostToolUse',
+        payload: {
+          transcriptPath,
+          toolCall: { name: 'run_command', args: { CommandLine: 'pwd' } }
+        }
+      },
+      'production'
+    )
+
+    expect(lateTool).toBeNull()
+  })
+
+  it('treats Antigravity Stop transcripts as pending result text', () => {
+    expect(
+      hasPendingAgentResultText('antigravity', {
+        hook_event_name: 'Stop',
+        payload: { transcriptPath: '/tmp/antigravity-transcript.jsonl' }
+      })
+    ).toBe(true)
+    expect(
+      hasPendingAgentResultText('antigravity', {
+        hook_event_name: 'Stop',
+        payload: {
+          transcriptPath: '/tmp/antigravity-transcript.jsonl',
+          last_assistant_message: 'done'
+        }
+      })
+    ).toBe(false)
+  })
+
   it('normalizes Grok hookEventName payloads and keeps prompt across tool events', () => {
     const prompt = normalizeHookPayload(
       state,
@@ -169,6 +491,50 @@ describe('shared agent-hook-listener', () => {
     })
   })
 
+  it('strips Grok internal user_query wrapper before caching the prompt', () => {
+    const prompt = normalizeHookPayload(
+      state,
+      'grok',
+      {
+        paneKey: PANE_KEY,
+        payload: {
+          hookEventName: 'user_prompt_submit',
+          prompt: '<user_query>\nFind recent PR\n</user_query>'
+        }
+      },
+      'production'
+    )
+    expect(prompt?.payload.prompt).toBe('Find recent PR')
+
+    const tool = normalizeHookPayload(
+      state,
+      'grok',
+      {
+        paneKey: PANE_KEY,
+        payload: {
+          hookEventName: 'pre_tool_use',
+          toolName: 'web_search',
+          toolInput: { query: 'recent PR' }
+        }
+      },
+      'production'
+    )
+    expect(tool?.payload.prompt).toBe('Find recent PR')
+  })
+
+  it('strips Grok opening user_query wrapper even when the closing tag is absent', () => {
+    const event = normalizeHookPayload(
+      state,
+      'grok',
+      {
+        paneKey: PANE_KEY,
+        payload: { hookEventName: 'user_prompt_submit', prompt: '<user_query>Find recent PR' }
+      },
+      'production'
+    )
+    expect(event?.payload.prompt).toBe('Find recent PR')
+  })
+
   it('maps Grok feedback notifications to waiting without overwriting the prompt', () => {
     normalizeHookPayload(
       state,
@@ -193,6 +559,89 @@ describe('shared agent-hook-listener', () => {
       prompt: 'ship it',
       agentType: 'grok'
     })
+  })
+
+  it('reads Grok final assistant text from chat history on Stop', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'orca-grok-session-'))
+    const sessionId = '019e37f4-5135-7b63-a4ab-6d13aa6bf528'
+    const cwd = join(tmpDir, 'workspace')
+    const sessionDir = join(tmpDir, '.grok', 'sessions', encodeURIComponent(cwd), sessionId)
+    try {
+      vi.stubEnv('HOME', tmpDir)
+      vi.stubEnv('USERPROFILE', tmpDir)
+      mkdirSync(sessionDir, { recursive: true })
+      writeFileSync(
+        join(sessionDir, 'chat_history.jsonl'),
+        `${[
+          JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'hihi' }] }),
+          JSON.stringify({ type: 'assistant', content: 'Hi! How can I help you today?' })
+        ].join('\n')}\n`
+      )
+
+      normalizeHookPayload(
+        state,
+        'grok',
+        { paneKey: PANE_KEY, payload: { hookEventName: 'user_prompt_submit', prompt: 'hihi' } },
+        'production'
+      )
+
+      const done = normalizeHookPayload(
+        state,
+        'grok',
+        {
+          paneKey: PANE_KEY,
+          payload: { hookEventName: 'Stop', sessionId, cwd }
+        },
+        'production'
+      )
+
+      expect(done?.payload.state).toBe('done')
+      expect(done?.payload.lastAssistantMessage).toBe('Hi! How can I help you today?')
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not let Grok sessionId escape the chat-history directory', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'orca-grok-session-escape-'))
+    const cwd = join(tmpDir, 'workspace')
+    const escapedDir = join(tmpDir, '.grok', 'sessions', 'escaped')
+    try {
+      vi.stubEnv('HOME', tmpDir)
+      vi.stubEnv('USERPROFILE', tmpDir)
+      mkdirSync(escapedDir, { recursive: true })
+      writeFileSync(
+        join(escapedDir, 'chat_history.jsonl'),
+        `${JSON.stringify({ type: 'assistant', content: 'should not leak' })}\n`
+      )
+
+      const done = normalizeHookPayload(
+        state,
+        'grok',
+        {
+          paneKey: PANE_KEY,
+          payload: { hookEventName: 'Stop', sessionId: '../escaped', cwd }
+        },
+        'production'
+      )
+
+      expect(done?.payload.state).toBe('done')
+      expect(done?.payload.lastAssistantMessage).toBeUndefined()
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it('treats Grok SessionEnd chat history as pending result text', () => {
+    expect(
+      hasPendingAgentResultText('grok', {
+        payload: {
+          hookEventName: 'SessionEnd',
+          sessionId: '019e37f4-5135-7b63-a4ab-6d13aa6bf528',
+          cwd: '/tmp/workspace'
+        }
+      })
+    ).toBe(true)
   })
 
   it('normalizes Hermes pre_llm_call to a working turn with prompt text', () => {

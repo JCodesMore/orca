@@ -13,7 +13,11 @@ const { gitExecFileAsyncMock, gitExecFileAsyncBufferMock, readFileMock, rmMock, 
 
 vi.mock('./runner', () => ({
   gitExecFileAsync: gitExecFileAsyncMock,
-  gitExecFileAsyncBuffer: gitExecFileAsyncBufferMock
+  gitExecFileAsyncBuffer: gitExecFileAsyncBufferMock,
+  gitOptionalLocksDisabledEnv: (env: NodeJS.ProcessEnv = process.env) => ({
+    ...env,
+    GIT_OPTIONAL_LOCKS: '0'
+  })
 }))
 
 vi.mock('fs/promises', () => ({
@@ -213,6 +217,18 @@ describe('getDiff', () => {
     })
   })
 
+  it('normalizes Windows separators before reading git blobs', async () => {
+    gitExecFileAsyncBufferMock.mockResolvedValueOnce({ stdout: Buffer.from('index-content\n') })
+    readFileMock.mockResolvedValue(Buffer.from('working-tree-content'))
+
+    await getDiff('/repo', 'src\\file.ts', false)
+
+    expect(gitExecFileAsyncBufferMock).toHaveBeenCalledWith(['show', ':src/file.ts'], {
+      cwd: '/repo',
+      maxBuffer: 10 * 1024 * 1024
+    })
+  })
+
   it('falls back to HEAD for unstaged diffs when the file is not in the index', async () => {
     gitExecFileAsyncBufferMock
       .mockRejectedValueOnce(new Error('missing index'))
@@ -351,11 +367,35 @@ describe('getStatus', () => {
         '--branch',
         '--untracked-files=all'
       ],
-      { cwd: '/repo' }
+      { cwd: '/repo', env: expect.objectContaining({ GIT_OPTIONAL_LOCKS: '0' }) }
     )
     expect(result.entries).toEqual([
       { path: 'docs/日本語/sample.md', status: 'modified', area: 'unstaged' }
     ])
+  })
+
+  it('omits ignored files by default and parses them when requested', async () => {
+    readFileMock.mockResolvedValue('gitdir: /repo/.git/worktrees/feature\n')
+    existsSyncMock.mockReturnValue(false)
+    gitExecFileAsyncMock.mockResolvedValueOnce({
+      stdout: '! dist/\n! generated/file.js\n'
+    })
+
+    const result = await getStatus('/repo', { includeIgnored: true })
+
+    expect(gitExecFileAsyncMock).toHaveBeenCalledWith(
+      [
+        '-c',
+        'core.quotePath=false',
+        'status',
+        '--porcelain=v2',
+        '--branch',
+        '--untracked-files=all',
+        '--ignored=matching'
+      ],
+      { cwd: '/repo', env: expect.objectContaining({ GIT_OPTIONAL_LOCKS: '0' }) }
+    )
+    expect(result.ignoredPaths).toEqual(['dist/', 'generated/file.js'])
   })
 
   it('parses branch identity from porcelain v2 branch headers', async () => {
@@ -422,7 +462,7 @@ describe('getStatus', () => {
         '--branch',
         '--untracked-files=all'
       ],
-      { cwd: '/repo' }
+      { cwd: '/repo', env: expect.objectContaining({ GIT_OPTIONAL_LOCKS: '0' }) }
     )
     expect('ignoredPaths' in result).toBe(false)
   })
@@ -446,7 +486,7 @@ describe('getStatus', () => {
         '--untracked-files=all',
         '--ignored=matching'
       ],
-      { cwd: '/repo' }
+      { cwd: '/repo', env: expect.objectContaining({ GIT_OPTIONAL_LOCKS: '0' }) }
     )
     expect(result.ignoredPaths).toEqual(['dist/', '.env', 'coverage/'])
     expect(result.entries).toEqual([])
@@ -577,11 +617,33 @@ describe('getBranchCompare', () => {
     gitExecFileAsyncMock
       .mockResolvedValueOnce({ stdout: 'main\n' })
       .mockRejectedValueOnce(new Error('unborn'))
+      .mockRejectedValueOnce(new Error('missing base'))
 
     const result = await getBranchCompare('/repo', 'origin/main')
 
     expect(result.summary.status).toBe('unborn-head')
     expect(result.summary.errorMessage).toContain('committed HEAD')
+    expect(result.entries).toEqual([])
+  })
+
+  it('treats an unborn branch with a resolvable base as having no committed branch changes', async () => {
+    gitExecFileAsyncMock
+      .mockResolvedValueOnce({ stdout: 'feature\n' })
+      .mockRejectedValueOnce(new Error('unborn'))
+      .mockResolvedValueOnce({ stdout: 'base-oid\n' })
+
+    const result = await getBranchCompare('/repo', 'origin/main')
+
+    expect(result.summary).toEqual({
+      baseRef: 'origin/main',
+      baseOid: 'base-oid',
+      compareRef: 'feature',
+      headOid: null,
+      mergeBase: null,
+      changedFiles: 0,
+      commitsAhead: 0,
+      status: 'ready'
+    })
     expect(result.entries).toEqual([])
   })
 

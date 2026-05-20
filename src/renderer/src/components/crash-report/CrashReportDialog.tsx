@@ -11,6 +11,7 @@ import {
   DialogTitle
 } from '@/components/ui/dialog'
 import { formatCrashReportText, type CrashReportRecord } from '../../../../shared/crash-reporting'
+import type { GitHubViewer } from '../../../../shared/types'
 
 function formatSummary(report: CrashReportRecord): string {
   return `${report.processType} ${report.reason}${
@@ -25,6 +26,7 @@ export function CrashReportDialog(): React.JSX.Element {
   const [notes, setNotes] = useState('')
   const [loading, setLoading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  const [viewer, setViewer] = useState<GitHubViewer | null>(null)
   const diagnosticText = useMemo(
     () => (report ? formatCrashReportText(report, notes) : ''),
     [notes, report]
@@ -70,6 +72,32 @@ export function CrashReportDialog(): React.JSX.Element {
     })
   }, [])
 
+  useEffect(() => {
+    if (!open) {
+      setViewer(null)
+      return
+    }
+
+    let cancelled = false
+    void window.api.gh
+      .viewer()
+      .then((nextViewer) => {
+        if (!cancelled) {
+          setViewer(nextViewer)
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setViewer(null)
+          console.error('Failed to load GitHub viewer for crash report:', error)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [open])
+
   const handleCopy = async (): Promise<void> => {
     const result = await window.api.crashReports.copyLatestDiagnostics(
       report ? { reportId: report.id, notes } : {}
@@ -102,8 +130,10 @@ export function CrashReportDialog(): React.JSX.Element {
       const result = await window.api.crashReports.submit({
         reportId: report.id,
         notes,
-        submitAnonymously: true,
-        githubLogin: null,
+        // Why: crash reporting must degrade to anonymous if gh is unavailable;
+        // identity lookup is best-effort and never blocks report creation.
+        submitAnonymously: !viewer,
+        githubLogin: viewer?.login ?? null,
         githubEmail: null
       })
       if (!result.ok) {
@@ -164,7 +194,7 @@ export function CrashReportDialog(): React.JSX.Element {
             />
             <div className="space-y-1.5">
               <div className="text-[11px] font-medium text-muted-foreground">Diagnostic text</div>
-              <pre className="max-h-44 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/20 p-3 font-mono text-[11px] leading-5 text-muted-foreground">
+              <pre className="max-h-44 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/20 p-3 font-mono text-[11px] leading-5 text-muted-foreground scrollbar-sleek">
                 {diagnosticText}
               </pre>
             </div>

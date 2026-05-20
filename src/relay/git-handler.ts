@@ -16,10 +16,11 @@ import {
 } from './git-handler-ops'
 import { commitCompare as commitCompareOp, commitDiffEntry } from './git-handler-commit-diff-ops'
 import { commitChangesRelay, addWorktreeOp, removeWorktreeOp } from './git-handler-worktree-ops'
-import { detectConflictOperation, getStatusOp } from './git-handler-status-ops'
+import { checkIgnoredPathsOp, detectConflictOperation, getStatusOp } from './git-handler-status-ops'
 import { resolveRelayPushTarget } from './git-handler-push-target'
 import { normalizeGitErrorMessage, isNoUpstreamError } from '../shared/git-remote-error'
 import { loadGitHistoryFromExecutor } from '../shared/git-history'
+import { buildRelayCommandEnv } from './relay-command-env'
 
 const execFileAsync = promisify(execFile)
 const MAX_GIT_BUFFER = 10 * 1024 * 1024
@@ -37,6 +38,7 @@ export class GitHandler {
 
   private registerHandlers(): void {
     this.dispatcher.onRequest('git.status', (p) => this.getStatus(p))
+    this.dispatcher.onRequest('git.checkIgnored', (p) => this.checkIgnored(p))
     this.dispatcher.onRequest('git.history', (p) => this.history(p))
     this.dispatcher.onRequest('git.commit', (p) => this.commit(p))
     this.dispatcher.onRequest('git.diff', (p) => this.getDiff(p))
@@ -65,10 +67,15 @@ export class GitHandler {
   private async git(
     args: string[],
     cwd: string,
-    opts?: { maxBuffer?: number }
+    opts?: { maxBuffer?: number; disableOptionalLocks?: boolean }
   ): Promise<{ stdout: string; stderr: string }> {
+    const env = buildRelayCommandEnv()
+    if (opts?.disableOptionalLocks) {
+      env.GIT_OPTIONAL_LOCKS = '0'
+    }
     return execFileAsync('git', args, {
       cwd: expandTilde(cwd),
+      env,
       encoding: 'utf-8',
       maxBuffer: opts?.maxBuffer ?? MAX_GIT_BUFFER
     })
@@ -77,6 +84,7 @@ export class GitHandler {
   private async gitBuffer(args: string[], cwd: string): Promise<Buffer> {
     const { stdout } = (await execFileAsync('git', args, {
       cwd,
+      env: buildRelayCommandEnv(),
       encoding: 'buffer',
       maxBuffer: MAX_GIT_BUFFER
     })) as { stdout: Buffer }
@@ -85,6 +93,10 @@ export class GitHandler {
 
   private async getStatus(params: Record<string, unknown>) {
     return getStatusOp(this.git.bind(this), params)
+  }
+
+  private async checkIgnored(params: Record<string, unknown>) {
+    return checkIgnoredPathsOp(this.git.bind(this), params)
   }
 
   private async history(params: Record<string, unknown>) {

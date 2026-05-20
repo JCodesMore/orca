@@ -21,10 +21,14 @@ export type QuickLaunchAgentMenuItemsProps = {
    *  the picked agent boots with this prompt — argv/flag agents auto-submit,
    *  followup-path agents land it as a draft for the user to confirm. */
   prompt?: string
+  /** Use non-default modes for generated context that must not become shell syntax. */
+  promptDelivery?: 'auto-submit' | 'draft' | 'submit-after-ready'
   /** Telemetry surface for `agent_started.launch_source`. Defaults to
    *  `'tab_bar_quick_launch'` so the existing tab-bar `+` callsite is
    *  unchanged. */
   launchSource?: LaunchSource
+  /** Called after a prompt is queued into the agent, or immediately for argv prompt launches. */
+  onPromptDelivered?: () => void
 }
 
 function getCatalogEntry(agent: TuiAgent): { id: TuiAgent; label: string } | null {
@@ -46,12 +50,37 @@ function orderAgents(
   return [defaultAgent, ...inCatalogOrder.filter((id) => id !== defaultAgent)]
 }
 
+export function shouldShowLaunchWatchdogTimeout({
+  launchSource,
+  prompt,
+  pasteDraftAfterLaunch,
+  hasPty
+}: {
+  launchSource?: LaunchSource
+  prompt?: string
+  pasteDraftAfterLaunch: boolean
+  hasPty: boolean
+}): boolean {
+  return !(
+    (launchSource === 'notes_send' || launchSource === 'conflict_resolution') &&
+    (prompt?.trim().length ?? 0) > 0 &&
+    pasteDraftAfterLaunch &&
+    hasPty
+  )
+}
+
+function getLaunchWatchdogTimeoutMessage(label: string): string {
+  return `Couldn't launch ${label} — the terminal is still open.`
+}
+
 function QuickLaunchAgentMenuItemsInner({
   worktreeId,
   groupId,
   onFocusTerminal,
   prompt,
-  launchSource
+  promptDelivery,
+  launchSource,
+  onPromptDelivered
 }: QuickLaunchAgentMenuItemsProps): React.JSX.Element | null {
   // Why: must be a reactive selector (not getConnectionId() which reads a
   // snapshot via getState()). This ensures the component re-renders when the
@@ -85,7 +114,9 @@ function QuickLaunchAgentMenuItemsInner({
         worktreeId,
         groupId,
         ...(prompt !== undefined ? { prompt } : {}),
-        ...(launchSource !== undefined ? { launchSource } : {})
+        ...(promptDelivery !== undefined ? { promptDelivery } : {}),
+        ...(launchSource !== undefined ? { launchSource } : {}),
+        ...(onPromptDelivered !== undefined ? { onPromptDelivered } : {})
       })
       if (!result) {
         toast.error(`Could not build launch command for ${label}.`)
@@ -114,10 +145,21 @@ function QuickLaunchAgentMenuItemsInner({
         if (state.activeWorktreeId !== worktreeId) {
           return
         }
-        toast.message(`Couldn't launch ${label} — the terminal is still open.`)
+        const hasPty = (state.ptyIdsByTabId[result.tabId]?.length ?? 0) > 0
+        if (
+          !shouldShowLaunchWatchdogTimeout({
+            launchSource,
+            prompt,
+            pasteDraftAfterLaunch: result.pasteDraftAfterLaunch,
+            hasPty
+          })
+        ) {
+          return
+        }
+        toast.message(getLaunchWatchdogTimeoutMessage(label))
       })
     },
-    [worktreeId, groupId, onFocusTerminal, prompt, launchSource]
+    [worktreeId, groupId, onFocusTerminal, prompt, promptDelivery, launchSource, onPromptDelivered]
   )
 
   const agents = detectedIds ? orderAgents(defaultAgent, detectedIds) : []

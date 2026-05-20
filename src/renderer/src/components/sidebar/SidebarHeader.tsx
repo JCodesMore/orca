@@ -27,12 +27,6 @@ const GROUP_BY_OPTIONS = [
 ] as const
 
 const PROPERTY_OPTIONS: { id: WorktreeCardProperty; label: string }[] = [
-  { id: 'status', label: 'Terminal status' },
-  { id: 'unread', label: 'Unread indicator' },
-  { id: 'ci', label: 'CI checks' },
-  { id: 'issue', label: 'Linked issue' },
-  { id: 'pr', label: 'Linked PR' },
-  { id: 'comment', label: 'Comment' },
   // Why: toggles the inline "Agent activity" list rendered below each
   // workspace card body (see WorktreeCard -> WorktreeCardAgents). Off hides
   // the list; there is no alternate surface.
@@ -66,8 +60,6 @@ const SidebarHeader = React.memo(function SidebarHeader() {
   const setSortBy = useAppStore((s) => s.setSortBy)
   const groupBy = useAppStore((s) => s.groupBy)
   const setGroupBy = useAppStore((s) => s.setGroupBy)
-  const showWorkspaceLineage = useAppStore((s) => s.showWorkspaceLineage)
-  const setShowWorkspaceLineage = useAppStore((s) => s.setShowWorkspaceLineage)
 
   const handleWorkspaceBoardOpenChange = useCallback((open: boolean) => {
     setWorkspaceBoardOpen(open)
@@ -122,24 +114,6 @@ const SidebarHeader = React.memo(function SidebarHeader() {
           <span className="pl-2 pr-0.5 text-[10.5px] font-semibold uppercase tracking-[0.12em] text-muted-foreground/80 select-none">
             Workspaces
           </span>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant={workspaceBoardOpen ? 'secondary' : 'ghost'}
-                size="icon-xs"
-                className="text-muted-foreground"
-                aria-label="Workspace board"
-                aria-pressed={workspaceBoardOpen}
-                data-workspace-board-trigger=""
-                onClick={handleWorkspaceBoardToggle}
-              >
-                <Kanban className="size-3.5" strokeWidth={2.25} />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom" sideOffset={6}>
-              {workspaceBoardOpen ? 'Close workspace board' : 'Workspace board'}
-            </TooltipContent>
-          </Tooltip>
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
           <SidebarFilter preserveWorkspaceBoardOpen onMenuOpenChange={setWorkspaceBoardMenuOpen} />
@@ -196,15 +170,6 @@ const SidebarHeader = React.memo(function SidebarHeader() {
               </div>
 
               <DropdownMenuSeparator />
-              <DropdownMenuCheckboxItem
-                checked={showWorkspaceLineage}
-                onCheckedChange={(checked) => setShowWorkspaceLineage(Boolean(checked))}
-                onSelect={(e) => e.preventDefault()}
-              >
-                Nest child workspaces
-              </DropdownMenuCheckboxItem>
-
-              <DropdownMenuSeparator />
               <DropdownMenuLabel>Sort by</DropdownMenuLabel>
               <DropdownMenuRadioGroup
                 value={sortBy}
@@ -250,6 +215,25 @@ const SidebarHeader = React.memo(function SidebarHeader() {
               ))}
             </DropdownMenuContent>
           </DropdownMenu>
+
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant={workspaceBoardOpen ? 'secondary' : 'ghost'}
+                size="icon-xs"
+                className="text-muted-foreground"
+                aria-label="Workspace board"
+                aria-pressed={workspaceBoardOpen}
+                data-workspace-board-trigger=""
+                onClick={handleWorkspaceBoardToggle}
+              >
+                <Kanban className="size-3.5" strokeWidth={2.25} />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" sideOffset={6}>
+              {workspaceBoardOpen ? 'Close workspace board' : 'Workspace board'}
+            </TooltipContent>
+          </Tooltip>
 
           <Tooltip>
             <TooltipTrigger asChild>

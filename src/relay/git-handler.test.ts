@@ -37,6 +37,7 @@ describe('GitHandler', () => {
   it('registers all expected handlers', () => {
     const methods = Array.from(dispatcher._requestHandlers.keys())
     expect(methods).toContain('git.status')
+    expect(methods).toContain('git.checkIgnored')
     expect(methods).toContain('git.history')
     expect(methods).toContain('git.commit')
     expect(methods).toContain('git.diff')
@@ -142,6 +143,23 @@ describe('GitHandler', () => {
 
       expect('ignoredPaths' in defaultResult).toBe(false)
       expect(ignoredResult.ignoredPaths).toEqual(expect.arrayContaining(['dist/', '.env']))
+    })
+
+    it('checks ignored status for selected paths', async () => {
+      gitInit(tmpDir)
+      writeFileSync(path.join(tmpDir, '.gitignore'), 'dist/\n.env\n')
+      gitCommit(tmpDir, 'initial')
+      mkdirSync(path.join(tmpDir, 'dist'), { recursive: true })
+      writeFileSync(path.join(tmpDir, 'dist', 'bundle.js'), 'compiled')
+      writeFileSync(path.join(tmpDir, '.env'), 'TOKEN=secret')
+
+      const result = (await dispatcher.callRequest('git.checkIgnored', {
+        worktreePath: tmpDir,
+        paths: ['dist/bundle.js', 'src/index.ts', '.env']
+      })) as string[]
+
+      expect(result).toEqual(expect.arrayContaining(['dist/bundle.js', '.env']))
+      expect(result).not.toContain('src/index.ts')
     })
 
     it('detects modified files', async () => {
@@ -414,6 +432,35 @@ describe('GitHandler', () => {
       )
       expect(entry).toBeDefined()
       expect(entry!.path).toBe('docs/日本語/sample.md')
+    })
+
+    it('treats an unborn branch with a resolvable base as having no committed branch changes', async () => {
+      gitInit(tmpDir)
+      writeFileSync(path.join(tmpDir, 'base.txt'), 'base')
+      gitCommit(tmpDir, 'initial')
+      const baseRef = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+        cwd: tmpDir,
+        encoding: 'utf-8'
+      }).trim()
+
+      execFileSync('git', ['checkout', '--orphan', 'feature'], { cwd: tmpDir, stdio: 'pipe' })
+      execFileSync('git', ['rm', '-rf', '.'], { cwd: tmpDir, stdio: 'pipe' })
+
+      const result = (await dispatcher.callRequest('git.branchCompare', {
+        worktreePath: tmpDir,
+        baseRef
+      })) as { summary: Record<string, unknown>; entries: Record<string, unknown>[] }
+
+      expect(result.summary).toMatchObject({
+        baseRef,
+        compareRef: 'feature',
+        headOid: null,
+        changedFiles: 0,
+        commitsAhead: 0,
+        status: 'ready'
+      })
+      expect(result.summary.baseOid).toMatch(/^[0-9a-f]{40}$/)
+      expect(result.entries).toEqual([])
     })
   })
 

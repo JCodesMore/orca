@@ -11,6 +11,10 @@ export const GitStatusParams = WorktreeSelector.extend({
   includeIgnored: z.boolean().optional()
 })
 
+export const GitCheckIgnored = WorktreeSelector.extend({
+  paths: z.array(z.string().min(1, 'Missing path')).max(2000)
+})
+
 export const GitFilePath = WorktreeSelector.extend({
   filePath: z
     .unknown()
@@ -74,10 +78,22 @@ export const GitCommit = WorktreeSelector.extend({
     .pipe(z.string().min(1, 'Missing commit message'))
 })
 
+const CommitMessageModelCapability = z.object({
+  id: z.string(),
+  label: z.string(),
+  thinkingLevels: z.array(z.object({ id: z.string(), label: z.string() })).optional(),
+  defaultThinkingLevel: z.string().optional()
+})
+
 const CommitMessageAiSettings = z.object({
   enabled: z.boolean(),
   agentId: z.string().nullable(),
   selectedModelByAgent: z.record(z.string(), z.string()),
+  selectedModelByAgentByHost: z.record(z.string(), z.record(z.string(), z.string())).optional(),
+  discoveredModelsByAgent: z.record(z.string(), z.array(CommitMessageModelCapability)).optional(),
+  discoveredModelsByAgentByHost: z
+    .record(z.string(), z.record(z.string(), z.array(CommitMessageModelCapability)))
+    .optional(),
   selectedThinkingByModel: z.record(z.string(), z.string()),
   customPrompt: z.string(),
   customAgentCommand: z.string()
@@ -86,7 +102,13 @@ const CommitMessageAiSettings = z.object({
 export const GitGenerateCommitMessage = WorktreeSelector.extend({
   commitMessageAi: CommitMessageAiSettings.optional(),
   agentCmdOverrides: z.record(z.string(), z.string()).optional(),
-  enableGitHubAttribution: z.boolean().optional()
+  enableGitHubAttribution: z.boolean().optional(),
+  commitMessageDiscoveryHostKey: z.string().optional()
+})
+
+export const GitDiscoverCommitMessageModels = WorktreeSelector.extend({
+  agentId: z.string().min(1, 'Missing agent id'),
+  agentCmdOverrides: z.record(z.string(), z.string()).optional()
 })
 
 export const GitGeneratePullRequestFields = GitGenerateCommitMessage.extend({

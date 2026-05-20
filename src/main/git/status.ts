@@ -16,7 +16,7 @@ import type {
   GitStatusResult
 } from '../../shared/types'
 import type { CommitMessageDraftContext } from '../../shared/commit-message-generation'
-import { gitExecFileAsync, gitExecFileAsyncBuffer } from './runner'
+import { gitExecFileAsync, gitExecFileAsyncBuffer, gitOptionalLocksDisabledEnv } from './runner'
 
 const MAX_GIT_SHOW_BYTES = 10 * 1024 * 1024
 const MAX_STAGED_COMMIT_CONTEXT_BYTES = MAX_GIT_SHOW_BYTES
@@ -59,7 +59,12 @@ export async function getStatus(
   if (options.includeIgnored) {
     statusArgs.push('--ignored=matching')
   }
-  const statusPromise = gitExecFileAsync(statusArgs, { cwd: worktreePath })
+  const statusPromise = gitExecFileAsync(statusArgs, {
+    cwd: worktreePath,
+    // Why: status polling is read-like; avoid refreshing the index and racing
+    // terminal Git commands on `.git/worktrees/*/index.lock`.
+    env: gitOptionalLocksDisabledEnv()
+  })
   const conflictOperation = await conflictPromise
 
   try {
@@ -433,17 +438,31 @@ export async function getBranchCompare(
   summary.compareRef = compareRef
 
   let headOid = ''
+  let baseOid = ''
   try {
     headOid = await resolveRefOid(worktreePath, 'HEAD')
     summary.headOid = headOid
   } catch {
+    try {
+      baseOid = await resolveRefOid(worktreePath, baseRef)
+      summary.baseOid = baseOid
+      // Why: new remote worktrees can be on an unborn branch until the first
+      // commit. There are no committed branch changes yet; surfacing this as a
+      // compare error makes the source-control panel look broken.
+      summary.changedFiles = 0
+      summary.commitsAhead = 0
+      summary.status = 'ready'
+      return { summary, entries: [] }
+    } catch {
+      // Preserve the existing unborn-head message when even the base is not
+      // resolvable; callers cannot compare or present a useful empty state.
+    }
     summary.status = 'unborn-head'
     summary.errorMessage =
       'This branch does not have a committed HEAD yet, so compare-to-base is unavailable.'
     return { summary, entries: [] }
   }
 
-  let baseOid = ''
   try {
     baseOid = await resolveRefOid(worktreePath, baseRef)
     summary.baseOid = baseOid

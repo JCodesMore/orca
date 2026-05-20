@@ -583,6 +583,8 @@ export class SshRelaySession {
         worktreeId?: unknown
         env?: unknown
         version?: unknown
+        hasExplicitPrompt?: unknown
+        isReplay?: unknown
         payload?: unknown
       }
       if (typeof envelope.paneKey !== 'string') {
@@ -600,6 +602,8 @@ export class SshRelaySession {
           worktreeId: typeof envelope.worktreeId === 'string' ? envelope.worktreeId : undefined,
           env: typeof envelope.env === 'string' ? envelope.env : undefined,
           version: typeof envelope.version === 'string' ? envelope.version : undefined,
+          hasExplicitPrompt: envelope.hasExplicitPrompt === true ? true : undefined,
+          isReplay: envelope.isReplay === true ? true : undefined,
           payload: envelope.payload
         },
         this.targetId

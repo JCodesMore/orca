@@ -25,9 +25,12 @@ const {
   bulkUnstageFilesMock,
   bulkDiscardChangesMock,
   discardChangesMock,
+  checkIgnoredPathsMock,
   listWorktreesMock,
   resolveCommitMessageSettingsMock,
   generateCommitMessageFromContextMock,
+  discoverCommitMessageModelsLocalMock,
+  discoverCommitMessageModelsRemoteMock,
   cancelGenerateCommitMessageLocalMock,
   getSshFilesystemProviderMock,
   getSshGitProviderMock
@@ -53,9 +56,12 @@ const {
   bulkUnstageFilesMock: vi.fn(),
   bulkDiscardChangesMock: vi.fn(),
   discardChangesMock: vi.fn(),
+  checkIgnoredPathsMock: vi.fn(),
   listWorktreesMock: vi.fn(),
   resolveCommitMessageSettingsMock: vi.fn(),
   generateCommitMessageFromContextMock: vi.fn(),
+  discoverCommitMessageModelsLocalMock: vi.fn(),
+  discoverCommitMessageModelsRemoteMock: vi.fn(),
   cancelGenerateCommitMessageLocalMock: vi.fn(),
   getSshFilesystemProviderMock: vi.fn(),
   getSshGitProviderMock: vi.fn()
@@ -95,21 +101,40 @@ vi.mock('../git/status', () => ({
   discardChanges: discardChangesMock
 }))
 
+vi.mock('../git/check-ignored-paths', () => ({
+  checkIgnoredPaths: checkIgnoredPathsMock
+}))
+
 vi.mock('../git/worktree', () => ({
   listWorktrees: listWorktreesMock
 }))
 
 vi.mock('../providers/ssh-filesystem-dispatch', () => ({
-  getSshFilesystemProvider: getSshFilesystemProviderMock
+  getSshFilesystemProvider: getSshFilesystemProviderMock,
+  SSH_FILESYSTEM_PROVIDER_UNAVAILABLE_MESSAGE:
+    'Remote connection dropped. Click Reconnect on the SSH target before retrying.',
+  requireSshFilesystemProvider: (connectionId: string) => {
+    const provider = getSshFilesystemProviderMock(connectionId)
+    if (!provider) {
+      throw new Error(
+        'Remote connection dropped. Click Reconnect on the SSH target before retrying.'
+      )
+    }
+    return provider
+  }
 }))
 
 vi.mock('../providers/ssh-git-dispatch', () => ({
-  getSshGitProvider: getSshGitProviderMock
+  getSshGitProvider: getSshGitProviderMock,
+  SSH_GIT_PROVIDER_UNAVAILABLE_MESSAGE:
+    'Remote connection dropped. Click Reconnect on the SSH target before retrying.'
 }))
 
 vi.mock('../text-generation/commit-message-text-generation', () => ({
   resolveCommitMessageSettings: resolveCommitMessageSettingsMock,
   generateCommitMessageFromContext: generateCommitMessageFromContextMock,
+  discoverCommitMessageModelsLocal: discoverCommitMessageModelsLocalMock,
+  discoverCommitMessageModelsRemote: discoverCommitMessageModelsRemoteMock,
   cancelGenerateCommitMessageLocal: cancelGenerateCommitMessageLocalMock
 }))
 
@@ -186,6 +211,8 @@ describe('registerFilesystemHandlers', () => {
       listWorktreesMock,
       resolveCommitMessageSettingsMock,
       generateCommitMessageFromContextMock,
+      discoverCommitMessageModelsLocalMock,
+      discoverCommitMessageModelsRemoteMock,
       cancelGenerateCommitMessageLocalMock,
       getSshFilesystemProviderMock,
       getSshGitProviderMock
@@ -222,6 +249,16 @@ describe('registerFilesystemHandlers', () => {
       close: vi.fn()
     })
     lstatMock.mockRejectedValue(Object.assign(new Error('missing'), { code: 'ENOENT' }))
+  })
+
+  it('returns an actionable reconnect error when the SSH filesystem provider is unavailable', async () => {
+    registerFilesystemHandlers(store as never)
+
+    await expect(
+      handlers.get('fs:readDir')!(null, { dirPath: '/remote/repo', connectionId: 'ssh-1' })
+    ).rejects.toThrow(
+      'Remote connection dropped. Click Reconnect on the SSH target before retrying.'
+    )
   })
 
   it('rejects readFile when the real path escapes allowed roots', async () => {
@@ -495,6 +532,39 @@ describe('registerFilesystemHandlers', () => {
 
     expect(getStatusMock).toHaveBeenCalledWith(WORKTREE_FEATURE_PATH, { includeIgnored: true })
     expect(sshProvider.getStatus).toHaveBeenCalledWith('/remote/repo', { includeIgnored: true })
+  })
+
+  it('checks ignored paths through local and SSH git providers', async () => {
+    registerWorktreeRootsForRepo(store as never, 'repo-1', [REPO_PATH, WORKTREE_FEATURE_PATH])
+    checkIgnoredPathsMock.mockResolvedValue(['dist/bundle.js'])
+    const sshProvider = {
+      checkIgnoredPaths: vi.fn().mockResolvedValue(['build/output.js'])
+    }
+    getSshGitProviderMock.mockReturnValue(sshProvider)
+
+    registerFilesystemHandlers(store as never)
+
+    await expect(
+      handlers.get('git:checkIgnored')!(null, {
+        worktreePath: WORKTREE_FEATURE_PATH,
+        paths: ['dist/bundle.js', 'src/index.ts']
+      })
+    ).resolves.toEqual(['dist/bundle.js'])
+    await expect(
+      handlers.get('git:checkIgnored')!(null, {
+        worktreePath: '/remote/repo',
+        connectionId: 'ssh-1',
+        paths: ['build/output.js']
+      })
+    ).resolves.toEqual(['build/output.js'])
+
+    expect(checkIgnoredPathsMock).toHaveBeenCalledWith(WORKTREE_FEATURE_PATH, [
+      path.join('dist', 'bundle.js'),
+      path.join('src', 'index.ts')
+    ])
+    expect(sshProvider.checkIgnoredPaths).toHaveBeenCalledWith('/remote/repo', [
+      path.join('build', 'output.js')
+    ])
   })
 
   it('rejects git file paths that escape the selected worktree', async () => {
@@ -898,7 +968,7 @@ describe('registerFilesystemHandlers', () => {
       stagedSummary: 'M\tREADME.md',
       stagedPatch: '+hello'
     }
-    const params = { agentId: 'claude', model: 'claude-haiku-4-5' }
+    const params = { agentId: 'claude', model: 'haiku' }
     resolveCommitMessageSettingsMock.mockReturnValue({ ok: true, params })
     getStagedCommitContextMock.mockResolvedValue(context)
     generateCommitMessageFromContextMock.mockResolvedValue({
@@ -936,6 +1006,89 @@ describe('registerFilesystemHandlers', () => {
         process.env.ANTHROPIC_API_KEY = previousAnthropicApiKey
       }
     }
+  })
+
+  it('passes per-agent command overrides into local model discovery', async () => {
+    discoverCommitMessageModelsLocalMock.mockResolvedValue({
+      success: true,
+      capability: {
+        id: 'codex',
+        label: 'Codex',
+        modelSource: 'dynamic',
+        defaultModelId: 'gpt-5.5',
+        models: [{ id: 'gpt-5.5', label: 'GPT-5.5' }]
+      },
+      models: [{ id: 'gpt-5.5', label: 'GPT-5.5' }],
+      defaultModelId: 'gpt-5.5'
+    })
+    const storeWithOverride = {
+      ...store,
+      getSettings: () => ({
+        workspaceDir: WORKSPACE_DIR,
+        agentCmdOverrides: { codex: 'npx codex' }
+      })
+    }
+
+    registerFilesystemHandlers(storeWithOverride as never)
+
+    await handlers.get('git:discoverCommitMessageModels')!(null, { agentId: 'codex' })
+
+    expect(discoverCommitMessageModelsLocalMock).toHaveBeenCalledWith(
+      'codex',
+      undefined,
+      'npx codex'
+    )
+  })
+
+  it('routes SSH model discovery through the remote git provider', async () => {
+    discoverCommitMessageModelsRemoteMock.mockResolvedValue({
+      success: true,
+      capability: {
+        id: 'cursor',
+        label: 'Cursor',
+        modelSource: 'dynamic',
+        defaultModelId: 'auto',
+        models: [{ id: 'auto', label: 'Auto' }]
+      },
+      models: [{ id: 'auto', label: 'Auto' }],
+      defaultModelId: 'auto'
+    })
+    const executeCommitMessagePlan = vi.fn()
+    getSshGitProviderMock.mockReturnValue({ executeCommitMessagePlan })
+    const storeWithOverride = {
+      ...store,
+      getSettings: () => ({
+        workspaceDir: WORKSPACE_DIR,
+        agentCmdOverrides: { cursor: 'npx cursor-agent' }
+      })
+    }
+
+    registerFilesystemHandlers(storeWithOverride as never)
+
+    await handlers.get('git:discoverCommitMessageModels')!(null, {
+      agentId: 'cursor',
+      worktreePath: '/remote/repo',
+      connectionId: 'conn-1'
+    })
+
+    expect(discoverCommitMessageModelsRemoteMock).toHaveBeenCalledWith(
+      'cursor',
+      '/remote/repo',
+      expect.any(Function),
+      'npx cursor-agent'
+    )
+    const execute = discoverCommitMessageModelsRemoteMock.mock.calls[0]?.[2] as (
+      plan: unknown,
+      cwd: string,
+      timeoutMs: number
+    ) => Promise<unknown>
+    await execute({ binary: 'cursor-agent', args: ['--list-models'] }, '/remote/repo', 60_000)
+    expect(executeCommitMessagePlan).toHaveBeenCalledWith(
+      { binary: 'cursor-agent', args: ['--list-models'] },
+      '/remote/repo',
+      60_000
+    )
+    expect(discoverCommitMessageModelsLocalMock).not.toHaveBeenCalled()
   })
 
   it('generates an SSH commit message using remote staged context and relay execution', async () => {

@@ -1,6 +1,7 @@
-import type { Worktree, Repo, TerminalTab } from '../../../../shared/types'
+import type { Worktree, Repo, TerminalTab, WorktreeLineage } from '../../../../shared/types'
 import { buildWorktreeComparator, sortWorktreesSmart } from './smart-sort'
 import { tabHasLivePty } from '@/lib/tab-has-live-pty'
+import { isWebTerminalSurfaceTabId } from '@/runtime/web-terminal-surface-id'
 import { useAppStore } from '@/store'
 import { getAllWorktreesFromState, getRepoMapFromState } from '@/store/selectors'
 
@@ -97,12 +98,17 @@ export function computeVisibleWorktreeIds(
     // forgot to pass it would silently widen the list across all Spaces.
     activeSpaceId: string | null
     repoSpaceAssignments: Record<string, string>
+    worktreeLineageById: Record<string, WorktreeLineage>
   }
 ): string[] {
   let all: Worktree[] = getAllWorktreesFromState({ worktreesByRepo })
 
   // Filter archived
   all = all.filter((w) => !w.isArchived)
+
+  // Why: sidebar lineage is structural. Archived workspaces stay hidden, but
+  // every other valid ancestor can bypass filters so children never orphan.
+  const lineageAncestorById = new Map(all.map((w) => [w.id, w]))
 
   if (opts.hideDefaultBranchWorkspace) {
     all = all.filter((w) => !isDefaultBranchWorkspace(w))
@@ -125,12 +131,18 @@ export function computeVisibleWorktreeIds(
       const hasLiveTerminal = tabs.some((tab) =>
         opts.ptyIdsByTabId ? tabHasLivePty(opts.ptyIdsByTabId, tab.id) : false
       )
+      const hasHostMirroredTerminal = tabs.some((tab) => isWebTerminalSurfaceTabId(tab.id))
       const hasBrowserTabs = (opts.browserTabsByWorktree?.[w.id] ?? []).length > 0
       // Why: "Active only" should reflect the surfaces Orca can actually
       // restore into, not just PTY-backed terminals. A browser-tab worktree is
       // still active from the user's point of view even if it has no live PTY,
       // and the currently selected worktree should never vanish from the list.
-      return hasLiveTerminal || hasBrowserTabs || opts.activeWorktreeId === w.id
+      return (
+        hasLiveTerminal ||
+        hasHostMirroredTerminal ||
+        hasBrowserTabs ||
+        opts.activeWorktreeId === w.id
+      )
     })
   }
 
@@ -143,7 +155,53 @@ export function computeVisibleWorktreeIds(
     return ai - bi
   })
 
-  return all.map((w) => w.id)
+  return addVisibleLineageAncestors(
+    all.map((w) => w.id),
+    lineageAncestorById,
+    opts.worktreeLineageById
+  )
+}
+
+function addVisibleLineageAncestors(
+  ids: string[],
+  worktreeById: Map<string, Worktree>,
+  lineageById: Record<string, WorktreeLineage>
+): string[] {
+  const result: string[] = []
+  const included = new Set<string>()
+  const visiting = new Set<string>()
+
+  const addWithAncestors = (id: string): void => {
+    if (included.has(id) || visiting.has(id)) {
+      return
+    }
+    const worktree = worktreeById.get(id)
+    if (!worktree) {
+      return
+    }
+    visiting.add(id)
+    const lineage = lineageById[id]
+    const parent = lineage ? worktreeById.get(lineage.parentWorktreeId) : undefined
+    if (
+      parent &&
+      worktree.instanceId === lineage.worktreeInstanceId &&
+      parent.instanceId === lineage.parentWorktreeInstanceId
+    ) {
+      // Why: sidebar lineage is structural. If a filtered child is visible,
+      // its valid parent must be rendered too so the hierarchy remains legible.
+      addWithAncestors(parent.id)
+    }
+    visiting.delete(id)
+    if (!included.has(id)) {
+      included.add(id)
+      result.push(id)
+    }
+  }
+
+  for (const id of ids) {
+    addWithAncestors(id)
+  }
+  return result
 }
 
 /**
@@ -221,6 +279,7 @@ export function getVisibleWorktreeIds(): string[] {
     hideDefaultBranchWorkspace: state.hideDefaultBranchWorkspace,
     repoMap,
     activeSpaceId: state.activeSpaceId,
-    repoSpaceAssignments: state.repoSpaceAssignments
+    repoSpaceAssignments: state.repoSpaceAssignments,
+    worktreeLineageById: state.worktreeLineageById
   })
 }

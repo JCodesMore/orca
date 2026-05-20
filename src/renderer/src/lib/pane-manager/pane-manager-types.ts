@@ -1,4 +1,4 @@
-import type { Terminal } from '@xterm/xterm'
+import type { IMarker, Terminal } from '@xterm/xterm'
 import type { ITerminalOptions } from '@xterm/xterm'
 import type { FitAddon } from '@xterm/addon-fit'
 import type { LigaturesAddon } from '@xterm/addon-ligatures'
@@ -15,11 +15,12 @@ import type { TerminalLeafId } from '../../../../shared/stable-pane-id'
 // ---------------------------------------------------------------------------
 
 /** Hints forwarded from splitPane() into onPaneCreated for a single split.
- *  Currently only carries the resolved cwd for the new pane's PTY spawn.
+ *  Carries one-shot PTY spawn/adoption data for the new pane.
  *  Kept as a separate parameter (rather than extending ManagedPane) so the
  *  hint is scoped to pane creation and does not live on the pane afterwards. */
 export type PaneSpawnHints = {
   cwd?: string
+  ptyId?: string
 }
 
 export type ClosedPaneInfo = {
@@ -80,9 +81,9 @@ export type ManagedPane = {
 export type ScrollState = {
   bufferType: 'normal' | 'alternate'
   wasAtBottom: boolean
-  firstVisibleLineContent: string
   viewportY: number
-  totalLines: number
+  baseY: number
+  firstVisibleLineMarker?: IMarker
 }
 
 export type ManagedPaneInternal = {
@@ -107,11 +108,8 @@ export type ManagedPaneInternal = {
   webLinksAddon: WebLinksAddon
   // Stored so disposePane() can remove it and avoid a memory leak.
   compositionHandler: (() => void) | null
-  // Why: during splitPane, multiple async operations (rAFs, ResizeObserver
-  // debounce, WebGL context loss) may independently attempt scroll
-  // restoration. This field acts as a lock: when set, safeFit and other
-  // intermediate fit paths skip their own scroll restoration, deferring to
-  // the splitPane's final authoritative restore.
+  // Why: splitPane reparents DOM; its delayed restore owns scroll until the
+  // browser settles, so intermediate fits must not compete with it.
   pendingSplitScrollState: ScrollState | null
   debugLabel: string | null
 } & ManagedPane

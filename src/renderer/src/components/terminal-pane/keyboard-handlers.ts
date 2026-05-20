@@ -9,6 +9,7 @@ import type { MacOptionAsAlt } from './terminal-shortcut-policy'
 import { resolveSplitCwd, type PaneCwdMap } from './resolve-split-cwd'
 import { keyboardEventBelongsToScope } from './terminal-keyboard-scope'
 import { normalizeSelectedTextForFileSearch } from '@/lib/file-search-selection'
+import { splitWebRuntimeTerminal } from '@/runtime/web-runtime-session'
 
 function isEditableTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) {
@@ -127,6 +128,7 @@ export function useTerminalKeyboardShortcuts({
     }
 
     const isMac = navigator.userAgent.includes('Mac')
+    const isWindows = navigator.userAgent.includes('Windows')
 
     // Why: KeyboardEvent.location on a character key (e.g. Period) always
     // reports that key's own position (0 = standard), not which modifier is
@@ -198,7 +200,8 @@ export function useTerminalKeyboardShortcuts({
         e,
         isMac,
         macOptionAsAltRef.current,
-        optionKeyLocation
+        optionKeyLocation,
+        isWindows
       )
       if (!action) {
         return
@@ -334,6 +337,10 @@ export function useTerminalKeyboardShortcuts({
         if (!pane) {
           return
         }
+        const ptyId = paneTransportsRef.current.get(pane.id)?.getPtyId() ?? null
+        if (splitWebRuntimeTerminal(ptyId, action.direction)) {
+          return
+        }
         // Split-pane CWD inheritance (docs/ssh-split-pane-inherit-cwd.md):
         // if we have a confirmed live OSC 7 for the source pane, split
         // synchronously to preserve chaining on rapid Cmd+D. Otherwise fall
@@ -343,7 +350,6 @@ export function useTerminalKeyboardShortcuts({
           manager.splitPane(pane.id, action.direction, { cwd: cached.cwd })
           return
         }
-        const ptyId = paneTransportsRef.current.get(pane.id)?.getPtyId() ?? null
         const paneIdAtDispatch = pane.id
         const directionAtDispatch = action.direction
         void (async () => {

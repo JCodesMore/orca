@@ -3,6 +3,7 @@ import type { StateCreator } from 'zustand'
 import type { AppState } from '../types'
 import { joinPath } from '@/lib/path'
 import { toast } from 'sonner'
+import { isPathInsideOrEqual } from '../../../../shared/cross-platform-path'
 import { resolveMarkdownLinkTarget } from '@/components/editor/markdown-internal-links'
 import { openHttpLink } from '@/lib/http-link-routing'
 import { isLocalPathOpenBlocked, showLocalPathOpenBlockedToast } from '@/lib/local-path-open-guard'
@@ -24,6 +25,7 @@ import type {
   WorkspaceVisibleTabType
 } from '../../../../shared/types'
 import { stripCredentialsFromMessage } from '../../../../shared/git-remote-error'
+import { FLOATING_TERMINAL_WORKTREE_ID } from '../../../../shared/constants'
 import type { RemoteOpKind } from '@/components/right-sidebar/source-control-primary-action'
 import {
   fetchRuntimeGit,
@@ -100,6 +102,7 @@ export type ConflictReviewState = {
   source: 'live-summary' | 'combined-diff-exclusion'
   snapshotTimestamp: number
   entries: ConflictReviewEntry[]
+  selectedFileId?: string
 }
 
 export type CombinedDiffSkippedConflict = {
@@ -230,6 +233,7 @@ export type EditorSlice = {
   rightSidebarOpen: boolean
   rightSidebarWidth: number
   rightSidebarTab: RightSidebarTab
+  rightSidebarTabByWorktree: Record<string, RightSidebarTab>
   activityBarPosition: ActivityBarPosition
   toggleRightSidebar: () => void
   setRightSidebarOpen: (open: boolean) => void
@@ -239,6 +243,8 @@ export type EditorSlice = {
 
   // File explorer state
   expandedDirs: Record<string, Set<string>> // worktreeId -> set of expanded dir paths
+  collapseAllDirs: (worktreeId: string) => void
+  collapseDirSubtree: (worktreeId: string, dirPath: string) => void
   toggleDir: (worktreeId: string, dirPath: string) => void
   pendingExplorerReveal: {
     worktreeId: string
@@ -324,6 +330,13 @@ export type EditorSlice = {
     areaFilter?: string
   ) => void
   openConflictFile: (
+    worktreeId: string,
+    worktreePath: string,
+    entry: GitStatusEntry,
+    language: string
+  ) => void
+  openConflictReviewFile: (
+    reviewFileId: string,
     worktreeId: string,
     worktreePath: string,
     entry: GitStatusEntry,
@@ -480,6 +493,28 @@ function openWorkspaceEditorItem(
     targetGroupId: resolvedGroupId
   })
   return created?.id ?? fileId
+}
+
+function buildEditorActiveResult(
+  state: Pick<EditorSlice, 'activeFileIdByWorktree' | 'activeTabTypeByWorktree'>,
+  worktreeId: string,
+  fileId: string
+): {
+  activeFileId?: string
+  activeTabType?: 'editor'
+  activeFileIdByWorktree: Record<string, string | null>
+  activeTabTypeByWorktree: Record<string, WorkspaceVisibleTabType>
+} {
+  return {
+    // Why: floating markdown tabs use the editor surface without becoming the
+    // main worktree's active editor. Updating only the per-worktree maps keeps
+    // the workspace behind the floating panel from switching surfaces.
+    ...(worktreeId === FLOATING_TERMINAL_WORKTREE_ID
+      ? {}
+      : { activeFileId: fileId, activeTabType: 'editor' as const }),
+    activeFileIdByWorktree: { ...state.activeFileIdByWorktree, [worktreeId]: fileId },
+    activeTabTypeByWorktree: { ...state.activeTabTypeByWorktree, [worktreeId]: 'editor' }
+  }
 }
 
 const REMOTE_OPERATION_FAILED_MESSAGE = 'Remote operation failed'
@@ -696,15 +731,49 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
   rightSidebarOpen: false,
   rightSidebarWidth: 280,
   rightSidebarTab: 'explorer',
+  rightSidebarTabByWorktree: {},
   activityBarPosition: 'top',
   toggleRightSidebar: () => set((s) => ({ rightSidebarOpen: !s.rightSidebarOpen })),
   setRightSidebarOpen: (open) => set({ rightSidebarOpen: open }),
   setRightSidebarWidth: (width) => set({ rightSidebarWidth: width }),
-  setRightSidebarTab: (tab) => set({ rightSidebarTab: tab }),
+  setRightSidebarTab: (tab) =>
+    set((s) => ({
+      rightSidebarTab: tab,
+      rightSidebarTabByWorktree: s.activeWorktreeId
+        ? { ...s.rightSidebarTabByWorktree, [s.activeWorktreeId]: tab }
+        : s.rightSidebarTabByWorktree
+    })),
   setActivityBarPosition: (position) => set({ activityBarPosition: position }),
 
   // File explorer
   expandedDirs: {},
+  collapseAllDirs: (worktreeId) =>
+    set((s) => {
+      const current = s.expandedDirs[worktreeId]
+      if (!current?.size) {
+        return s
+      }
+      return {
+        expandedDirs: {
+          ...s.expandedDirs,
+          [worktreeId]: new Set<string>()
+        }
+      }
+    }),
+  collapseDirSubtree: (worktreeId, dirPath) =>
+    set((s) => {
+      const current = s.expandedDirs[worktreeId]
+      if (!current?.size) {
+        return s
+      }
+      const next = new Set(
+        Array.from(current).filter((expandedDir) => !isPathInsideOrEqual(dirPath, expandedDir))
+      )
+      if (next.size === current.size) {
+        return s
+      }
+      return { expandedDirs: { ...s.expandedDirs, [worktreeId]: next } }
+    }),
   toggleDir: (worktreeId, dirPath) =>
     set((s) => {
       const current = s.expandedDirs[worktreeId] ?? new Set<string>()
@@ -718,11 +787,15 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
     }),
   pendingExplorerReveal: null,
   revealInExplorer: (worktreeId, filePath) =>
-    set({
+    set((s) => ({
       rightSidebarOpen: true,
       rightSidebarTab: 'explorer',
+      rightSidebarTabByWorktree: {
+        ...s.rightSidebarTabByWorktree,
+        [worktreeId]: 'explorer'
+      },
       pendingExplorerReveal: { worktreeId, filePath, requestId: Date.now() }
-    }),
+    })),
   clearPendingExplorerReveal: () => set({ pendingExplorerReveal: null }),
 
   // Open files
@@ -773,12 +846,7 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
         }
       }
 
-      const activeResult = {
-        activeFileId: id,
-        activeTabType: 'editor' as const,
-        activeFileIdByWorktree: { ...s.activeFileIdByWorktree, [worktreeId]: id },
-        activeTabTypeByWorktree: { ...s.activeTabTypeByWorktree, [worktreeId]: 'editor' as const }
-      }
+      const activeResult = buildEditorActiveResult(s, worktreeId, id)
 
       if (existing) {
         // If opening as non-preview, also pin the existing tab
@@ -988,12 +1056,7 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
       const worktreeId = file.worktreeId
       const runtimeEnvironmentId =
         file.runtimeEnvironmentId ?? s.settings?.activeRuntimeEnvironmentId?.trim() ?? undefined
-      const activeResult = {
-        activeFileId: id,
-        activeTabType: 'editor' as const,
-        activeFileIdByWorktree: { ...s.activeFileIdByWorktree, [worktreeId]: id },
-        activeTabTypeByWorktree: { ...s.activeTabTypeByWorktree, [worktreeId]: 'editor' as const }
-      }
+      const activeResult = buildEditorActiveResult(s, worktreeId, id)
 
       if (existing) {
         const needsUpdate =
@@ -1824,6 +1887,104 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
     void openWorkspaceEditorItem(get(), absolutePath, worktreeId, entry.path, 'editor')
   },
 
+  openConflictReviewFile: (reviewFileId, worktreeId, worktreePath, entry, language) => {
+    const absolutePath = joinPath(worktreePath, entry.path)
+    const reviewTab = (get().unifiedTabsByWorktree?.[worktreeId] ?? []).find(
+      (tab) => tab.entityId === reviewFileId && tab.contentType === 'conflict-review'
+    )
+    set((s) => {
+      const conflict = toOpenConflictMetadata(entry)
+      const existing = s.openFiles.find((f) => f.id === absolutePath)
+      const nextTracked =
+        entry.conflictStatus === 'unresolved' && entry.conflictKind
+          ? {
+              ...s.trackedConflictPathsByWorktree[worktreeId],
+              [entry.path]: entry.conflictKind
+            }
+          : s.trackedConflictPathsByWorktree[worktreeId]
+
+      if (!conflict) {
+        return s
+      }
+
+      const nextOpenFiles = existing
+        ? s.openFiles.map((f) =>
+            f.id === absolutePath
+              ? {
+                  ...f,
+                  mode: 'edit' as const,
+                  language,
+                  relativePath: entry.path,
+                  filePath: absolutePath,
+                  conflict,
+                  diffSource: undefined,
+                  skippedConflicts: undefined,
+                  conflictReview: undefined
+                }
+              : f.id === reviewFileId && f.conflictReview
+                ? {
+                    ...f,
+                    conflictReview: {
+                      ...f.conflictReview,
+                      selectedFileId: absolutePath
+                    }
+                  }
+                : f
+          )
+        : [
+            ...s.openFiles.map((f) =>
+              f.id === reviewFileId && f.conflictReview
+                ? {
+                    ...f,
+                    conflictReview: {
+                      ...f.conflictReview,
+                      selectedFileId: absolutePath
+                    }
+                  }
+                : f
+            ),
+            {
+              id: absolutePath,
+              filePath: absolutePath,
+              relativePath: entry.path,
+              worktreeId,
+              language,
+              isDirty: false,
+              mode: 'edit' as const,
+              conflict
+            }
+          ]
+
+      return {
+        openFiles: nextOpenFiles,
+        activeFileId: reviewFileId,
+        activeTabType: 'editor',
+        activeFileIdByWorktree: { ...s.activeFileIdByWorktree, [worktreeId]: reviewFileId },
+        activeTabTypeByWorktree: { ...s.activeTabTypeByWorktree, [worktreeId]: 'editor' },
+        trackedConflictPathsByWorktree:
+          nextTracked === s.trackedConflictPathsByWorktree[worktreeId]
+            ? s.trackedConflictPathsByWorktree
+            : { ...s.trackedConflictPathsByWorktree, [worktreeId]: nextTracked }
+      }
+    })
+
+    // Why: the conflict file needs a normal editor backing tab for save/close
+    // flows, but selecting it from Conflict Review must keep the review tab
+    // visible. Create the backing tab beside the review tab, then restore focus.
+    void openWorkspaceEditorItem(
+      get(),
+      absolutePath,
+      worktreeId,
+      entry.path,
+      'editor',
+      undefined,
+      reviewTab?.groupId
+    )
+    if (reviewTab) {
+      get().activateTab?.(reviewTab.id)
+    }
+  },
+
   // Why: Review conflicts is launched from Source Control into the editor area,
   // not from Checks. Merge-conflict review is source-control work, not CI/PR
   // status. The tab renders from a stored snapshot (entries + timestamp), not
@@ -2240,6 +2401,10 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
       get().endRemoteOperation()
     }
     void get().fetchUpstreamStatus(worktreeId, worktreePath, connectionId)
+    const refreshGitHubForWorktree = get().refreshGitHubForWorktree
+    if (typeof refreshGitHubForWorktree === 'function') {
+      refreshGitHubForWorktree(worktreeId)
+    }
   },
   pullBranch: async (worktreeId, worktreePath, connectionId) => {
     get().beginRemoteOperation('pull')
@@ -2252,6 +2417,10 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
       get().endRemoteOperation()
     }
     void get().fetchUpstreamStatus(worktreeId, worktreePath, connectionId)
+    const refreshGitHubForWorktree = get().refreshGitHubForWorktree
+    if (typeof refreshGitHubForWorktree === 'function') {
+      refreshGitHubForWorktree(worktreeId)
+    }
   },
   syncBranch: async (worktreeId, worktreePath, connectionId, pushTarget) => {
     // Why: same shape as pushBranch / pullBranch — fire-and-forget the
@@ -2263,6 +2432,7 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
     // user invoked Sync; the underlying push is implementation detail. The
     // outer catch must then skip toasting to avoid a double-toast.
     let pushStageToastShown = false
+    let pushed = false
     try {
       const context = { settings: get().settings, worktreeId, worktreePath, connectionId }
       await fetchRuntimeGit(context)
@@ -2275,6 +2445,7 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
       if (upstreamStatus.ahead > 0) {
         try {
           await pushRuntimeGit(context, { pushTarget })
+          pushed = true
         } catch (error) {
           // Why: format under the user-facing operation (sync) rather than
           // the inner step (push) — the user clicked Sync and shouldn't see
@@ -2297,6 +2468,12 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
       get().endRemoteOperation()
     }
     void get().fetchUpstreamStatus(worktreeId, worktreePath, connectionId)
+    if (pushed) {
+      const refreshGitHubForWorktree = get().refreshGitHubForWorktree
+      if (typeof refreshGitHubForWorktree === 'function') {
+        refreshGitHubForWorktree(worktreeId)
+      }
+    }
   },
   fetchBranch: async (worktreeId, worktreePath, connectionId) => {
     // Why: same shape as pushBranch / pullBranch — fire-and-forget the

@@ -86,6 +86,21 @@ function readDataFile(): unknown {
   return JSON.parse(readFileSync(dataFile(), 'utf-8'))
 }
 
+function collectPropertyPaths(value: unknown, property: string, prefix = ''): string[] {
+  if (!value || typeof value !== 'object') {
+    return []
+  }
+  const paths: string[] = []
+  for (const [key, child] of Object.entries(value)) {
+    const path = prefix ? `${prefix}.${key}` : key
+    if (key === property) {
+      paths.push(path)
+    }
+    paths.push(...collectPropertyPaths(child, property, path))
+  }
+  return paths
+}
+
 const makeRepo = (overrides: Partial<Repo> = {}): Repo => ({
   id: 'r1',
   path: '/repo',
@@ -207,17 +222,19 @@ describe('Store', () => {
     expect(settings.showTasksButton).toBe(true)
     expect(settings.visibleTaskProviders).toEqual(['github', 'gitlab', 'linear'])
     expect(settings.openInApplications).toEqual([])
-    expect(settings.experimentalActivity).toBe(true)
+    expect(settings.experimentalActivity).toBe(false)
+    expect(settings.experimentalActivityDefaultedOffForAllUsers).toBe(true)
     expect(settings.floatingTerminalEnabled).toBe(true)
     expect(settings.floatingTerminalDefaultedForAllUsers).toBe(true)
     expect(settings.notifications.customSoundPath).toBeNull()
+    expect(settings.notifications.customSoundVolume).toBe(100)
   })
 
   it('returns default UI state when no data file exists', async () => {
     const store = await createStore()
     const ui = store.getUI()
     expect(ui.sidebarWidth).toBe(280)
-    expect(ui.groupBy).toBe('repo')
+    expect(ui.groupBy).toBe('workspace-status')
     expect(ui.lastActiveRepoId).toBeNull()
     expect(ui.dismissedUpdateVersion).toBeNull()
     expect(ui.lastUpdateCheckAt).toBeNull()
@@ -441,6 +458,47 @@ describe('Store', () => {
     expect(persisted.automations[0].baseBranch).toBeNull()
   })
 
+  it('persists session reuse only for existing-workspace automations', async () => {
+    const store = await createStore()
+    store.addRepo(makeRepo())
+
+    const existingWorkspace = store.createAutomation({
+      name: 'Digest',
+      prompt: 'Summarize changes',
+      agentId: 'claude',
+      projectId: 'r1',
+      workspaceMode: 'existing',
+      workspaceId: 'wt1',
+      reuseSession: true,
+      timezone: 'UTC',
+      rrule: 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0',
+      dtstart: new Date('2026-05-13T00:00:00Z').getTime()
+    })
+    const newPerRun = store.createAutomation({
+      name: 'Fresh',
+      prompt: 'Run checks',
+      agentId: 'claude',
+      projectId: 'r1',
+      workspaceMode: 'new_per_run',
+      reuseSession: true,
+      timezone: 'UTC',
+      rrule: 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0',
+      dtstart: new Date('2026-05-13T00:00:00Z').getTime()
+    })
+
+    expect(existingWorkspace.reuseSession).toBe(true)
+    expect(newPerRun.reuseSession).toBe(false)
+    expect(
+      store.updateAutomation(existingWorkspace.id, { workspaceMode: 'new_per_run' }).reuseSession
+    ).toBe(false)
+
+    const persisted = readDataFile() as { automations: Record<string, unknown>[] }
+    delete persisted.automations[0].reuseSession
+    writeDataFile(persisted)
+    const reloaded = await createStore()
+    expect(reloaded.listAutomations()[0].reuseSession).toBe(false)
+  })
+
   it('numbers automation run titles per automation', async () => {
     const store = await createStore()
     store.addRepo(makeRepo())
@@ -595,10 +653,13 @@ describe('Store', () => {
     expect(store.getSettings().editorAutoSaveDelayMs).toBe(1000)
     expect(store.getSettings().refreshLocalBaseRefOnWorktreeCreate).toBe(false)
     expect(store.getSettings().rightSidebarOpenByDefault).toBe(true)
+    expect(store.getSettings().sourceControlViewMode).toBe('list')
+    expect(store.getSettings().showGitIgnoredFiles).toBe(true)
     expect(store.getSettings().showTasksButton).toBe(true)
     expect(store.getSettings().combinedDiffFileTreeVisibleByDefault).toBe(false)
     expect(store.getSettings().visibleTaskProviders).toEqual(['github', 'gitlab', 'linear'])
-    expect(store.getSettings().experimentalActivity).toBe(true)
+    expect(store.getSettings().experimentalActivity).toBe(false)
+    expect(store.getSettings().experimentalActivityDefaultedOffForAllUsers).toBe(true)
     expect(store.getSettings().notifications.customSoundPath).toBeNull()
     // repos should be loaded
     expect(store.getRepos()).toHaveLength(1)
@@ -700,8 +761,47 @@ describe('Store', () => {
       agentTaskComplete: true,
       terminalBell: false,
       suppressWhenFocused: true,
-      customSoundPath: '/Users/kaylee/Downloads/Note_block_pling.ogg'
+      customSoundPath: '/Users/kaylee/Downloads/Note_block_pling.ogg',
+      customSoundVolume: 100
     })
+  })
+
+  it('clamps notification custom sound volume from persisted settings', async () => {
+    writeDataFile({
+      schemaVersion: 1,
+      repos: [],
+      worktreeMeta: {},
+      settings: {
+        notifications: {
+          customSoundVolume: 250
+        }
+      },
+      ui: {},
+      githubCache: { pr: {}, issue: {} },
+      workspaceSession: {}
+    })
+
+    const store = await createStore()
+    expect(store.getSettings().notifications.customSoundVolume).toBe(100)
+  })
+
+  it('defaults invalid notification custom sound volume from persisted settings', async () => {
+    writeDataFile({
+      schemaVersion: 1,
+      repos: [],
+      worktreeMeta: {},
+      settings: {
+        notifications: {
+          customSoundVolume: Number.NaN
+        }
+      },
+      ui: {},
+      githubCache: { pr: {}, issue: {} },
+      workspaceSession: {}
+    })
+
+    const store = await createStore()
+    expect(store.getSettings().notifications.customSoundVolume).toBe(100)
   })
 
   it('preserves editorAutoSaveDelayMs when set in persisted data', async () => {
@@ -941,6 +1041,20 @@ describe('Store', () => {
     ])
   })
 
+  it('updateSettings deep-merges and clamps notification custom sound volume', async () => {
+    const store = await createStore()
+    const updated = store.updateSettings({
+      notifications: {
+        ...store.getSettings().notifications,
+        customSoundVolume: -20
+      }
+    })
+
+    expect(updated.notifications.customSoundVolume).toBe(0)
+    expect(updated.notifications.enabled).toBe(true)
+    expect(updated.notifications.customSoundPath).toBeNull()
+  })
+
   it('updateSettings toggles editorAutoSave', async () => {
     const store = await createStore()
     expect(store.getSettings().editorAutoSave).toBe(false)
@@ -961,6 +1075,81 @@ describe('Store', () => {
 
     store.updateSettings({ rightSidebarOpenByDefault: true })
     expect(store.getSettings().rightSidebarOpenByDefault).toBe(true)
+  })
+
+  it('updateSettings persists sourceControlViewMode as a user setting', async () => {
+    const store = await createStore()
+    expect(store.getSettings().sourceControlViewMode).toBe('list')
+
+    store.updateSettings({ sourceControlViewMode: 'tree' })
+    expect(store.getSettings().sourceControlViewMode).toBe('tree')
+  })
+
+  it('reloads sourceControlViewMode from global settings without touching workspace state', async () => {
+    const workspaceSession = {
+      activeRepoId: 'r1',
+      activeWorktreeId: 'repo1::/worktree-a',
+      activeTabId: 'tab1',
+      tabsByWorktree: {
+        'repo1::/worktree-a': [
+          makeTerminalTab({
+            id: 'tab1',
+            worktreeId: 'repo1::/worktree-a'
+          })
+        ],
+        'repo1::/worktree-b': [
+          makeTerminalTab({
+            id: 'tab2',
+            worktreeId: 'repo1::/worktree-b'
+          })
+        ]
+      },
+      terminalLayoutsByTabId: {},
+      openFilesByWorktree: {},
+      browserTabsByWorktree: {},
+      browserPagesByWorkspace: {},
+      activeBrowserTabIdByWorktree: {},
+      activeFileIdByWorktree: {},
+      activeTabTypeByWorktree: {},
+      browserUrlHistory: []
+    }
+    writeDataFile({
+      schemaVersion: 1,
+      repos: [makeRepo()],
+      worktreeMeta: {
+        'repo1::/worktree-a': { status: 'active' },
+        'repo1::/worktree-b': { status: 'active' }
+      },
+      settings: { theme: 'dark' },
+      ui: {},
+      githubCache: { pr: {}, issue: {} },
+      workspaceSession
+    })
+
+    const store = await createStore()
+    expect(store.getSettings().sourceControlViewMode).toBe('list')
+
+    store.updateSettings({ sourceControlViewMode: 'tree' })
+    store.flush()
+
+    const persisted = readDataFile() as {
+      settings?: { sourceControlViewMode?: string }
+      workspaceSession?: typeof workspaceSession
+      worktreeMeta?: Record<string, unknown>
+    }
+    expect(persisted.settings?.sourceControlViewMode).toBe('tree')
+    expect(persisted.workspaceSession).toEqual(workspaceSession)
+    expect(persisted.worktreeMeta).toEqual({
+      'repo1::/worktree-a': { status: 'active' },
+      'repo1::/worktree-b': { status: 'active' }
+    })
+    expect(collectPropertyPaths(persisted, 'sourceControlViewMode')).toEqual([
+      'settings.sourceControlViewMode'
+    ])
+
+    const reloaded = await createStore()
+    expect(reloaded.getSettings().sourceControlViewMode).toBe('tree')
+    expect(reloaded.getWorkspaceSession().activeWorktreeId).toBe('repo1::/worktree-a')
   })
 
   // ── 10. flush writes synchronously ─────────────────────────────────
@@ -1022,8 +1211,22 @@ describe('Store', () => {
     store.updateUI({ sidebarWidth: 400 })
     const ui = store.getUI()
     expect(ui.sidebarWidth).toBe(400)
-    expect(ui.groupBy).toBe('repo') // default preserved
+    expect(ui.groupBy).toBe('workspace-status') // default preserved
     expect(ui.dismissedUpdateVersion).toBeNull()
+  })
+
+  it('updateUI restores retired card properties from direct UI writes', async () => {
+    const store = await createStore()
+    store.updateUI({ worktreeCardProperties: ['inline-agents'] })
+
+    expect(store.getUI().worktreeCardProperties).toEqual([
+      'status',
+      'unread',
+      'issue',
+      'pr',
+      'comment',
+      'inline-agents'
+    ])
   })
 
   it('persists updater reminder metadata in UI state', async () => {
@@ -1365,12 +1568,32 @@ describe('Store', () => {
     expect(store.getSettings().experimentalPet).toBe(true)
   })
 
-  it('promotes legacy experimentalActivity profiles to default-on', async () => {
+  it('defaults legacy experimentalActivity profiles off once', async () => {
     writeDataFile({
       schemaVersion: 1,
       repos: [],
       worktreeMeta: {},
-      settings: { experimentalActivity: false },
+      settings: { experimentalActivity: true },
+      ui: {},
+      githubCache: { pr: {}, issue: {} },
+      workspaceSession: {}
+    })
+
+    const store = await createStore()
+
+    expect(store.getSettings().experimentalActivity).toBe(false)
+    expect(store.getSettings().experimentalActivityDefaultedOffForAllUsers).toBe(true)
+  })
+
+  it('preserves experimentalActivity after the default-off migration has run', async () => {
+    writeDataFile({
+      schemaVersion: 1,
+      repos: [],
+      worktreeMeta: {},
+      settings: {
+        experimentalActivity: true,
+        experimentalActivityDefaultedOffForAllUsers: true
+      },
       ui: {},
       githubCache: { pr: {}, issue: {} },
       workspaceSession: {}
@@ -1477,6 +1700,53 @@ describe('Store', () => {
     const props = store.getUI().worktreeCardProperties
     expect(props.filter((p) => p === 'inline-agents')).toHaveLength(1)
     expect(store.getUI()._inlineAgentsDefaultedForAllUsers).toBe(true)
+  })
+
+  it('restores retired card properties when loading old user choices', async () => {
+    writeDataFile({
+      schemaVersion: 1,
+      repos: [],
+      worktreeMeta: {},
+      settings: {},
+      ui: {
+        worktreeCardProperties: ['inline-agents'],
+        _inlineAgentsDefaultedForAllUsers: true
+      },
+      githubCache: { pr: {}, issue: {} },
+      workspaceSession: {}
+    })
+    const store = await createStore()
+    expect(store.getUI().worktreeCardProperties).toEqual([
+      'status',
+      'unread',
+      'issue',
+      'pr',
+      'comment',
+      'inline-agents'
+    ])
+  })
+
+  it('keeps Agent activity opt-out while restoring retired card properties', async () => {
+    writeDataFile({
+      schemaVersion: 1,
+      repos: [],
+      worktreeMeta: {},
+      settings: {},
+      ui: {
+        worktreeCardProperties: [],
+        _inlineAgentsDefaultedForAllUsers: true
+      },
+      githubCache: { pr: {}, issue: {} },
+      workspaceSession: {}
+    })
+    const store = await createStore()
+    expect(store.getUI().worktreeCardProperties).toEqual([
+      'status',
+      'unread',
+      'issue',
+      'pr',
+      'comment'
+    ])
   })
 
   it('preserves a deliberate uncheck from the experimental-toggle era (Case B)', async () => {

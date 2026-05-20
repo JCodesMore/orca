@@ -106,11 +106,17 @@ export const CORE_COMMAND_SPECS: CommandSpec[] = [
     ],
     notes: [
       'By default, Orca records the new worktree as a child of the caller workspace when it can infer one from the Orca terminal or current directory.',
-      'Pass --parent-worktree to choose a parent explicitly, or --no-parent to force no lineage.',
+      'For related work, use the inferred parent or pass --parent-worktree active to make the current workspace relationship explicit.',
+      'Use --no-parent when the new worktree should be independent of the current workspace.',
       'By default this creates the worktree and its first terminal without switching the active Orca workspace.',
       'Repo-defined setup hooks follow the repository setup policy; pass --run-hooks to force them.',
       'Pass --activate when the CLI caller intentionally wants to reveal the new worktree in the app.',
       'Passing --run-hooks reveals the worktree so the setup hook can run in its first terminal.'
+    ],
+    examples: [
+      'orca worktree create --repo id:<repoId> --name related-task --json',
+      'orca worktree create --repo id:<repoId> --name related-task --parent-worktree active --json',
+      'orca worktree create --repo id:<repoId> --name independent-task --no-parent --json'
     ]
   },
   {

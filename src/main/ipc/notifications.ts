@@ -11,6 +11,7 @@ import type {
 import { getRepoIdFromWorktreeId } from '../../shared/worktree-id'
 import type { OrcaRuntimeService } from '../runtime/orca-runtime'
 import { buildNotificationOptions } from './notification-options'
+import { parsePaneKey } from '../../shared/stable-pane-id'
 
 const NOTIFICATION_COOLDOWN_MS = 5000
 const MAX_NOTIFICATION_SOUND_BYTES = 10 * 1024 * 1024
@@ -148,9 +149,9 @@ export function registerNotificationHandlers(store: Store, runtime?: OrcaRuntime
       setTimeout(release, 5 * 60 * 1000)
 
       // Why: clicking a notification should bring Orca to the foreground and
-      // switch to the worktree that triggered it. We reuse the existing
-      // ui:activateWorktree IPC channel that the renderer already handles
-      // (setActiveRepo, setActiveView, setActiveWorktree, revealInSidebar).
+      // switch to the worktree/pane that triggered it. Worktree activation owns
+      // repo/sidebar state; the optional focusTerminal follow-up uses the stable
+      // pane leaf id so split-pane notifications land on the exact pane.
       // Why: worktreeId is formatted as "repoId::worktreePath".  If the
       // separator is missing we cannot reliably extract a repoId, so skip
       // the click-to-navigate binding — the notification still fires but
@@ -174,6 +175,17 @@ export function registerNotificationHandlers(store: Store, runtime?: OrcaRuntime
             repoId,
             worktreeId: args.worktreeId
           })
+          const paneTarget = args.paneKey ? parsePaneKey(args.paneKey) : null
+          if (paneTarget) {
+            win.webContents.send('ui:focusTerminal', {
+              tabId: paneTarget.tabId,
+              worktreeId: args.worktreeId,
+              leafId: paneTarget.leafId,
+              ackPaneKeyOnSuccess: args.paneKey,
+              flashFocusedPane: true,
+              scrollToBottomIfOutputSinceLastView: true
+            })
+          }
         })
       }
 

@@ -11,6 +11,7 @@ import {
   normalizeBrowserNavigationUrl,
   normalizeExternalBrowserUrl
 } from '../../shared/browser-url'
+import { isCrashReportReason } from '../../shared/crash-reporting'
 import { resolveWindowShortcutAction } from '../../shared/window-shortcut-policy'
 import { getMainE2EConfig } from '../e2e-config'
 import { buildEditableContextMenuTemplate } from './editable-context-menu'
@@ -68,7 +69,24 @@ type CreateMainWindowOptions = {
    *  latch must be cleared or later window closes will be misclassified as
    *  quit attempts. */
   onQuitAborted?: () => void
-  onRendererProcessGone?: (details: Electron.RenderProcessGoneDetails) => void
+  onRendererProcessGone?: (
+    details: Electron.RenderProcessGoneDetails,
+    webContentsId: number
+  ) => void
+  /** Returns true when a renderer loss should be reported as a crash. Why:
+   *  intentional reload/update/quit paths can emit crash-like `killed`
+   *  renderer exits, but surfacing those as crash reports is noise. */
+  shouldRecordRendererCrash?: (
+    details: Electron.RenderProcessGoneDetails,
+    webContentsId: number
+  ) => boolean
+  /** Returns true when Orca should reload after an unexpected renderer loss.
+   *  Why: update relaunch and app quit intentionally tear down child
+   *  processes; recovering those paths can fight Electron's shutdown. */
+  shouldRecoverRenderer?: (
+    details: Electron.RenderProcessGoneDetails,
+    webContentsId: number
+  ) => boolean
   /** Why: main-process startup must register IPC handlers before the renderer
    *  begins booting, or eager renderer calls can race into missing channels. */
   deferLoad?: boolean
@@ -213,6 +231,7 @@ export function createMainWindow(
       webviewTag: true
     }
   })
+  const rendererWebContentsId = mainWindow.webContents.id
 
   if (process.platform === 'darwin') {
     // Why: persistent parked webviews use separate compositor layers, and on
@@ -483,11 +502,49 @@ export function createMainWindow(
     markdownEditorFocused = false
   }
   let rendererProcessGone = false
+  let rendererRecoveryTimer: ReturnType<typeof setTimeout> | null = null
+  const clearRendererRecoveryTimer = (): void => {
+    if (rendererRecoveryTimer) {
+      clearTimeout(rendererRecoveryTimer)
+      rendererRecoveryTimer = null
+    }
+  }
+  const scheduleRendererRecovery = (details: Electron.RenderProcessGoneDetails): void => {
+    if (
+      rendererRecoveryTimer ||
+      !details ||
+      !isCrashReportReason(details.reason) ||
+      windowClosing ||
+      opts?.getIsQuitting?.() ||
+      opts?.shouldRecoverRenderer?.(details, rendererWebContentsId) === false ||
+      mainWindow.isDestroyed()
+    ) {
+      return
+    }
+    rendererRecoveryTimer = setTimeout(() => {
+      rendererRecoveryTimer = null
+      if (
+        windowClosing ||
+        opts?.getIsQuitting?.() ||
+        opts?.shouldRecoverRenderer?.(details, rendererWebContentsId) === false ||
+        mainWindow.isDestroyed()
+      ) {
+        return
+      }
+      // Why: a transient Network Service / renderer loss can leave Chromium
+      // showing a blank shell. Reload the app document once so the user gets
+      // back to a usable window instead of needing a full relaunch.
+      loadMainWindow(mainWindow)
+    }, 250)
+  }
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
     rendererProcessGone = true
     resetMarkdownEditorFocus()
-    opts?.onRendererProcessGone?.(details)
+    if (opts?.shouldRecordRendererCrash?.(details, rendererWebContentsId) !== false) {
+      opts?.onRendererProcessGone?.(details, rendererWebContentsId)
+    }
     console.error('[window] Renderer process gone; close confirmation will be bypassed', details)
+    scheduleRendererRecovery(details)
   })
   mainWindow.webContents.on('destroyed', resetMarkdownEditorFocus)
   mainWindow.webContents.on('did-start-navigation', (_e, _url, _isInPlace, isMainFrame) => {
@@ -497,6 +554,7 @@ export function createMainWindow(
   })
   mainWindow.webContents.on('did-finish-load', () => {
     rendererProcessGone = false
+    clearRendererRecoveryTimer()
   })
 
   let ctrlTabSwitching = false
@@ -772,6 +830,7 @@ export function createMainWindow(
     // stale-true flag can't leak past subsequent state transitions. Paired
     // with the webContents lifecycle resets above.
     markdownEditorFocused = false
+    clearRendererRecoveryTimer()
     ipcMain.removeListener(trafficLightChannel, onSyncTrafficLights)
     ipcMain.removeListener(minimizeChannel, onMinimize)
     ipcMain.removeListener(maximizeChannel, onMaximize)

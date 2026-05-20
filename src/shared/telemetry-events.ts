@@ -41,6 +41,7 @@ export const AGENT_KIND_VALUES = [
   'opencode',
   'pi',
   'gemini',
+  'antigravity',
   'aider',
   'goose',
   'amp',
@@ -101,6 +102,15 @@ export const addRepoSetupStepActionSchema = z.enum([
 ])
 export type AddRepoSetupStepAction = z.infer<typeof addRepoSetupStepActionSchema>
 
+export const addRepoExistingWorkspaceSourceSchema = z.enum([
+  'local_folder_picker',
+  'runtime_server_path',
+  'ssh_remote_path',
+  'clone_url',
+  'create_project'
+])
+export type AddRepoExistingWorkspaceSource = z.infer<typeof addRepoExistingWorkspaceSourceSchema>
+
 // Deliberately a separate enum from `errorClassSchema` (PTY-spawn taxonomy):
 // different domain — this one buckets git/filesystem failures thrown by
 // `createLocalWorktree` / `createRemoteWorktree`. Merging the two would lock
@@ -136,6 +146,7 @@ export const launchSourceSchema = z.enum([
   'onboarding',
   'diff_notes_send',
   'notes_send',
+  'conflict_resolution',
   'unknown'
 ])
 export type LaunchSource = z.infer<typeof launchSourceSchema>
@@ -197,6 +208,7 @@ export const SETTINGS_CHANGED_WHITELIST = [
   'openLinksInApp',
   'experimentalMobile',
   'experimentalPet',
+  'experimentalActivity',
   'experimentalWorktreeSymlinks',
   'geminiCliOAuthEnabled'
 ] as const satisfies readonly BooleanGlobalSettingsKey[]
@@ -285,8 +297,32 @@ const featureWallTileClickedSchema = z
   })
   .strict()
 
+const existingWorkspaceCountSchema = z.number().int().min(1).max(50)
+const addRepoExistingWorkspaceContextSchema = {
+  source: addRepoExistingWorkspaceSourceSchema,
+  existing_workspace_count: existingWorkspaceCountSchema,
+  existing_linked_workspace_count: z.number().int().min(0).max(50)
+} as const
+
 const addRepoSetupStepActionEventSchema = z
-  .object({ action: addRepoSetupStepActionSchema, nth_repo_added: nthRepoAddedSchema })
+  .object({
+    action: addRepoSetupStepActionSchema,
+    source: addRepoExistingWorkspaceSourceSchema.optional(),
+    existing_workspace_count: existingWorkspaceCountSchema.optional(),
+    existing_linked_workspace_count: z.number().int().min(0).max(50).optional(),
+    nth_repo_added: nthRepoAddedSchema
+  })
+  .strict()
+const addRepoExistingWorkspacesDetectedSchema = z
+  .object({
+    ...addRepoExistingWorkspaceContextSchema,
+    main_workspace_count: z.number().int().min(0).max(50),
+    branch_named_workspace_count: z.number().int().min(0).max(50),
+    detached_workspace_count: z.number().int().min(0).max(50),
+    custom_named_workspace_count: z.number().int().min(0).max(50),
+    sparse_workspace_count: z.number().int().min(0).max(50),
+    nth_repo_added: nthRepoAddedSchema
+  })
   .strict()
 
 // Why: same enum-only discipline as `agent_error` — `.strict()` rejects raw
@@ -352,7 +388,27 @@ const onboardingFailureReasonSchema = z.enum([
   'cancelled',
   'unknown'
 ])
-const onboardingValueKindSchema = z.enum(['agent', 'theme', 'notifications', 'repo'])
+const onboardingValueKindSchema = z.enum([
+  'agent',
+  'theme',
+  'notifications',
+  'integrations',
+  'repo'
+])
+const onboardingTaskSourcesGithubStatusSchema = z.enum([
+  'connected',
+  'not_authenticated',
+  'not_installed',
+  'checking',
+  'unknown'
+])
+const onboardingTaskSourcesLinearStatusSchema = z.enum([
+  'connected',
+  'not_connected',
+  'checking',
+  'unknown'
+])
+const onboardingTaskSourcesExitActionSchema = z.enum(['continue', 'skip_to_project_setup'])
 // `dismissed` from `OnboardingChecklistState` is intentionally excluded —
 // it is a UI panel-visibility flag, not an activation event, so it never
 // fires `activation_checklist_item_completed`. Keep this list in sync with
@@ -461,6 +517,16 @@ const onboardingStep4PathFailedSchema = z
   .object({
     path: onboardingPathSchema,
     reason: onboardingFailureReasonSchema,
+    cohort: cohortSchema
+  })
+  .strict()
+const onboardingTaskSourcesSnapshotSchema = z
+  .object({
+    github_status: onboardingTaskSourcesGithubStatusSchema,
+    linear_status: onboardingTaskSourcesLinearStatusSchema,
+    exit_action: onboardingTaskSourcesExitActionSchema,
+    duration_ms: z.number().int().nonnegative().optional(),
+    advanced_via: advancedViaSchema,
     cohort: cohortSchema
   })
   .strict()
@@ -679,6 +745,7 @@ export const eventSchemas = {
 
   repo_added: repoAddedSchema,
   add_repo_setup_step_action: addRepoSetupStepActionEventSchema,
+  add_repo_existing_workspaces_detected: addRepoExistingWorkspacesDetectedSchema,
   workspace_created: workspaceCreatedSchema,
   workspace_create_failed: workspaceCreateFailedSchema,
 
@@ -703,6 +770,7 @@ export const eventSchemas = {
   onboarding_step_skipped: onboardingStepSkippedSchema,
   onboarding_step4_path_clicked: onboardingStep4PathClickedSchema,
   onboarding_step4_path_failed: onboardingStep4PathFailedSchema,
+  onboarding_task_sources_snapshot: onboardingTaskSourcesSnapshotSchema,
   onboarding_completed: onboardingCompletedSchema,
   onboarding_dismissed: onboardingDismissedSchema,
   onboarding_agent_picked: onboardingAgentPickedSchema,
@@ -759,6 +827,7 @@ type _CohortExtendedRoster =
   | 'app_opened'
   | 'repo_added'
   | 'add_repo_setup_step_action'
+  | 'add_repo_existing_workspaces_detected'
   | 'workspace_created'
   | 'workspace_create_failed'
   | 'agent_started'
@@ -809,6 +878,7 @@ type _OnboardingCohortRoster =
   | 'onboarding_step_skipped'
   | 'onboarding_step4_path_clicked'
   | 'onboarding_step4_path_failed'
+  | 'onboarding_task_sources_snapshot'
   | 'onboarding_completed'
   | 'onboarding_dismissed'
   | 'onboarding_agent_picked'

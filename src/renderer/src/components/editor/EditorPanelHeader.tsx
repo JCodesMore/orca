@@ -9,6 +9,7 @@ import {
   MoreHorizontal,
   Rows2
 } from 'lucide-react'
+import { useAppStore } from '@/store'
 import type { MarkdownViewMode, OpenFile } from '@/store/slices/editor'
 import {
   DropdownMenu,
@@ -28,6 +29,7 @@ import type { EditorToggleValue } from './EditorViewToggle'
 import type { EditorHeaderOpenFileState } from './editor-header'
 import { getEditorHeaderCopyState } from './editor-header'
 import { getMarkdownPreviewShortcutLabel } from './markdown-preview-controls'
+import { DiffNotesSendMenu } from './DiffNotesSendMenu'
 
 const isMac = navigator.userAgent.includes('Mac')
 const isLinux = navigator.userAgent.includes('Linux')
@@ -58,18 +60,16 @@ type EditorPanelHeaderProps = {
   canShowMarkdownTableOfContents: boolean
   isMarkdownTableOfContentsDisabled: boolean
   showMarkdownTableOfContents: boolean
-  markdownReviewToolsEnabled: boolean
   sideBySide: boolean
   openFileState: EditorHeaderOpenFileState
   onCopyPath: () => void
-  onOpenDiffTargetFile: () => void
+  onOpenDiffTargetFile: (preferredMarkdownViewMode?: 'rich') => void
   onOpenPreviewToSide: () => void
   onOpenMarkdownPreview: () => void
   onOpenContainingFolder: () => void
   onToggleSideBySide: () => void
   onEditorToggleChange: (next: EditorToggleValue) => void
   onToggleMarkdownTableOfContents: () => void
-  onToggleMarkdownReviewTools: () => void
   onExportMarkdownToPdf: () => void
 }
 
@@ -91,7 +91,6 @@ export function EditorPanelHeader({
   canShowMarkdownTableOfContents,
   isMarkdownTableOfContentsDisabled,
   showMarkdownTableOfContents,
-  markdownReviewToolsEnabled,
   sideBySide,
   openFileState,
   onCopyPath,
@@ -102,12 +101,13 @@ export function EditorPanelHeader({
   onToggleSideBySide,
   onEditorToggleChange,
   onToggleMarkdownTableOfContents,
-  onToggleMarkdownReviewTools,
   onExportMarkdownToPdf
 }: EditorPanelHeaderProps): React.JSX.Element {
   const [pathMenuOpen, setPathMenuOpen] = useState(false)
   const [pathMenuPoint, setPathMenuPoint] = useState({ x: 0, y: 0 })
   const headerCopyState = getEditorHeaderCopyState(activeFile)
+  const diffComments = useAppStore((s) => s.getDiffComments(activeFile.worktreeId))
+  const activeGroupId = useAppStore((s) => s.activeGroupIdByWorktree[activeFile.worktreeId])
 
   useEffect(() => {
     const closeMenu = (): void => setPathMenuOpen(false)
@@ -191,7 +191,7 @@ export function EditorPanelHeader({
               <button
                 type="button"
                 className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-foreground transition-colors flex-shrink-0 disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-muted-foreground"
-                onClick={onOpenDiffTargetFile}
+                onClick={() => onOpenDiffTargetFile(isMarkdown ? 'rich' : undefined)}
                 aria-label="Open file"
                 disabled={!openFileState.canOpen}
               >
@@ -207,6 +207,16 @@ export function EditorPanelHeader({
             </TooltipContent>
           </Tooltip>
         </TooltipProvider>
+      )}
+      {isSingleDiff && diffComments.length > 0 && (
+        <DiffNotesSendMenu
+          worktreeId={activeFile.worktreeId}
+          groupId={activeGroupId ?? activeFile.worktreeId}
+          comments={diffComments}
+          filePath={activeFile.relativePath}
+          showFileScope
+          triggerClassName="p-1 flex-shrink-0"
+        />
       )}
       {canOpenPreviewToSide && (
         <TooltipProvider delayDuration={300}>
@@ -307,10 +317,6 @@ export function EditorPanelHeader({
               onSelect={onExportMarkdownToPdf}
             >
               Export as PDF
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem onSelect={onToggleMarkdownReviewTools}>
-              {markdownReviewToolsEnabled ? 'Hide Review Notes' : 'Show Review Notes'}
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
