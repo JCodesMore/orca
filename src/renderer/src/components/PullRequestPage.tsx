@@ -823,7 +823,7 @@ function PRReviewersPanel({
   }
 
   return (
-    <aside className="rounded-lg border border-border/50 bg-card/50 shadow-xs">
+    <aside className="rounded-lg border border-border/50 bg-card shadow-xs">
       <div className="flex h-10 items-center gap-2 border-b border-border/50 px-3">
         <Users className="size-3.5 text-muted-foreground" />
         <span className="text-[13px] font-medium text-foreground">Reviewers</span>
@@ -2588,7 +2588,7 @@ function ConversationTab({
           repoPath={repoPath}
           onReviewersRequested={onReviewersRequested}
         />
-        <aside className="overflow-hidden rounded-lg border border-border/50 bg-card/50 shadow-xs">
+        <aside className="overflow-hidden rounded-lg border border-border/50 bg-card shadow-xs">
           <ChecksTab
             item={item}
             repoPath={repoPath}
@@ -2606,7 +2606,7 @@ function ConversationTab({
     <div
       key={comment.id}
       className={cn(
-        'min-w-0 overflow-hidden rounded-lg border border-border/40 bg-card/50 shadow-xs',
+        'min-w-0 overflow-hidden rounded-lg border border-border/40 bg-card shadow-xs',
         isReply && 'ml-6 max-w-[calc(100%-1.5rem)]',
         comment.isResolved && PR_COMMENT_RESOLVED_CONTAINER_CLASS
       )}
@@ -2734,7 +2734,7 @@ function ConversationTab({
       <Accordion key={getPRCommentGroupId(group)} type="single" collapsible>
         <AccordionItem
           value={getPRCommentGroupId(group)}
-          className="rounded-lg border border-border/40 bg-card/40"
+          className="rounded-lg border border-border/40 bg-card"
         >
           <AccordionTrigger className="px-3 py-2 text-[13px] text-muted-foreground hover:bg-accent/30">
             <span className="min-w-0 truncate">
@@ -2761,7 +2761,7 @@ function ConversationTab({
       )}
     >
       <div className="flex min-w-0 flex-col gap-4">
-        <div className="rounded-lg border border-border/50 bg-card/50 shadow-xs">
+        <div className="rounded-lg border border-border/50 bg-card shadow-xs">
           <div className="flex items-center gap-2 border-b border-border/50 px-3 py-2 text-[12px] text-muted-foreground">
             <span className="font-medium text-foreground">{authorLabel}</span>
             <span>updated {formatRelativeTime(item.updatedAt)}</span>
@@ -3055,7 +3055,7 @@ function PRActionsPanel({
   }
 
   return (
-    <aside className="rounded-lg border border-border/50 bg-card/50 p-3 shadow-xs">
+    <aside className="rounded-lg border border-border/50 bg-card p-3 shadow-xs">
       <div className="mb-3 flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <GitPullRequest className="size-3.5 text-muted-foreground" />
@@ -4062,7 +4062,7 @@ function ChecksTab({
           </div>
           {actions}
         </div>
-        <div className="overflow-hidden rounded-lg border border-border/50 bg-card/50 shadow-xs">
+        <div className="overflow-hidden rounded-lg border border-border/50 bg-card shadow-xs">
           {sorted.map((check, index) => (
             <div
               key={getCheckDetailsKey(check)}
@@ -5404,7 +5404,7 @@ export default function PullRequestPage({
       </div>
 
       {/* Row 2: PR title block — large weight-400 title + state row, mirrors Primer pr-title-block */}
-      <div className="flex-none border-b border-border/60 bg-card px-6 py-4">
+      <div className="flex-none border-b border-border/60 px-6 py-4">
         <div className="flex items-start gap-4">
           <h1 className="min-w-0 flex-1 text-[28px] font-medium leading-tight text-foreground">
             <span className="break-words">{workItem.title}</span>
@@ -5504,7 +5504,7 @@ export default function PullRequestPage({
                 ::after, so don't add a second border that boxes the trigger. */}
             <TabsList
               variant="line"
-              className="mx-0 justify-start gap-2 border-b border-border/60 bg-card px-6"
+              className="mx-0 justify-start gap-2 border-b border-border/60 bg-transparent px-6"
             >
               <TabsTrigger value="conversation" className="px-3 py-2.5">
                 <MessageSquare className="size-3.5" />
