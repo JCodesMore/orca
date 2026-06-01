@@ -20,6 +20,7 @@ type QueueEntry = {
   reason: GitHubPRRefreshReason
   priority: number
   dueAt: number
+  bypassBackgroundBudget?: boolean
   windowId?: number
 }
 
@@ -29,6 +30,8 @@ type PRRefreshOutcomeObserver = (
 ) => void
 
 const MIN_BACKGROUND_REFRESH_AGE_MS = 60_000
+const MERGEABILITY_PENDING_REFRESH_MS = 10_000
+const MANUAL_MERGEABILITY_PENDING_REFRESH_MS = 2_500
 const BACKGROUND_BUDGET_WINDOW_MS = 5 * 60_000
 const MIN_BACKGROUND_SPACING_MS = 10_000
 const BACKGROUND_BUDGET_MAX = 20
@@ -50,6 +53,30 @@ export function setPRRefreshOutcomeObserver(observer: PRRefreshOutcomeObserver |
   outcomeObserver = observer
 }
 
+function removeInvisibleVisibleRefreshes(): void {
+  for (const [key, entry] of queue) {
+    if (entry.reason === 'visible' && !isVisibleKey(key)) {
+      queue.delete(key)
+      errorBackoff.delete(key)
+      broadcast({
+        aliases: Array.from(entry.aliases.values()),
+        reason: 'visible',
+        status: 'skipped',
+        skippedReason: 'fresh'
+      })
+    }
+  }
+}
+
+export function clearVisiblePRRefreshWindow(windowId: number): void {
+  if (!visibleByWindow.delete(windowId)) {
+    return
+  }
+  // Why: visible follow-ups are owned by the renderer that reported them.
+  // If that WebContents is destroyed, no later visibility report may arrive.
+  removeInvisibleVisibleRefreshes()
+}
+
 function nextSequence(): number {
   sequence += 1
   return sequence
@@ -65,10 +92,11 @@ function broadcast(event: Omit<GitHubPRRefreshEvent, 'sequence'>, sequenceOverri
 }
 
 function refreshKey(candidate: GitHubPRRefreshCandidate): string {
+  const connectionScope = candidate.connectionId ?? 'local'
   if (typeof candidate.linkedPRNumber === 'number') {
-    return `${candidate.repoPath}::pr::${candidate.linkedPRNumber}`
+    return `${connectionScope}::${candidate.repoPath}::pr::${candidate.linkedPRNumber}`
   }
-  return `${candidate.repoPath}::branch::${candidate.branch}`
+  return `${connectionScope}::${candidate.repoPath}::branch::${candidate.branch}`
 }
 
 function isVisibleKey(key: string): boolean {
@@ -105,6 +133,10 @@ function isBackground(reason: GitHubPRRefreshReason): boolean {
 
 function isBudgetedBackground(reason: GitHubPRRefreshReason): boolean {
   return reason === 'visible' || reason === 'swr'
+}
+
+function isBudgetedQueueEntry(entry: QueueEntry): boolean {
+  return isBudgetedBackground(entry.reason) && entry.bypassBackgroundBudget !== true
 }
 
 function validateCandidate(
@@ -155,6 +187,21 @@ function freshRetryAt(candidate: GitHubPRRefreshCandidate): number | null {
     : candidate.cachedFetchedAt + refreshIntervalForCandidate(candidate)
 }
 
+function aliasFromCandidate(candidate: GitHubPRRefreshCandidate): GitHubPRRefreshAlias {
+  return {
+    cacheKey: candidate.cacheKey,
+    repoId: candidate.repoId,
+    repoPath: candidate.repoPath,
+    branch: candidate.branch,
+    worktreeId: candidate.worktreeId,
+    connectionId: candidate.connectionId ?? null,
+    linkedPRNumber: candidate.linkedPRNumber ?? null,
+    fallbackPRNumber:
+      candidate.linkedPRNumber == null ? (candidate.fallbackPRNumber ?? null) : null,
+    fallbackPRSource: candidate.linkedPRNumber == null ? (candidate.fallbackPRSource ?? null) : null
+  }
+}
+
 function visibleCandidateAfterOutcome(
   candidate: GitHubPRRefreshCandidate,
   outcome: PRRefreshOutcome
@@ -167,7 +214,9 @@ function visibleCandidateAfterOutcome(
     cachedFetchedAt: outcome.fetchedAt,
     cachedHasPR: outcome.kind === 'found',
     cachedPRState: outcome.kind === 'found' ? outcome.pr.state : null,
-    cachedChecksStatus: outcome.kind === 'found' ? outcome.pr.checksStatus : null
+    cachedChecksStatus: outcome.kind === 'found' ? outcome.pr.checksStatus : null,
+    cachedMergeable: outcome.kind === 'found' ? outcome.pr.mergeable : null,
+    cachedMergeStateStatus: outcome.kind === 'found' ? (outcome.pr.mergeStateStatus ?? null) : null
   }
 }
 
@@ -230,9 +279,13 @@ function scheduleVisibleFollowUp(
   outcome: PRRefreshOutcome,
   priority: number,
   aliases: GitHubPRRefreshAlias[],
-  windowId?: number
+  windowId?: number,
+  options?: { pendingMergeabilityDelayMs?: number }
 ): void {
   if (!isVisibleKey(key)) {
+    // Why: manual/active refreshes can remove the queued visible retry after
+    // its owner window is gone, leaving the retry backoff without an owner.
+    errorBackoff.delete(key)
     return
   }
   if (outcome.kind === 'upstream-error') {
@@ -256,7 +309,15 @@ function scheduleVisibleFollowUp(
   }
   errorBackoff.delete(key)
   const followUpCandidate = visibleCandidateAfterOutcome(candidate, outcome)
-  const dueAt = freshRetryAt(followUpCandidate) ?? Date.now()
+  const regularDueAt = freshRetryAt(followUpCandidate) ?? Date.now()
+  const pendingMergeabilityDueAt =
+    options?.pendingMergeabilityDelayMs !== undefined && isMergeabilityPendingOutcome(outcome)
+      ? outcome.fetchedAt + options.pendingMergeabilityDelayMs
+      : null
+  const dueAt =
+    pendingMergeabilityDueAt === null
+      ? regularDueAt
+      : Math.min(regularDueAt, pendingMergeabilityDueAt)
   // Why: coalesced linked-PR refreshes may represent several local branches.
   // Preserve every alias for the next visible follow-up so all cache entries
   // keep receiving periodic updates.
@@ -267,6 +328,9 @@ function scheduleVisibleFollowUp(
     reason: 'visible',
     priority,
     dueAt,
+    // Why: this manual one-shot fixes GitHub's transient UNKNOWN state; visible
+    // spacing would otherwise delay it past the intended prompt retry window.
+    bypassBackgroundBudget: pendingMergeabilityDueAt !== null,
     windowId
   })
   scheduleDrain(Math.max(0, dueAt - Date.now()))
@@ -279,6 +343,16 @@ function refreshIntervalForCandidate(candidate: GitHubPRRefreshCandidate): numbe
   if (candidate.cachedHasPR === false) {
     return 15 * 60_000
   }
+  if (
+    candidate.cachedHasPR === true &&
+    candidate.cachedPRState === 'open' &&
+    candidate.cachedMergeable === 'UNKNOWN' &&
+    !hasResolvedMergeStateStatus(candidate.cachedMergeStateStatus)
+  ) {
+    // Why: GitHub can return transient UNKNOWN mergeability while it computes
+    // the PR test merge; visible merge buttons need a prompt follow-up.
+    return MERGEABILITY_PENDING_REFRESH_MS
+  }
   if (candidate.cachedChecksStatus === 'success') {
     return 10 * 60_000
   }
@@ -289,6 +363,19 @@ function refreshIntervalForCandidate(candidate: GitHubPRRefreshCandidate): numbe
     return 90_000
   }
   return MIN_BACKGROUND_REFRESH_AGE_MS
+}
+
+function hasResolvedMergeStateStatus(status: string | null | undefined): boolean {
+  return status === 'CLEAN' || status === 'BEHIND' || status === 'BLOCKED'
+}
+
+function isMergeabilityPendingOutcome(outcome: PRRefreshOutcome): boolean {
+  return (
+    outcome.kind === 'found' &&
+    outcome.pr.state === 'open' &&
+    outcome.pr.mergeable === 'UNKNOWN' &&
+    !hasResolvedMergeStateStatus(outcome.pr.mergeStateStatus)
+  )
 }
 
 function backgroundRefreshBuckets(): ('core' | 'graphql')[] {
@@ -362,7 +449,7 @@ async function drainQueue(): Promise<void> {
         return
       }
 
-      const budgetDelay = isBudgetedBackground(next.reason) ? nextBudgetDelay() : 0
+      const budgetDelay = isBudgetedQueueEntry(next) ? nextBudgetDelay() : 0
       if (budgetDelay > 0) {
         scheduleDrain(budgetDelay)
         return
@@ -381,7 +468,11 @@ async function drainQueue(): Promise<void> {
         continue
       }
       const requestSequence = nextSequence()
-      broadcast({ aliases, reason: next.reason, status: 'in-flight' }, requestSequence)
+      const requestStartedAt = Date.now()
+      broadcast(
+        { aliases, reason: next.reason, status: 'in-flight', requestStartedAt },
+        requestSequence
+      )
 
       if (isBackground(next.reason)) {
         const rateLimit = await getRateLimit()
@@ -415,7 +506,7 @@ async function drainQueue(): Promise<void> {
           scheduleDrain(Math.max(1_000, retryAt - Date.now()))
           continue
         }
-        if (isBudgetedBackground(next.reason)) {
+        if (isBudgetedQueueEntry(next)) {
           noteBackgroundStart()
         }
         for (const bucket of buckets) {
@@ -427,10 +518,11 @@ async function drainQueue(): Promise<void> {
         next.candidate.repoPath,
         next.candidate.branch,
         next.candidate.linkedPRNumber ?? null,
-        next.candidate.connectionId ?? null
+        next.candidate.connectionId ?? null,
+        next.candidate.linkedPRNumber == null ? (next.candidate.fallbackPRNumber ?? null) : null
       )
       outcomeObserver?.(next.candidate, outcome)
-      broadcast({ aliases, reason: next.reason, outcome }, requestSequence)
+      broadcast({ aliases, reason: next.reason, outcome, requestStartedAt }, requestSequence)
       scheduleVisibleFollowUp(
         next.key,
         next.candidate,
@@ -451,13 +543,7 @@ export function enqueuePRRefresh(
   priority = 0,
   windowId?: number
 ): void {
-  const alias: GitHubPRRefreshAlias = {
-    cacheKey: candidate.cacheKey,
-    repoId: candidate.repoId,
-    repoPath: candidate.repoPath,
-    branch: candidate.branch,
-    worktreeId: candidate.worktreeId
-  }
+  const alias = aliasFromCandidate(candidate)
   const key = refreshKey(candidate)
   const skippedReason = validateCandidate(candidate)
   if (skippedReason) {
@@ -516,37 +602,27 @@ export function reportVisiblePRRefreshCandidates(
     return
   }
   visibleByWindow.set(windowId, { generation, keys: new Set(candidates.map(refreshKey)) })
-  for (const [key, entry] of queue) {
-    if (entry.reason === 'visible' && !isVisibleKey(key)) {
-      queue.delete(key)
-      errorBackoff.delete(key)
-      broadcast({
-        aliases: Array.from(entry.aliases.values()),
-        reason: 'visible',
-        status: 'skipped',
-        skippedReason: 'fresh'
-      })
-    }
-  }
+  removeInvisibleVisibleRefreshes()
   for (const candidate of candidates) {
     enqueuePRRefresh(candidate, 'visible', 40, windowId)
   }
 }
 
+export function _getVisiblePRRefreshWindowCountForTests(): number {
+  return visibleByWindow.size
+}
+
+export function _getPRRefreshErrorBackoffCountForTests(): number {
+  return errorBackoff.size
+}
+
 export async function refreshPRNow(candidate: GitHubPRRefreshCandidate): Promise<PRRefreshOutcome> {
-  const alias: GitHubPRRefreshAlias = {
-    cacheKey: candidate.cacheKey,
-    repoId: candidate.repoId,
-    repoPath: candidate.repoPath,
-    branch: candidate.branch,
-    worktreeId: candidate.worktreeId
-  }
+  const alias = aliasFromCandidate(candidate)
   const key = refreshKey(candidate)
   const existing = queue.get(key)
-  const aliases = existing ? Array.from(existing.aliases.values()) : [alias]
-  if (!aliases.some((entry) => entry.cacheKey === alias.cacheKey)) {
-    aliases.push(alias)
-  }
+  const aliasMap = new Map(existing ? existing.aliases : [])
+  aliasMap.set(alias.cacheKey, alias)
+  const aliases = Array.from(aliasMap.values())
   const skippedReason = validateCandidate(candidate)
   if (skippedReason) {
     removeQueuedAliasForInvalidCandidate(key, alias)
@@ -562,15 +638,21 @@ export async function refreshPRNow(candidate: GitHubPRRefreshCandidate): Promise
 
   queue.delete(key)
   const requestSequence = nextSequence()
-  broadcast({ aliases, reason: 'manual', status: 'in-flight' }, requestSequence)
+  const requestStartedAt = Date.now()
+  broadcast({ aliases, reason: 'manual', status: 'in-flight', requestStartedAt }, requestSequence)
   const outcome = await getPRForBranchOutcome(
     candidate.repoPath,
     candidate.branch,
     candidate.linkedPRNumber ?? null,
-    candidate.connectionId ?? null
+    candidate.connectionId ?? null,
+    candidate.linkedPRNumber == null ? (candidate.fallbackPRNumber ?? null) : null
   )
   outcomeObserver?.(candidate, outcome)
-  broadcast({ aliases, reason: 'manual', outcome }, requestSequence)
-  scheduleVisibleFollowUp(key, candidate, outcome, 40, aliases)
+  broadcast({ aliases, reason: 'manual', outcome, requestStartedAt }, requestSequence)
+  scheduleVisibleFollowUp(key, candidate, outcome, 40, aliases, undefined, {
+    // Why: GitHub often reports UNKNOWN immediately after `gh pr reopen`;
+    // do one prompt visible retry so conflicts replace the transient label.
+    pendingMergeabilityDelayMs: MANUAL_MERGEABILITY_PENDING_REFRESH_MS
+  })
   return outcome
 }

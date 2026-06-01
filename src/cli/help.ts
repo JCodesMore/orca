@@ -42,6 +42,11 @@ Worktrees:
   worktree rm               Remove a worktree from Orca and git
   worktree ps               Show a compact orchestration summary across worktrees
 
+Files:
+  file open                 Open a workspace file in the Orca editor
+  file diff                 Open a workspace file diff in the Orca editor
+  file open-changed         Open all git-changed files for a workspace
+
 Terminals:
   terminal list             List live Orca-managed terminals
   terminal show             Show terminal metadata and preview
@@ -164,12 +169,15 @@ Common Commands:
   orca worktree create --repo <selector> --name <name> [--base-branch <ref>] [--issue <number>] [--comment <text>] [--parent-worktree <selector>] [--no-parent] [--run-hooks] [--activate] [--json]
   orca worktree show --worktree <selector> [--json]
   orca worktree current [--json]
-  orca worktree set --worktree <selector> [--display-name <name>] [--issue <number|null>] [--comment <text>] [--parent-worktree <selector>|--no-parent] [--json]
+  orca worktree set --worktree <selector> [--display-name <name>] [--issue <number|null>] [--comment <text>] [--workspace-status <id>] [--parent-worktree <selector>|--no-parent] [--json]
   orca worktree rm --worktree <selector> [--force] [--run-hooks] [--json]
   orca worktree ps [--limit <n>] [--json]
+  orca file open <path> [--worktree <selector>] [--json]
+  orca file diff <path> [--staged] [--worktree <selector>] [--json]
+  orca file open-changed [--mode edit|diff|both] [--worktree <selector>] [--json]
   orca terminal list [--worktree <selector>] [--limit <n>] [--json]
   orca terminal show [--terminal <handle>] [--json]
-  orca terminal read [--terminal <handle>] [--json]
+  orca terminal read [--terminal <handle>] [--cursor <n>] [--limit <n>] [--json]
   orca terminal send [--terminal <handle>] [--text <text>] [--enter] [--interrupt] [--json]
   orca terminal wait [--terminal <handle>] --for exit|tui-idle [--timeout-ms <ms>] [--json]
   orca terminal stop --worktree <selector> [--json]
@@ -201,7 +209,7 @@ Wait Options:
 
 Output Options:
   --json                    Emit machine-readable JSON instead of human text
-  --pairing-code <code>      Connect to a remote Orca runtime using an orca://pair#... code
+  --pairing-code <code>      Connect to a remote Orca runtime using an orca://pair?... code
   --environment <selector>   Connect using a saved environment id or name
   --help                    Show this help message
 
@@ -252,6 +260,8 @@ Examples:
   $ orca worktree current
   $ orca worktree set --worktree active --comment "waiting on review"
   $ orca worktree ps --limit 10
+  $ orca file open-changed --mode diff
+  $ orca file open src/App.tsx
   $ orca terminal list --worktree path:/Users/me/orca/workspaces/orca/cli-test-1 --json
   $ orca terminal send --terminal term_123 --text "hi" --enter
   $ orca terminal wait --terminal term_123 --for exit --timeout-ms 60000 --json
@@ -353,6 +363,7 @@ export function formatFlagHelp(flag: string): string {
     json: '--json                 Emit machine-readable JSON',
     key: '--key <key>            Key or combo to press, e.g. Escape or CmdOrCtrl+L',
     limit: '--limit <n>            Maximum number of rows to return',
+    mode: '--mode <mode>          Mode such as edit, diff, or both',
     'mouse-button': '--mouse-button <btn>   Mouse button: left, right, or middle',
     name: '--name <name>          Name for the new worktree or automation',
     'no-parent': '--no-parent            Force no parent lineage for unrelated work',
@@ -360,7 +371,7 @@ export function formatFlagHelp(flag: string): string {
     pages: '--pages <n>           Number of scroll pages',
     'parent-worktree':
       '--parent-worktree <selector> Parent selector; create infers the caller/current worktree by default',
-    path: '--path <path>          Filesystem path to the repo',
+    path: '--path <path>          Path argument for the command',
     query: '--query <text>        Search text for matching refs',
     ref: '--ref <ref>            Base ref to persist for the repo',
     repo: '--repo <selector>      Repo selector such as id:<id>, name:<name>, or path:<path>',
@@ -377,7 +388,10 @@ export function formatFlagHelp(flag: string): string {
     worktree:
       '--worktree <selector>  Worktree selector such as id:<id>, branch:<branch>, issue:<number>, path:<path>, or active/current',
     workspace: '--workspace <selector> Existing worktree selector for automation runs',
+    'workspace-status':
+      '--workspace-status <id> Board status id (defaults: todo, in-progress, in-review, completed)',
     prompt: '--prompt <text>        Automation prompt to pass to the agent',
+    staged: '--staged               Open staged source-control changes',
     provider: '--provider <agent>     Agent id such as codex, claude, or gemini',
     trigger: '--trigger <schedule>   Automation schedule preset, cron, or RRULE',
     schedule: '--schedule <schedule>  Alias for --trigger',

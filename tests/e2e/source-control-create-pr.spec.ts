@@ -1,6 +1,7 @@
 import type { Page } from '@stablyai/playwright-test'
 import { test, expect } from './helpers/orca-app'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
+import type { CreateHostedReviewResult } from '../../src/shared/hosted-review'
 
 type CreatePRPayload = {
   repoPath: string
@@ -45,7 +46,6 @@ async function openSourceControl(page: Page, expectedWorktreeId: string): Promis
     )
     .toBe(true)
   await expect(page.getByRole('button', { name: /Source Control/ })).toBeVisible()
-  await expect(page.getByRole('textbox', { name: 'Commit message' })).toBeVisible()
 }
 
 async function forceCreatePREligibleStatus(
@@ -72,9 +72,10 @@ async function forceCreatePREligibleStatus(
 }
 
 async function seedCreatePREligibleBranch(
-  page: Page
+  page: Page,
+  options: { createResult?: CreateHostedReviewResult } = {}
 ): Promise<{ branch: string; worktreeId: string }> {
-  return page.evaluate(async () => {
+  return page.evaluate(async ({ createResult }) => {
     const store = window.__store
     if (!store) {
       throw new Error('window.__store is not available')
@@ -111,9 +112,7 @@ async function seedCreatePREligibleBranch(
       blockedReason: null,
       nextAction: null,
       defaultBaseRef: 'origin/main',
-      head: branch,
-      title: 'Create PR from E2E',
-      body: '- Initial commit for E2E'
+      head: branch
     }
 
     ;(window as unknown as { __createPRPayloads: CreatePRPayload[] }).__createPRPayloads = []
@@ -161,6 +160,9 @@ async function seedCreatePREligibleBranch(
           repoPath,
           input
         })
+        if (createResult) {
+          return createResult
+        }
         return {
           ok: true as const,
           number: 73,
@@ -172,7 +174,7 @@ async function seedCreatePREligibleBranch(
     state.setRightSidebarOpen(true)
     state.setRightSidebarTab('source-control')
     return { branch, worktreeId: worktree.id }
-  })
+  }, options)
 }
 
 test.describe('Source Control create pull request', () => {
@@ -181,29 +183,39 @@ test.describe('Source Control create pull request', () => {
     await waitForActiveWorktree(orcaPage)
   })
 
-  test('opens the PR dialog from Source Control and creates the pull request', async ({
-    orcaPage
-  }) => {
+  test('creates the pull request from the Source Control primary action', async ({ orcaPage }) => {
     const { branch, worktreeId } = await seedCreatePREligibleBranch(orcaPage)
     await openSourceControl(orcaPage, worktreeId)
     await forceCreatePREligibleStatus(orcaPage, worktreeId, branch)
 
     const createButton = orcaPage.getByRole('button', { name: 'Create PR' })
     await expect(createButton).toBeVisible({ timeout: 10_000 })
+    await expect(createButton).toBeDisabled()
+    const titleInput = orcaPage.getByRole('textbox', { name: 'Pull request title' })
+    const descriptionInput = orcaPage.getByRole('textbox', {
+      name: 'Pull request description'
+    })
+    await expect(titleInput).toHaveValue('')
+    await expect(orcaPage.getByRole('textbox', { name: 'Pull request base branch' })).toHaveValue(
+      'main'
+    )
+    await expect(descriptionInput).toHaveValue('')
+    await titleInput.fill('Create PR from E2E')
+    await descriptionInput.fill('- Initial commit for E2E')
     await expect(createButton).toBeEnabled()
     await createButton.click()
 
-    const dialog = orcaPage.getByRole('dialog', { name: 'Create Pull Request' })
-    await expect(dialog).toBeVisible()
-    await expect(dialog).toContainText(branch)
-    await expect(dialog.getByLabel('Base branch')).toHaveValue('main')
-    await expect(dialog.getByLabel('Title')).toHaveValue('Create PR from E2E')
-    await expect(dialog.getByLabel('Description')).toHaveValue('- Initial commit for E2E')
-
-    await dialog.getByRole('button', { name: 'Create PR' }).click()
-
-    await expect(dialog).toBeHidden({ timeout: 10_000 })
-    await expect(orcaPage.getByText('Create PR from E2E')).toBeVisible({ timeout: 10_000 })
+    await expect
+      .poll(
+        () =>
+          orcaPage.evaluate(
+            () =>
+              (window as unknown as { __createPRPayloads: CreatePRPayload[] }).__createPRPayloads
+                .length
+          ),
+        { timeout: 10_000 }
+      )
+      .toBe(1)
 
     const payloads = await orcaPage.evaluate(
       () => (window as unknown as { __createPRPayloads: CreatePRPayload[] }).__createPRPayloads
@@ -217,5 +229,39 @@ test.describe('Source Control create pull request', () => {
       body: '- Initial commit for E2E',
       draft: false
     })
+  })
+
+  test('surfaces create failures without clearing the pull request composer', async ({
+    orcaPage
+  }) => {
+    const failureMessage = 'Create PR failed: GitHub API rate limit exceeded'
+    const { branch, worktreeId } = await seedCreatePREligibleBranch(orcaPage, {
+      createResult: {
+        ok: false,
+        code: 'unknown',
+        error: failureMessage
+      }
+    })
+    await openSourceControl(orcaPage, worktreeId)
+    await forceCreatePREligibleStatus(orcaPage, worktreeId, branch)
+
+    const createButton = orcaPage.getByRole('button', { name: 'Create PR' })
+    const titleInput = orcaPage.getByRole('textbox', { name: 'Pull request title' })
+    const descriptionInput = orcaPage.getByRole('textbox', {
+      name: 'Pull request description'
+    })
+    await expect(createButton).toBeVisible({ timeout: 10_000 })
+    await titleInput.fill('Failing PR from E2E')
+    await descriptionInput.fill('This draft should survive a failed create attempt.')
+    await expect(createButton).toBeEnabled()
+    await createButton.click()
+
+    await expect(orcaPage.getByText(failureMessage)).toBeVisible()
+    await expect(titleInput).toHaveValue('Failing PR from E2E')
+    await expect(descriptionInput).toHaveValue('This draft should survive a failed create attempt.')
+    await expect(orcaPage.getByRole('textbox', { name: 'Pull request base branch' })).toHaveValue(
+      'main'
+    )
+    await expect(createButton).toBeEnabled()
   })
 })

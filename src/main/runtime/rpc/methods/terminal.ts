@@ -159,12 +159,31 @@ function resolveMobileFloorClientId(
 function appendPendingMultiplexOutput(stream: TerminalMultiplexStream, data: string): void {
   stream.pendingOutput.push(data)
   stream.pendingOutputChars += data.length
+  stream.pendingOutputChars = trimPendingOutputToBudget(
+    stream.pendingOutput,
+    stream.pendingOutputChars
+  )
+}
+
+function trimPendingOutputToBudget(pendingOutput: string[], pendingOutputChars: number): number {
+  let omittedChunkCount = 0
   while (
-    stream.pendingOutputChars > TERMINAL_MULTIPLEX_PENDING_MAX_CHARS &&
-    stream.pendingOutput.length > 0
+    pendingOutputChars > TERMINAL_MULTIPLEX_PENDING_MAX_CHARS &&
+    omittedChunkCount < pendingOutput.length
   ) {
-    stream.pendingOutputChars -= stream.pendingOutput.shift()?.length ?? 0
+    pendingOutputChars -= pendingOutput[omittedChunkCount].length
+    omittedChunkCount += 1
   }
+  if (omittedChunkCount > 0) {
+    pendingOutput.splice(0, omittedChunkCount)
+  }
+  return pendingOutputChars
+}
+
+function isTerminalReadPayloadIncomplete(read: { truncated: boolean; limited?: boolean }): boolean {
+  // Why: uncursored terminal reads are bounded previews; limited previews are
+  // incomplete stream payloads even when the retained buffer was not truncated.
+  return read.truncated || read.limited === true
 }
 
 function sendSnapshotFrames(
@@ -272,7 +291,8 @@ const TerminalRead = TerminalHandle.extend({
           message: 'Cursor must be a non-negative integer'
         })
     )
-    .optional()
+    .optional(),
+  limit: OptionalFiniteNumber
 })
 
 // Why: the legacy handler allowed `title: string | null` and rejected every
@@ -331,7 +351,8 @@ const TerminalSplit = TerminalHandle.extend({
     .transform((v) => (v === 'vertical' || v === 'horizontal' ? v : undefined))
     .pipe(z.union([z.enum(['vertical', 'horizontal']), z.undefined()]))
     .optional(),
-  command: OptionalString
+  command: OptionalString,
+  env: z.record(z.string(), z.string()).optional()
 })
 
 const TerminalStop = z.object({
@@ -472,7 +493,10 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
     name: 'terminal.read',
     params: TerminalRead,
     handler: async (params, { runtime }) => ({
-      terminal: await runtime.readTerminal(params.terminal, { cursor: params.cursor })
+      terminal: await runtime.readTerminal(params.terminal, {
+        cursor: params.cursor,
+        limit: params.limit
+      })
     })
   }),
   defineMethod({
@@ -480,6 +504,13 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
     params: TerminalHandle,
     handler: async (params, { runtime }) => ({
       process: await runtime.inspectTerminalProcess(params.terminal)
+    })
+  }),
+  defineMethod({
+    name: 'terminal.isRunningAgent',
+    params: TerminalHandle,
+    handler: async (params, { runtime }) => ({
+      isRunningAgent: await runtime.isTerminalRunningAgent(params.terminal)
     })
   }),
   defineMethod({
@@ -561,7 +592,8 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
     handler: async (params, { runtime }) => ({
       split: await runtime.splitTerminal(params.terminal, {
         direction: params.direction,
-        command: params.command
+        command: params.command,
+        env: params.env
       })
     })
   }),
@@ -680,7 +712,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
     params: TerminalMultiplex,
     handler: async (
       _params,
-      { runtime, connectionId, sendBinary, registerBinaryStreamHandler },
+      { runtime, connectionId, sendBinary, registerBinaryStreamHandler, signal },
       emit
     ) => {
       if (!sendBinary || !registerBinaryStreamHandler || !connectionId) {
@@ -797,9 +829,12 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
         const isMobile = request.client?.type === 'mobile'
         if (!leaf?.ptyId && isMobile) {
           try {
-            const ptyId = await runtime.waitForLeafPtyId(request.terminal)
+            const ptyId = await runtime.waitForLeafPtyId(request.terminal, 10_000, signal)
             leaf = { ptyId }
           } catch {
+            if (closed || signal?.aborted) {
+              return
+            }
             // Fall through to the explicit no_connected_pty error below.
           }
         }
@@ -910,7 +945,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
             rows: serialized?.rows ?? size?.rows,
             displayMode,
             seq,
-            truncated: read.truncated
+            truncated: serialized ? read.truncated : isTerminalReadPayloadIncomplete(read)
           })
           sendSnapshotFrames((opcode, payload) => sendFrame(request.streamId, opcode, payload), {
             kind: 'scrollback',
@@ -918,7 +953,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
             rows: serialized?.rows ?? size?.rows ?? 24,
             displayMode,
             seq,
-            truncated: read.truncated,
+            truncated: serialized ? read.truncated : isTerminalReadPayloadIncomplete(read),
             truncatedByByteBudget: serialized?.truncatedByByteBudget,
             data: serialized?.data ?? (read.tail.length > 0 ? `${read.tail.join('\r\n')}\r\n` : '')
           })
@@ -985,7 +1020,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
     params: TerminalSubscribe,
     handler: async (
       params,
-      { runtime, connectionId, sendBinary, registerBinaryStreamHandler },
+      { runtime, connectionId, sendBinary, registerBinaryStreamHandler, signal },
       emit
     ) => {
       let leaf = runtime.resolveLeafForHandle(params.terminal)
@@ -998,16 +1033,24 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
       // the subscribe can proceed normally.
       if (!leaf?.ptyId && isMobile) {
         try {
-          const ptyId = await runtime.waitForLeafPtyId(params.terminal)
+          const ptyId = await runtime.waitForLeafPtyId(params.terminal, 10_000, signal)
           leaf = { ptyId }
         } catch {
+          if (signal?.aborted) {
+            return
+          }
           // PTY wait timed out — fall through to scrollback-only path below
         }
       }
 
       if (!leaf?.ptyId) {
         const read = await runtime.readTerminal(params.terminal)
-        emit({ type: 'subscribed', streamId: null, lines: read.tail, truncated: read.truncated })
+        emit({
+          type: 'subscribed',
+          streamId: null,
+          lines: read.tail,
+          truncated: isTerminalReadPayloadIncomplete(read)
+        })
         emit({ type: 'end' })
         return
       }
@@ -1021,13 +1064,18 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
       if (!useBinaryStream) {
         const read = await runtime.readTerminal(params.terminal)
         const serialized = await serializeBudgetedMobileSnapshot(runtime, ptyId, false)
+        // Why: legacy JSON streams register cleanup after snapshot awaits; if
+        // the socket closed meanwhile, registering now would orphan listeners.
+        if (signal?.aborted) {
+          return
+        }
         const size = runtime.getTerminalSize(ptyId)
         const displayMode = runtime.getMobileDisplayMode(ptyId)
         const seq = runtime.getLayout(ptyId)?.seq
         emit({
           type: 'scrollback',
           lines: read.tail,
-          truncated: read.truncated,
+          truncated: isTerminalReadPayloadIncomplete(read),
           serialized: serialized?.data,
           cols: serialized?.cols ?? size?.cols,
           rows: serialized?.rows ?? size?.rows,
@@ -1187,12 +1235,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
           if (buffering) {
             pendingOutput.push(data)
             pendingOutputChars += data.length
-            while (
-              pendingOutputChars > TERMINAL_MULTIPLEX_PENDING_MAX_CHARS &&
-              pendingOutput.length > 0
-            ) {
-              pendingOutputChars -= pendingOutput.shift()?.length ?? 0
-            }
+            pendingOutputChars = trimPendingOutputToBudget(pendingOutput, pendingOutputChars)
             return
           }
           outputBatcher?.push(data)
@@ -1214,7 +1257,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
           type: 'subscribed',
           streamId,
           lines: read.tail,
-          truncated: read.truncated,
+          truncated: isTerminalReadPayloadIncomplete(read),
           cols: serialized?.cols ?? size?.cols,
           rows: serialized?.rows ?? size?.rows,
           displayMode,
@@ -1226,7 +1269,7 @@ export const TERMINAL_METHODS: RpcAnyMethod[] = [
           rows: serialized?.rows ?? size?.rows ?? 24,
           displayMode,
           seq,
-          truncated: read.truncated,
+          truncated: serialized ? read.truncated : isTerminalReadPayloadIncomplete(read),
           truncatedByByteBudget: serialized?.truncatedByByteBudget,
           data: serialized?.data ?? ''
         })

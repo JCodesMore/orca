@@ -1,38 +1,53 @@
-/**
- * Step views for AddRepoDialog: Clone, Remote, and Setup.
- *
- * Why extracted: keeps AddRepoDialog.tsx under the 400-line oxlint limit
- * by moving the presentational JSX for each wizard step into separate components
- * while the parent retains all state and handlers.
- */
+/* eslint-disable max-lines -- Why: AddRepoDialog step views are already split from the parent,
+   and keeping clone/remote/setup step props together avoids a larger wizard refactor in this
+   leak fix. */
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { Folder, FolderOpen, Settings } from 'lucide-react'
+import { CircleStop, Folder, FolderOpen, Settings } from 'lucide-react'
 import { useAppStore } from '@/store'
 import { DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { RemoteFileBrowser } from './RemoteFileBrowser'
 import { SshTargetRow } from './SshTargetRow'
+import { useMountedRef } from '@/hooks/useMountedRef'
 import type { AddRepoExistingWorkspaceSource } from '../../../../shared/telemetry-events'
-import type { Repo } from '../../../../shared/types'
+import type { NestedRepoScanResult, Repo } from '../../../../shared/types'
 import type { SshTarget, SshConnectionState } from '../../../../shared/ssh-types'
+import { createNestedRepoTelemetryAttemptId } from '../../../../shared/nested-repo-telemetry'
 
 // ── Remote project hook ─────────────────────────────────────────────
 
 export function useRemoteRepo(
-  fetchWorktrees: (repoId: string) => Promise<void>,
-  setStep: (step: 'add' | 'clone' | 'remote' | 'create' | 'setup') => void,
+  fetchWorktrees: (repoId: string) => Promise<unknown>,
+  setStep: (step: 'add' | 'clone' | 'remote' | 'create' | 'nested' | 'setup') => void,
   setAddedRepo: (repo: Repo | null) => void,
   closeModal: () => void,
-  setExistingWorkspaceSource?: (source: AddRepoExistingWorkspaceSource) => void
+  setExistingWorkspaceSource?: (source: AddRepoExistingWorkspaceSource) => void,
+  scanNestedRepos?: (
+    path: string,
+    connectionId?: string,
+    controls?: { scanId?: string; onProgress?: (scan: NestedRepoScanResult) => void }
+  ) => Promise<NestedRepoScanResult | null>,
+  showNestedRepoReview?: (
+    scan: NestedRepoScanResult,
+    selectedPath: string,
+    connectionId: string,
+    attemptId: string,
+    inProgress: boolean,
+    scanId: string | null
+  ) => void,
+  onNestedScanResult?: (scan: NestedRepoScanResult | null, attemptId: string) => void
 ) {
   const [sshTargets, setSshTargets] = useState<(SshTarget & { state?: SshConnectionState })[]>([])
   const [selectedTargetId, setSelectedTargetId] = useState<string | null>(null)
   const [remotePath, setRemotePath] = useState('~/')
   const [remoteError, setRemoteError] = useState<string | null>(null)
   const [isAddingRemote, setIsAddingRemote] = useState(false)
+  const [remoteNestedScanId, setRemoteNestedScanId] = useState<string | null>(null)
   const remoteGenRef = useRef(0)
+  const mountedRef = useMountedRef()
+  const cancelNestedRepoScan = useAppStore((s) => s.cancelNestedRepoScan)
 
   const resetRemoteState = useCallback(() => {
     remoteGenRef.current++
@@ -41,7 +56,18 @@ export function useRemoteRepo(
     setRemotePath('~/')
     setRemoteError(null)
     setIsAddingRemote(false)
-  }, [])
+    if (remoteNestedScanId) {
+      void cancelNestedRepoScan(remoteNestedScanId)
+    }
+    setRemoteNestedScanId(null)
+  }, [cancelNestedRepoScan, remoteNestedScanId])
+
+  const stopRemoteNestedScan = useCallback(() => {
+    if (!remoteNestedScanId) {
+      return
+    }
+    void cancelNestedRepoScan(remoteNestedScanId)
+  }, [cancelNestedRepoScan, remoteNestedScanId])
 
   const handleOpenRemoteStep = useCallback(async () => {
     const gen = ++remoteGenRef.current
@@ -101,12 +127,48 @@ export function useRemoteRepo(
       return
     }
 
+    const trimmedRemotePath = remotePath.trim()
+    const gen = ++remoteGenRef.current
     setIsAddingRemote(true)
     setRemoteError(null)
     try {
+      const attemptId = createNestedRepoTelemetryAttemptId()
+      const scanId = `nested-repo-scan-${Date.now()}-${Math.random().toString(36).slice(2)}`
+      setRemoteNestedScanId(scanId)
+      const scan = await scanNestedRepos?.(trimmedRemotePath, selectedTargetId, {
+        scanId,
+        onProgress: (progressScan) => {
+          if (
+            gen !== remoteGenRef.current ||
+            !mountedRef.current ||
+            progressScan.selectedPathKind !== 'non_git_folder' ||
+            progressScan.repos.length === 0
+          ) {
+            return
+          }
+          showNestedRepoReview?.(
+            progressScan,
+            trimmedRemotePath,
+            selectedTargetId,
+            attemptId,
+            true,
+            scanId
+          )
+        }
+      })
+      if (!mountedRef.current || gen !== remoteGenRef.current) {
+        return
+      }
+      onNestedScanResult?.(scan ?? null, attemptId)
+      if (scan?.selectedPathKind === 'non_git_folder' && scan.repos.length > 0) {
+        showNestedRepoReview?.(scan, trimmedRemotePath, selectedTargetId, attemptId, false, scanId)
+        setRemoteNestedScanId(null)
+        return
+      }
+      setRemoteNestedScanId(null)
       const result = await window.api.repos.addRemote({
         connectionId: selectedTargetId,
-        remotePath: remotePath.trim()
+        remotePath: trimmedRemotePath
       })
       if ('error' in result) {
         throw new Error(result.error)
@@ -126,10 +188,16 @@ export function useRemoteRepo(
         useAppStore.setState({ repos: updated })
       }
 
+      if (!mountedRef.current || gen !== remoteGenRef.current) {
+        return
+      }
       toast.success('Remote project added', { description: repo.displayName })
       setAddedRepo(repo)
       setExistingWorkspaceSource?.('ssh_remote_path')
       await fetchWorktrees(repo.id)
+      if (!mountedRef.current || gen !== remoteGenRef.current) {
+        return
+      }
       setStep('setup')
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
@@ -139,19 +207,28 @@ export function useRemoteRepo(
         // silently adding as a folder.
         closeModal()
         useAppStore.getState().openModal('confirm-non-git-folder', {
-          folderPath: remotePath.trim(),
+          folderPath: trimmedRemotePath,
           connectionId: selectedTargetId
         })
         return
       }
-      setRemoteError(message)
+      if (mountedRef.current && gen === remoteGenRef.current) {
+        setRemoteError(message)
+      }
     } finally {
-      setIsAddingRemote(false)
+      if (mountedRef.current && gen === remoteGenRef.current) {
+        setIsAddingRemote(false)
+        setRemoteNestedScanId(null)
+      }
     }
   }, [
     selectedTargetId,
     remotePath,
+    scanNestedRepos,
+    showNestedRepoReview,
+    onNestedScanResult,
     fetchWorktrees,
+    mountedRef,
     setStep,
     setAddedRepo,
     closeModal,
@@ -164,13 +241,15 @@ export function useRemoteRepo(
     remotePath,
     remoteError,
     isAddingRemote,
+    isScanningNested: Boolean(remoteNestedScanId),
     setSelectedTargetId,
     setRemotePath,
     setRemoteError,
     resetRemoteState,
     handleOpenRemoteStep,
     handleAddRemoteRepo,
-    handleConnectTarget
+    handleConnectTarget,
+    stopRemoteNestedScan
   }
 }
 
@@ -182,11 +261,13 @@ type RemoteStepProps = {
   remotePath: string
   remoteError: string | null
   isAddingRemote: boolean
+  isScanningNested?: boolean
   onSelectTarget: (id: string) => void
   onRemotePathChange: (value: string) => void
   onAdd: () => void
   onOpenSshSettings: () => void
   onConnectTarget: (id: string) => Promise<void>
+  onStopNestedScan?: () => void
 }
 
 export function RemoteStep({
@@ -195,11 +276,13 @@ export function RemoteStep({
   remotePath,
   remoteError,
   isAddingRemote,
+  isScanningNested,
   onSelectTarget,
   onRemotePathChange,
   onAdd,
   onOpenSshSettings,
-  onConnectTarget
+  onConnectTarget,
+  onStopNestedScan
 }: RemoteStepProps): React.JSX.Element {
   const [browsing, setBrowsing] = useState(false)
 
@@ -304,6 +387,12 @@ export function RemoteStep({
         >
           {isAddingRemote ? 'Adding...' : 'Add remote project'}
         </Button>
+        {isScanningNested ? (
+          <Button variant="outline" className="w-full" onClick={onStopNestedScan}>
+            <CircleStop className="size-3.5" />
+            Stop scan
+          </Button>
+        ) : null}
       </div>
     </>
   )

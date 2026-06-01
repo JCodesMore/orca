@@ -5,6 +5,9 @@ export function buildSetupRunnerCommand(
   platform: SetupRunnerCommandPlatform
 ): string {
   if (platform === 'windows') {
+    if (runnerScriptPath.startsWith('/')) {
+      return `bash ${quotePosixArg(runnerScriptPath)}`
+    }
     if (isWslUncPath(runnerScriptPath)) {
       const linuxPath = wslUncToLinuxPath(runnerScriptPath)
       return `bash ${quotePosixArg(linuxPath)}`
@@ -17,12 +20,12 @@ export function buildSetupRunnerCommand(
 
 function isWslUncPath(path: string): boolean {
   const normalized = path.replace(/\\/g, '/')
-  return /^\/\/(wsl\.localhost|wsl\$)\//.test(normalized)
+  return /^\/\/(wsl\.localhost|wsl\$)\//i.test(normalized)
 }
 
 function wslUncToLinuxPath(windowsPath: string): string {
   const normalized = windowsPath.replace(/\\/g, '/')
-  const match = normalized.match(/^\/\/(wsl\.localhost|wsl\$)\/[^/]+(\/.*)?$/)
+  const match = normalized.match(/^\/\/(wsl\.localhost|wsl\$)\/[^/]+(\/.*)?$/i)
   return match?.[2] || '/'
 }
 

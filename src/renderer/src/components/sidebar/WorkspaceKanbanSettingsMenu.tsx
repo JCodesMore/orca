@@ -1,22 +1,20 @@
 import React from 'react'
-import { ArrowDown, ArrowUp, Plus, Settings2, Trash2 } from 'lucide-react'
+import { ArrowDown, ArrowUp, Plus, Settings, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuLabel,
-  DropdownMenuSeparator,
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import type { WorkspaceStatusDefinition } from '../../../../shared/types'
 import { getWorkspaceStatusVisualMeta } from './workspace-status'
 import WorkspaceStatusAppearancePopover from './WorkspaceStatusAppearancePopover'
 
 type WorkspaceKanbanSettingsMenuProps = {
-  opacityPercent: number
   workspaceStatuses: readonly WorkspaceStatusDefinition[]
-  onOpacityChange: (event: React.ChangeEvent<HTMLInputElement>) => void
   onRenameStatus: (statusId: string, label: string) => void
   onChangeStatusColor: (statusId: string, color: string) => void
   onChangeStatusIcon: (statusId: string, icon: string) => void
@@ -26,9 +24,7 @@ type WorkspaceKanbanSettingsMenuProps = {
 }
 
 export default function WorkspaceKanbanSettingsMenu({
-  opacityPercent,
   workspaceStatuses,
-  onOpacityChange,
   onRenameStatus,
   onChangeStatusColor,
   onChangeStatusIcon,
@@ -38,14 +34,27 @@ export default function WorkspaceKanbanSettingsMenu({
 }: WorkspaceKanbanSettingsMenuProps): React.JSX.Element {
   return (
     <DropdownMenu modal={false}>
-      <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon-xs" aria-label="Workspace board settings">
-          <Settings2 className="size-3.5" />
-        </Button>
-      </DropdownMenuTrigger>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Workspace board settings"
+              className="text-muted-foreground"
+            >
+              <Settings className="size-3.5" />
+            </Button>
+          </DropdownMenuTrigger>
+        </TooltipTrigger>
+        <TooltipContent side="top" sideOffset={4}>
+          Board settings
+        </TooltipContent>
+      </Tooltip>
       <DropdownMenuContent
         align="end"
         sideOffset={8}
+        collisionPadding={8}
         className="max-h-[min(80vh,720px)] w-80 overflow-y-auto p-2 scrollbar-sleek"
         onInteractOutside={(event) => {
           const target = event.target
@@ -57,23 +66,6 @@ export default function WorkspaceKanbanSettingsMenu({
           }
         }}
       >
-        <DropdownMenuLabel>Board opacity</DropdownMenuLabel>
-        <div className="px-2 pb-2">
-          <div className="mb-1 flex items-center justify-between text-[11px] text-muted-foreground">
-            <span>Pane opacity</span>
-            <span>{opacityPercent}%</span>
-          </div>
-          <input
-            type="range"
-            min={20}
-            max={100}
-            value={opacityPercent}
-            onChange={onOpacityChange}
-            className="h-5 w-full accent-foreground"
-            aria-label="Workspace board opacity"
-          />
-        </div>
-        <DropdownMenuSeparator />
         <DropdownMenuLabel>Statuses</DropdownMenuLabel>
         <div className="space-y-2 px-1 pb-1">
           {workspaceStatuses.map((status, index) => {

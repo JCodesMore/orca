@@ -2,6 +2,7 @@ import { execFile } from 'child_process'
 import { promisify } from 'util'
 import { gitExecFileAsync, glabExecFileAsync } from '../git/runner'
 import type { ClassifiedError, GitLabProjectRef, IssueSourcePreference } from '../../shared/types'
+import { getSshGitProvider } from '../providers/ssh-git-dispatch'
 
 // Why: legacy generic execFile wrapper — only used by callers that don't need
 // WSL-aware routing. Repo-scoped callers should use glabExecFileAsync from
@@ -102,11 +103,28 @@ export function classifyListIssuesError(stderr: string): ClassifiedError {
 // the short local name `ProjectRef`.
 export type ProjectRef = GitLabProjectRef
 
+const PROJECT_REF_CACHE_MAX_ENTRIES = 512
 const projectRefCache = new Map<string, ProjectRef | null>()
 
 /** @internal — exposed for tests only */
 export function _resetProjectRefCache(): void {
   projectRefCache.clear()
+}
+
+/** @internal — exposed for tests only */
+export function _getProjectRefCacheSize(): number {
+  return projectRefCache.size
+}
+
+function rememberProjectRefCacheEntry(cacheKey: string, value: ProjectRef | null): void {
+  projectRefCache.set(cacheKey, value)
+  while (projectRefCache.size > PROJECT_REF_CACHE_MAX_ENTRIES) {
+    const oldestKey = projectRefCache.keys().next().value
+    if (oldestKey === undefined) {
+      return
+    }
+    projectRefCache.delete(oldestKey)
+  }
 }
 
 /**
@@ -120,7 +138,7 @@ function normalizeHost(value: string): string {
 }
 
 function stripGitSuffix(path: string): string {
-  return path.replace(/\.git$/i, '')
+  return path.replace(/\/+$/, '').replace(/\.git$/i, '')
 }
 
 function makeProjectRef(
@@ -167,44 +185,58 @@ export function parseGitLabProjectRef(
 export async function getProjectRefForRemote(
   repoPath: string,
   remoteName: string,
-  knownHosts: readonly string[] = DEFAULT_GITLAB_HOSTS
+  knownHosts: readonly string[] = DEFAULT_GITLAB_HOSTS,
+  connectionId?: string | null
 ): Promise<ProjectRef | null> {
-  const cacheKey = `${repoPath}\0${remoteName}\0${knownHosts.join(',')}`
+  const cacheKey = `${connectionId ?? 'local'}\0${repoPath}\0${remoteName}\0${knownHosts.join(',')}`
   if (projectRefCache.has(cacheKey)) {
     return projectRefCache.get(cacheKey)!
   }
   try {
-    const { stdout } = await gitExecFileAsync(['remote', 'get-url', remoteName], {
-      cwd: repoPath
-    })
+    const sshGitProvider = connectionId ? getSshGitProvider(connectionId) : null
+    if (connectionId && !sshGitProvider) {
+      // Why: mobile can attempt GitLab loads before the SSH tunnel is ready.
+      // Caching that transient state would poison later loads after connect.
+      return null
+    }
+    const { stdout } = sshGitProvider
+      ? await sshGitProvider.exec(['remote', 'get-url', remoteName], repoPath)
+      : await gitExecFileAsync(['remote', 'get-url', remoteName], { cwd: repoPath })
     const result = parseGitLabProjectRef(stdout, knownHosts)
     if (result) {
-      projectRefCache.set(cacheKey, result)
+      rememberProjectRefCacheEntry(cacheKey, result)
       return result
     }
   } catch {
+    if (connectionId) {
+      // Why: remote SSH failures are often transient tunnel/process errors.
+      // Do not cache them as "not a GitLab repo" for the rest of the session.
+      return null
+    }
     // ignore — non-GitLab remote or no remote configured
   }
-  projectRefCache.set(cacheKey, null)
+  rememberProjectRefCacheEntry(cacheKey, null)
   return null
 }
 
 export async function getProjectRef(
   repoPath: string,
-  knownHosts?: readonly string[]
+  knownHosts?: readonly string[],
+  connectionId?: string | null
 ): Promise<ProjectRef | null> {
-  return getProjectRefForRemote(repoPath, 'origin', knownHosts)
+  return getProjectRefForRemote(repoPath, 'origin', knownHosts, connectionId)
 }
 
 export async function getIssueProjectRef(
   repoPath: string,
-  knownHosts?: readonly string[]
+  knownHosts?: readonly string[],
+  connectionId?: string | null
 ): Promise<ProjectRef | null> {
-  const upstream = await getProjectRefForRemote(repoPath, 'upstream', knownHosts)
+  const upstream = await getProjectRefForRemote(repoPath, 'upstream', knownHosts, connectionId)
   if (upstream) {
     return upstream
   }
-  return getProjectRefForRemote(repoPath, 'origin', knownHosts)
+  return getProjectRefForRemote(repoPath, 'origin', knownHosts, connectionId)
 }
 
 export type ResolvedIssueSource = {
@@ -222,23 +254,40 @@ export type ResolvedIssueSource = {
 export async function resolveIssueSource(
   repoPath: string,
   preference: IssueSourcePreference | undefined,
-  knownHosts?: readonly string[]
+  knownHosts?: readonly string[],
+  connectionId?: string | null
 ): Promise<ResolvedIssueSource> {
   if (preference === 'upstream') {
-    const upstream = await getProjectRefForRemote(repoPath, 'upstream', knownHosts)
+    const upstream = await getProjectRefForRemote(repoPath, 'upstream', knownHosts, connectionId)
     if (upstream) {
       return { source: upstream, fellBack: false }
     }
-    const origin = await getProjectRefForRemote(repoPath, 'origin', knownHosts)
+    const origin = await getProjectRefForRemote(repoPath, 'origin', knownHosts, connectionId)
     return { source: origin, fellBack: origin !== null }
   }
   if (preference === 'origin') {
     return {
-      source: await getProjectRefForRemote(repoPath, 'origin', knownHosts),
+      source: await getProjectRefForRemote(repoPath, 'origin', knownHosts, connectionId),
       fellBack: false
     }
   }
-  return { source: await getIssueProjectRef(repoPath, knownHosts), fellBack: false }
+  return { source: await getIssueProjectRef(repoPath, knownHosts, connectionId), fellBack: false }
+}
+
+export function glabRepoExecOptions(
+  repoPath: string,
+  connectionId?: string | null
+): { cwd?: string } {
+  return connectionId ? {} : { cwd: repoPath }
+}
+
+export function glabHostnameArgs(
+  projectRef: Pick<ProjectRef, 'host'> | null | undefined,
+  connectionId?: string | null
+): string[] {
+  // Why: local glab commands can infer host from cwd; SSH-backed calls have
+  // no local cwd, so self-hosted instances need an explicit hostname.
+  return connectionId && projectRef?.host ? ['--hostname', projectRef.host] : []
 }
 
 // ── Known-hosts discovery via `glab auth status` ────────────────────

@@ -8,16 +8,18 @@ import {
   insertText,
   type DictationInsertionTarget
 } from './dictation-insertion-target'
+import { getShortcutPlatform } from '@/lib/shortcut-platform'
 import { formatFinalTranscriptSegment } from './dictation-final-segments'
-import { waitForStoppedSession } from './dictation-stopped-sessions'
-
-const IS_MAC = navigator.userAgent.includes('Mac')
+import { recordStoppedSession, waitForStoppedSession } from './dictation-stopped-sessions'
+import { keybindingMatchesAction } from '../../../../shared/keybindings'
 
 export function DictationController() {
   const dictationState = useAppStore((s) => s.dictationState)
   const setDictationState = useAppStore((s) => s.setDictationState)
   const setPartialTranscript = useAppStore((s) => s.setPartialTranscript)
+  const recordFeatureInteraction = useAppStore((s) => s.recordFeatureInteraction)
   const settings = useAppStore((s) => s.settings)
+  const keybindings = useAppStore((s) => s.keybindings)
   const {
     start: startCapture,
     stop: stopCapture,
@@ -38,6 +40,10 @@ export function DictationController() {
   const finalTranscriptReceivedRef = useRef(false)
   const intentionalTargetCancellationRef = useRef(false)
   const insertedFinalTranscriptRef = useRef('')
+
+  const drainStoppedSession = useCallback((sessionId: string) => {
+    void waitForStoppedSession(sessionId, stoppedSessionIdsRef, stoppedResolversRef)
+  }, [])
 
   const finishDictationSession = useCallback(
     async (sessionId: string) => {
@@ -130,6 +136,7 @@ export function DictationController() {
         insertionTargetRef.current = null
         stopCapture()
         await window.api.speech.stopDictation(sessionId).catch(() => undefined)
+        drainStoppedSession(sessionId)
         return
       }
 
@@ -139,6 +146,7 @@ export function DictationController() {
         insertionTargetRef.current = null
         stopCapture()
         await window.api.speech.stopDictation(sessionId).catch(() => undefined)
+        drainStoppedSession(sessionId)
         return
       }
       if (stopRequestedDuringStartRef.current) {
@@ -148,11 +156,13 @@ export function DictationController() {
 
       dictationStateRef.current = 'listening'
       setDictationState('listening')
+      recordFeatureInteraction('voice-dictation')
     } catch (err) {
       if (dictationRunRef.current !== runId) {
         return
       }
       await window.api.speech.stopDictation(sessionId).catch(() => undefined)
+      drainStoppedSession(sessionId)
       if (captureStarted) {
         stopCapture()
       }
@@ -200,7 +210,9 @@ export function DictationController() {
     discardBufferedAudio,
     stopCapture,
     finishDictationSession,
-    setPartialTranscript
+    drainStoppedSession,
+    setPartialTranscript,
+    recordFeatureInteraction
   ])
 
   const stopDictation = useCallback(async () => {
@@ -270,8 +282,7 @@ export function DictationController() {
     }
 
     const handleKeyDown = (e: KeyboardEvent): void => {
-      const mod = IS_MAC ? e.metaKey : e.ctrlKey
-      if (mod && (e.key.toLowerCase() === 'e' || e.code === 'KeyE') && !e.shiftKey && !e.altKey) {
+      if (keybindingMatchesAction('voice.dictation', e, getShortcutPlatform(), keybindings)) {
         if (!settings?.voice?.enabled || !settings.voice.sttModel) {
           return
         }
@@ -284,7 +295,7 @@ export function DictationController() {
       }
     }
 
-    const handleKeyUp = (e: KeyboardEvent): void => {
+    const handleKeyUp = (): void => {
       if (!holdGestureActiveRef.current) {
         return
       }
@@ -292,15 +303,8 @@ export function DictationController() {
         holdGestureActiveRef.current = false
         return
       }
-      if (
-        e.key.toLowerCase() === 'e' ||
-        e.code === 'KeyE' ||
-        e.key === 'Meta' ||
-        e.key === 'Control'
-      ) {
-        holdGestureActiveRef.current = false
-        void stopDictation()
-      }
+      holdGestureActiveRef.current = false
+      void stopDictation()
     }
 
     const handleBlur = (): void => {
@@ -336,6 +340,7 @@ export function DictationController() {
     settings?.voice?.dictationMode,
     settings?.voice?.enabled,
     settings?.voice?.sttModel,
+    keybindings,
     startDictation,
     stopDictation
   ])
@@ -368,13 +373,7 @@ export function DictationController() {
     })
 
     const cleanupStopped = window.api.speech.onStopped((data) => {
-      const resolver = stoppedResolversRef.current.get(data.sessionId)
-      if (resolver) {
-        stoppedResolversRef.current.delete(data.sessionId)
-        resolver()
-        return
-      }
-      stoppedSessionIdsRef.current.add(data.sessionId)
+      recordStoppedSession(data.sessionId, stoppedSessionIdsRef, stoppedResolversRef)
     })
 
     const cleanupError = window.api.speech.onError((data) => {

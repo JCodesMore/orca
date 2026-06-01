@@ -1,6 +1,8 @@
-import { ipcMain } from 'electron'
+import { BrowserWindow, ipcMain } from 'electron'
 import type { Store } from '../persistence'
+import { advertisedUrlWatcher, type AdvertisedUrlWatcher } from '../ports/advertised-url-watcher'
 import type {
+  WorkspacePortAdvertisedUrlChangedEvent,
   WorkspacePortKillRequest,
   WorkspacePortKillResult,
   WorkspacePortScanRequest,
@@ -12,9 +14,32 @@ import {
   scanWorkspacePortProbes
 } from '../ports/workspace-port-ownership'
 
-export function registerWorkspacePortHandlers(store: Store): void {
-  const inFlightScans = new Map<string, Promise<WorkspacePortScanResult>>()
+type WorkspacePortHandlersOptions = {
+  advertisedUrlEvents?: Pick<AdvertisedUrlWatcher, 'onDidChange'>
+  getWindows?: () => BrowserWindow[]
+}
 
+let unsubscribeAdvertisedUrlChanges: (() => void) | null = null
+
+export function registerWorkspacePortHandlers(
+  store: Store,
+  options: WorkspacePortHandlersOptions = {}
+): void {
+  const inFlightScans = new Map<string, Promise<WorkspacePortScanResult>>()
+  const advertisedUrlEvents = options.advertisedUrlEvents ?? advertisedUrlWatcher
+  const getWindows = options.getWindows ?? (() => BrowserWindow.getAllWindows())
+
+  unsubscribeAdvertisedUrlChanges?.()
+  unsubscribeAdvertisedUrlChanges = advertisedUrlEvents.onDidChange((event) => {
+    const localWorktrees = getStoreWorkspacePortProbes(store)
+    if (!localWorktrees.some((worktree) => worktree.id === event.worktreeId)) {
+      return
+    }
+    broadcastWorkspacePortAdvertisedUrlChanged(getWindows, event)
+  })
+
+  ipcMain.removeHandler('workspacePorts:scan')
+  ipcMain.removeHandler('workspacePorts:kill')
   ipcMain.handle(
     'workspacePorts:scan',
     (_event, rawArgs?: unknown): Promise<WorkspacePortScanResult> => {
@@ -51,6 +76,22 @@ export function registerWorkspacePortHandlers(store: Store): void {
       return killWorkspacePort(worktrees, args)
     }
   )
+}
+
+function broadcastWorkspacePortAdvertisedUrlChanged(
+  getWindows: () => BrowserWindow[],
+  event: WorkspacePortAdvertisedUrlChangedEvent
+): void {
+  for (const window of getWindows()) {
+    if (window.isDestroyed()) {
+      continue
+    }
+    const webContents = window.webContents
+    if (webContents.isDestroyed()) {
+      continue
+    }
+    webContents.send('workspacePorts:advertised-url-changed', event)
+  }
 }
 
 function parseScanRequest(value: unknown): WorkspacePortScanRequest | undefined {

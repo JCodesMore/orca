@@ -218,6 +218,28 @@ describe('resolvePrimaryAction', () => {
     })
   })
 
+  it('returns Force Push when remote-only commits are patch-equivalent after a rebase', () => {
+    const result = resolvePrimaryAction(
+      inputs({
+        branchCommitsAhead: 4,
+        upstreamStatus: {
+          hasUpstream: true,
+          upstreamName: 'origin/feature',
+          ahead: 14,
+          behind: 3,
+          behindCommitsArePatchEquivalent: true
+        }
+      })
+    )
+    expect(result).toEqual({
+      kind: 'push',
+      label: 'Force Push',
+      title:
+        'Remote only has older copies of local commits. Force push 4 branch commits with lease to update origin/feature.',
+      disabled: false
+    })
+  })
+
   it('returns Pull when clean + behind-only', () => {
     const result = resolvePrimaryAction(
       inputs({ upstreamStatus: { hasUpstream: true, ahead: 0, behind: 4 } })
@@ -383,6 +405,27 @@ describe('resolvePrimaryAction', () => {
       kind: 'create_pr',
       label: 'Create PR',
       title: 'Create a pull request for this branch',
+      disabled: false
+    })
+  })
+
+  it('returns Create MR when a clean tracked GitLab branch is eligible for review creation', () => {
+    const result = resolvePrimaryAction(
+      inputs({
+        upstreamStatus: upstreamInSync,
+        hostedReviewCreation: {
+          provider: 'gitlab',
+          review: null,
+          canCreate: true,
+          blockedReason: null,
+          nextAction: null
+        }
+      })
+    )
+    expect(result).toEqual({
+      kind: 'create_pr',
+      label: 'Create MR',
+      title: 'Create a merge request for this branch',
       disabled: false
     })
   })

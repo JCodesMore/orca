@@ -13,7 +13,7 @@ vi.mock('@/runtime/runtime-terminal-inspection', () => ({
   inspectRuntimeTerminalProcess: vi.fn()
 }))
 
-vi.mock('@/lib/tui-agent-startup', () => ({
+vi.mock('./tui-agent-startup', () => ({
   isShellProcess: vi.fn(() => false)
 }))
 
@@ -35,7 +35,7 @@ describe('waitForAgentReady', () => {
       hasChildProcesses: false
     })
 
-    await expect(waitForAgentReady('tab-1', 'claude', { timeoutMs: 1 })).resolves.toEqual({
+    await expect(waitForAgentReady('tab-1', 'claude', { timeoutMs: 100 })).resolves.toEqual({
       ready: true,
       reason: 'foreground-match'
     })

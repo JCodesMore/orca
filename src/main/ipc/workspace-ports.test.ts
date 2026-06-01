@@ -2,15 +2,22 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { WorkspacePort, WorkspacePortScanResult } from '../../shared/workspace-ports'
 
 const handlers = new Map<string, (_event: unknown, args: unknown) => Promise<unknown> | unknown>()
-const { handleMock, scanWorkspacePortsMock, processKillMock } = vi.hoisted(() => ({
-  handleMock: vi.fn(),
-  scanWorkspacePortsMock: vi.fn(),
-  processKillMock: vi.fn()
-}))
+const { handleMock, removeHandlerMock, scanWorkspacePortsMock, processKillMock } = vi.hoisted(
+  () => ({
+    handleMock: vi.fn(),
+    removeHandlerMock: vi.fn(),
+    scanWorkspacePortsMock: vi.fn(),
+    processKillMock: vi.fn()
+  })
+)
 
 vi.mock('electron', () => ({
+  BrowserWindow: {
+    getAllWindows: vi.fn(() => [])
+  },
   ipcMain: {
-    handle: handleMock
+    handle: handleMock,
+    removeHandler: removeHandlerMock
   }
 }))
 
@@ -65,6 +72,7 @@ describe('registerWorkspacePortHandlers', () => {
   beforeEach(() => {
     handlers.clear()
     handleMock.mockReset()
+    removeHandlerMock.mockReset()
     scanWorkspacePortsMock.mockReset()
     handleMock.mockImplementation((channel, handler) => {
       handlers.set(channel, handler)
@@ -72,6 +80,14 @@ describe('registerWorkspacePortHandlers', () => {
     scanWorkspacePortsMock.mockResolvedValue(EMPTY_SCAN)
     processKillMock.mockReset()
     vi.spyOn(process, 'kill').mockImplementation(processKillMock)
+  })
+
+  it('removes existing IPC handlers before registering new ones', () => {
+    const store = makeStore()
+    registerWorkspacePortHandlers(store as never)
+
+    expect(removeHandlerMock).toHaveBeenCalledWith('workspacePorts:scan')
+    expect(removeHandlerMock).toHaveBeenCalledWith('workspacePorts:kill')
   })
 
   it('derives local worktree probes from the main store instead of renderer input', async () => {
@@ -217,6 +233,63 @@ describe('registerWorkspacePortHandlers', () => {
     expect(result).toEqual({ ok: false, reason: 'Invalid process or port.' })
     expect(scanWorkspacePortsMock).not.toHaveBeenCalled()
     expect(processKillMock).not.toHaveBeenCalled()
+  })
+
+  it('notifies renderers when a local worktree advertised URL changes', () => {
+    const store = makeStore()
+    type AdvertisedUrlListener = (event: { worktreeId: string; port: number }) => void
+    let advertisedUrlListener: AdvertisedUrlListener | undefined
+    const send = vi.fn()
+
+    registerWorkspacePortHandlers(store as never, {
+      advertisedUrlEvents: {
+        onDidChange: (listener) => {
+          advertisedUrlListener = listener
+          return () => {}
+        }
+      },
+      getWindows: () =>
+        [
+          {
+            isDestroyed: () => false,
+            webContents: {
+              isDestroyed: () => false,
+              send
+            }
+          }
+        ] as never
+    })
+
+    expect(advertisedUrlListener).toBeTypeOf('function')
+    const emitAdvertisedUrlChanged = advertisedUrlListener as AdvertisedUrlListener
+    emitAdvertisedUrlChanged({ worktreeId: 'local-repo::/workspace/repo', port: 3002 })
+    emitAdvertisedUrlChanged({ worktreeId: 'remote-repo::/remote/repo', port: 3003 })
+
+    expect(send).toHaveBeenCalledTimes(1)
+    expect(send).toHaveBeenCalledWith('workspacePorts:advertised-url-changed', {
+      worktreeId: 'local-repo::/workspace/repo',
+      port: 3002
+    })
+  })
+
+  it('unsubscribes the previous advertised URL listener when handlers are registered again', () => {
+    const store = makeStore()
+    const firstUnsubscribe = vi.fn()
+    const secondUnsubscribe = vi.fn()
+    const onDidChange = vi
+      .fn()
+      .mockReturnValueOnce(firstUnsubscribe)
+      .mockReturnValueOnce(secondUnsubscribe)
+
+    registerWorkspacePortHandlers(store as never, {
+      advertisedUrlEvents: { onDidChange }
+    })
+    registerWorkspacePortHandlers(store as never, {
+      advertisedUrlEvents: { onDidChange }
+    })
+
+    expect(firstUnsubscribe).toHaveBeenCalledTimes(1)
+    expect(secondUnsubscribe).not.toHaveBeenCalled()
   })
 })
 

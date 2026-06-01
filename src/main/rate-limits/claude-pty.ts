@@ -1,7 +1,12 @@
+/* eslint-disable max-lines -- Why: Claude PTY usage scraping keeps prompt
+driving, parser, timers, and teardown in one state machine; splitting it would
+make the lifecycle harder to audit. */
 import type { ProviderRateLimits, RateLimitWindow } from '../../shared/rate-limit-types'
 import { resolveClaudeCommand } from '../codex-cli/command'
 import type { ClaudeRuntimeAuthPreparation } from '../claude-accounts/runtime-auth-service'
 import { applyClaudeEnvPatch } from '../claude-accounts/environment'
+import { withMacTailscaleDnsHint } from '../network/macos-tailscale-dns-diagnostic'
+import { cleanupHiddenRateLimitPty } from './hidden-pty-cleanup'
 
 const PTY_TIMEOUT_MS = 25_000
 const MAX_OUTPUT_LENGTH = 100_000 // 100KB buffer limit
@@ -124,6 +129,10 @@ const STARTUP_DELAY_MS = 2_000
 const SETTLE_AFTER_STOP_MS = 2_000
 const SETTLE_AFTER_CLAUDE_21_USAGE_MS = 8_000
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`
+}
+
 function describeClaudeUsageFailure(output: string): string {
   if (RATE_LIMITED_RE.test(output)) {
     return 'Claude usage is rate limited right now.'
@@ -154,6 +163,8 @@ export async function fetchViaPty(options?: {
     let sentUsage = false
     let stopDetected = false
     let claude21UsageDetected = false
+    let startupDelayTimer: ReturnType<typeof setTimeout> | null = null
+    let stopSettleTimer: ReturnType<typeof setTimeout> | null = null
     let claude21UsageSettleTimer: ReturnType<typeof setTimeout> | null = null
 
     const claudeCommand = resolveClaudeCommand()
@@ -162,14 +173,34 @@ export async function fetchViaPty(options?: {
     // those need cmd.exe as an interpreter. Always route through cmd.exe on win32
     // and ensure the command path is properly quoted if it contains spaces.
     const isWin32 = process.platform === 'win32'
-    const spawnFile = isWin32 ? 'cmd.exe' : claudeCommand
-    const spawnArgs = isWin32 ? ['/c', `"${claudeCommand}"`] : []
-
     const spawnEnv = applyClaudeEnvPatch(
       { ...process.env, TERM: 'xterm-256color' } as Record<string, string>,
       options?.authPreparation?.envPatch ?? {},
       { stripAuthEnv: options?.authPreparation?.stripAuthEnv ?? false }
     )
+    const authPreparation = options?.authPreparation
+    const wslConfig =
+      authPreparation?.runtime === 'wsl' &&
+      authPreparation.wslDistro &&
+      authPreparation.wslLinuxConfigDir
+        ? {
+            distro: authPreparation.wslDistro,
+            linuxConfigDir: authPreparation.wslLinuxConfigDir
+          }
+        : null
+    const spawnFile = wslConfig ? 'wsl.exe' : isWin32 ? 'cmd.exe' : claudeCommand
+    const spawnArgs = wslConfig
+      ? [
+          '-d',
+          wslConfig.distro,
+          '--',
+          'bash',
+          '-lc',
+          `export CLAUDE_CONFIG_DIR=${shellQuote(wslConfig.linuxConfigDir)}; exec claude`
+        ]
+      : isWin32
+        ? ['/c', `"${claudeCommand}"`]
+        : []
 
     const term = pty.spawn(spawnFile, spawnArgs, {
       name: 'xterm-256color',
@@ -178,28 +209,32 @@ export async function fetchViaPty(options?: {
       env: spawnEnv
     })
     const termDisposables: { dispose: () => void }[] = []
-    const disposeTermListeners = (): void => {
-      for (const disposable of termDisposables.splice(0)) {
-        disposable.dispose()
+    let enterInterval: ReturnType<typeof setInterval> | null = null
+
+    function clearFollowupTimers(): void {
+      if (startupDelayTimer) {
+        clearTimeout(startupDelayTimer)
+        startupDelayTimer = null
+      }
+      if (stopSettleTimer) {
+        clearTimeout(stopSettleTimer)
+        stopSettleTimer = null
+      }
+      if (claude21UsageSettleTimer) {
+        clearTimeout(claude21UsageSettleTimer)
+        claude21UsageSettleTimer = null
+      }
+      if (enterInterval) {
+        clearInterval(enterInterval)
+        enterInterval = null
       }
     }
 
     const timeout = setTimeout(() => {
       if (!resolved) {
         resolved = true
-        // Why: node-pty's NAPI callbacks can outlive the Electron JS
-        // environment if we kill the hidden PTY without disposing them first,
-        // which matches Orca's documented SIGABRT failure mode on shutdown.
-        if (claude21UsageSettleTimer) {
-          clearTimeout(claude21UsageSettleTimer)
-          claude21UsageSettleTimer = null
-        }
-        if (enterInterval) {
-          clearInterval(enterInterval)
-          enterInterval = null
-        }
-        disposeTermListeners()
-        term.kill()
+        clearFollowupTimers()
+        cleanupHiddenRateLimitPty(term, termDisposables, { kill: true })
         // Even on timeout, try to parse whatever we collected
         const clean = stripTerminalControlSequences(output)
         const { session, weekly } = parsePtyUsage(clean)
@@ -218,10 +253,12 @@ export async function fetchViaPty(options?: {
             session: null,
             weekly: null,
             updatedAt: Date.now(),
-            error:
+            error: withMacTailscaleDnsHint(
               CLAUDE_21_USAGE_TABS_RE.test(clean) || CLAUDE_21_SESSION_STATS_RE.test(clean)
                 ? describeClaudeUsageFailure(clean)
                 : 'PTY timeout — /usage panel did not render',
+              clean
+            ),
             status: 'error'
           })
         }
@@ -230,8 +267,6 @@ export async function fetchViaPty(options?: {
 
     // Why: the Claude TUI may have scrollable panels or prompts.
     // Sending Enter every 0.8s advances through them.
-    let enterInterval: ReturnType<typeof setInterval> | null = null
-
     function startEnterPresses(): void {
       if (enterInterval) {
         return
@@ -249,15 +284,8 @@ export async function fetchViaPty(options?: {
       }
       resolved = true
       clearTimeout(timeout)
-      if (claude21UsageSettleTimer) {
-        clearTimeout(claude21UsageSettleTimer)
-        claude21UsageSettleTimer = null
-      }
-      if (enterInterval) {
-        clearInterval(enterInterval)
-      }
-      disposeTermListeners()
-      term.kill()
+      clearFollowupTimers()
+      cleanupHiddenRateLimitPty(term, termDisposables, { kill: true })
 
       const clean = stripTerminalControlSequences(output)
       const { session, weekly } = parsePtyUsage(clean)
@@ -268,7 +296,7 @@ export async function fetchViaPty(options?: {
           session: null,
           weekly: null,
           updatedAt: Date.now(),
-          error: describeClaudeUsageFailure(clean),
+          error: withMacTailscaleDnsHint(describeClaudeUsageFailure(clean), clean),
           status: 'error'
         })
       } else {
@@ -285,7 +313,8 @@ export async function fetchViaPty(options?: {
 
     // Why: wait 2s for the CLI to initialize, then send `/usage\r`
     // directly without detecting the prompt character (see comment above).
-    setTimeout(() => {
+    startupDelayTimer = setTimeout(() => {
+      startupDelayTimer = null
       if (resolved) {
         return
       }
@@ -339,7 +368,7 @@ export async function fetchViaPty(options?: {
             stopDetected = true
             // Why: 2.0s settle time after detecting the stop substring
             // allows the full panel to finish rendering.
-            setTimeout(finalize, SETTLE_AFTER_STOP_MS)
+            stopSettleTimer = setTimeout(finalize, SETTLE_AFTER_STOP_MS)
             break
           }
         }
@@ -350,15 +379,8 @@ export async function fetchViaPty(options?: {
     }
 
     const onExitDisposable = term.onExit(() => {
-      disposeTermListeners()
-      if (claude21UsageSettleTimer) {
-        clearTimeout(claude21UsageSettleTimer)
-        claude21UsageSettleTimer = null
-      }
-      if (enterInterval) {
-        clearInterval(enterInterval)
-        enterInterval = null
-      }
+      cleanupHiddenRateLimitPty(term, termDisposables, { kill: false })
+      clearFollowupTimers()
       if (!resolved) {
         resolved = true
         clearTimeout(timeout)
@@ -369,7 +391,10 @@ export async function fetchViaPty(options?: {
           session,
           weekly,
           updatedAt: Date.now(),
-          error: session || weekly ? null : 'CLI exited before /usage rendered',
+          error:
+            session || weekly
+              ? null
+              : withMacTailscaleDnsHint('CLI exited before /usage rendered', clean),
           status: session || weekly ? 'ok' : 'error'
         })
       }

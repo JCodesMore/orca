@@ -1,10 +1,15 @@
+/* eslint-disable max-lines -- File Explorer toolbar and row tests share element-walking fixtures. */
 import { describe, expect, it, vi } from 'vitest'
 import { Ellipsis, ListCollapse, Loader2, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { DropdownMenuCheckboxItem } from '@/components/ui/dropdown-menu'
 import { WorktreeOpenInMenuItems } from '@/components/sidebar/WorktreeOpenInMenu'
 import { FileExplorerToolbar } from './FileExplorerToolbar'
-import { FileExplorerRow, shouldShowCollapseFolderAction } from './FileExplorerRow'
+import {
+  FileExplorerRow,
+  shouldShowCollapseFolderAction,
+  shouldShowFindInFolderAction
+} from './FileExplorerRow'
 import { FileExplorerVirtualRows } from './FileExplorerVirtualRows'
 import type { TreeNode } from './file-explorer-types'
 
@@ -89,6 +94,19 @@ function findGitIgnoredMenuItem(node: unknown): ReactElementLike {
   })
   if (!found) {
     throw new Error('git ignored menu item not found')
+  }
+  return found
+}
+
+function findDotfilesMenuItem(node: unknown): ReactElementLike {
+  let found: ReactElementLike | null = null
+  visit(node, (entry) => {
+    if (entry.type === DropdownMenuCheckboxItem && entry.props.children === 'Show Dotfiles') {
+      found = entry
+    }
+  })
+  if (!found) {
+    throw new Error('dotfiles menu item not found')
   }
   return found
 }
@@ -191,6 +209,8 @@ function makeToolbar(overrides: Partial<Parameters<typeof FileExplorerToolbar>[0
     showGitIgnoredFilesToggle: true,
     showGitIgnoredFiles: true,
     onToggleGitIgnoredFiles: vi.fn(),
+    showDotfiles: true,
+    onToggleDotfiles: vi.fn(),
     ...overrides
   })
 }
@@ -269,6 +289,17 @@ describe('FileExplorerToolbar', () => {
     expect(menuItem.props.checked).toBe(true)
   })
 
+  it('puts the dotfile visibility toggle in the overflow menu', () => {
+    const onToggleDotfiles = vi.fn()
+    const element = makeToolbar({ onToggleDotfiles, showDotfiles: false })
+
+    const menuItem = findDotfilesMenuItem(element)
+    ;(menuItem.props.onCheckedChange as () => void)()
+
+    expect(onToggleDotfiles).toHaveBeenCalledTimes(1)
+    expect(menuItem.props.checked).toBe(false)
+  })
+
   it('adds open-in launchers to the overflow menu', () => {
     const element = makeToolbar({ connectionId: 'ssh-1' })
 
@@ -323,6 +354,19 @@ describe('FileExplorerRow collapse folder action', () => {
     ).toBe(false)
   })
 
+  it('only shows find in folder for directories', () => {
+    expect(shouldShowFindInFolderAction(directoryNode)).toBe(true)
+    expect(
+      shouldShowFindInFolderAction({
+        ...directoryNode,
+        name: 'index.ts',
+        path: '/repo/src/index.ts',
+        relativePath: 'src/index.ts',
+        isDirectory: false
+      })
+    ).toBe(false)
+  })
+
   it('passes the row node to the collapse folder handler', () => {
     const onCollapseFolderSubtree = vi.fn()
     const element = FileExplorerVirtualRows({
@@ -352,8 +396,11 @@ describe('FileExplorerRow collapse folder action', () => {
       onStartNew: vi.fn(),
       onStartRename: vi.fn(),
       onDuplicate: vi.fn(),
+      onAddFolderAsProject: vi.fn(),
+      canAddFolderAsProject: () => false,
       onRequestDelete: vi.fn(),
       onCollapseFolderSubtree,
+      onFindInFolder: vi.fn(),
       onMoveDrop: vi.fn(),
       onDragTargetChange: vi.fn(),
       onDragSourceChange: vi.fn(),
@@ -369,5 +416,56 @@ describe('FileExplorerRow collapse folder action', () => {
     ;(row.props.onCollapseFolderSubtree as () => void)()
 
     expect(onCollapseFolderSubtree).toHaveBeenCalledWith(directoryNode)
+  })
+
+  it('passes the row node to the find in folder handler', () => {
+    const onFindInFolder = vi.fn()
+    const element = FileExplorerVirtualRows({
+      virtualizer: {
+        getTotalSize: () => 26,
+        getVirtualItems: () => [{ index: 0, key: 'src', start: 0 }],
+        measureElement: vi.fn()
+      } as never,
+      inlineInputIndex: -1,
+      flatRows: [directoryNode],
+      inlineInput: null,
+      handleInlineSubmit: vi.fn(),
+      dismissInlineInput: vi.fn(),
+      folderStatusByRelativePath: new Map(),
+      statusByRelativePath: new Map(),
+      ignoredByRelativePath: new Set(),
+      expanded: new Set([directoryNode.path]),
+      dirCache: {},
+      selectedPaths: new Set(),
+      activeFileId: null,
+      flashingPath: null,
+      deleteShortcutLabel: 'Del',
+      onClick: vi.fn(),
+      onDoubleClick: vi.fn(),
+      onContextMenuSelect: vi.fn(),
+      onCopyPaths: vi.fn(),
+      onStartNew: vi.fn(),
+      onStartRename: vi.fn(),
+      onDuplicate: vi.fn(),
+      onAddFolderAsProject: vi.fn(),
+      canAddFolderAsProject: () => false,
+      onRequestDelete: vi.fn(),
+      onCollapseFolderSubtree: vi.fn(),
+      onFindInFolder,
+      onMoveDrop: vi.fn(),
+      onDragTargetChange: vi.fn(),
+      onDragSourceChange: vi.fn(),
+      onDragExpandDir: vi.fn(),
+      onNativeDragTargetChange: vi.fn(),
+      onNativeDragExpandDir: vi.fn(),
+      dropTargetDir: null,
+      dragSourcePath: null,
+      nativeDropTargetDir: null
+    })
+
+    const row = findFileExplorerRow(element)
+    ;(row.props.onFindInFolder as () => void)()
+
+    expect(onFindInFolder).toHaveBeenCalledWith(directoryNode)
   })
 })

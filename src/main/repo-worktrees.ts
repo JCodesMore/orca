@@ -2,6 +2,13 @@ import type { GitWorktreeInfo, Repo } from '../shared/types'
 import { listWorktrees } from './git/worktree'
 import { isFolderRepo } from '../shared/repo-kind'
 import { getSshGitProvider } from './providers/ssh-git-dispatch'
+import { areWorktreePathsEqual } from './ipc/worktree-logic'
+
+export function isRepoRoot(repos: Repo[], resolvedTarget: string): boolean {
+  return repos.some(
+    (repo) => !repo.connectionId && areWorktreePathsEqual(repo.path, resolvedTarget)
+  )
+}
 
 export function createFolderWorktree(repo: Repo): GitWorktreeInfo {
   return {

@@ -5,25 +5,23 @@ import { computeVisibleWorktreeIds } from './visible-worktrees'
 
 type UseVisibleWorkspaceKanbanWorktreeIdsParams = {
   allWorktrees: readonly Worktree[]
-  activeWorktreeId: string | null
   repoMap: Map<string, Repo>
 }
 
 export function useVisibleWorkspaceKanbanWorktreeIds({
   allWorktrees,
-  activeWorktreeId,
   repoMap
 }: UseVisibleWorkspaceKanbanWorktreeIdsParams): ReadonlySet<string> {
   const worktreesByRepo = useAppStore((s) => s.worktreesByRepo)
-  const showActiveOnly = useAppStore((s) => s.showActiveOnly)
+  const showSleepingWorkspaces = useAppStore((s) => s.showSleepingWorkspaces)
   const hideDefaultBranchWorkspace = useAppStore((s) => s.hideDefaultBranchWorkspace)
   const filterRepoIds = useAppStore((s) => s.filterRepoIds)
   const activeSpaceId = useAppStore((s) => s.activeSpaceId)
   const repoSpaceAssignments = useAppStore((s) => s.repoSpaceAssignments)
-  const tabsByWorktree = useAppStore((s) => (showActiveOnly ? s.tabsByWorktree : null))
-  const ptyIdsByTabId = useAppStore((s) => (showActiveOnly ? s.ptyIdsByTabId : null))
+  const tabsByWorktree = useAppStore((s) => (!showSleepingWorkspaces ? s.tabsByWorktree : null))
+  const ptyIdsByTabId = useAppStore((s) => (!showSleepingWorkspaces ? s.ptyIdsByTabId : null))
   const browserTabsByWorktree = useAppStore((s) =>
-    showActiveOnly ? s.browserTabsByWorktree : null
+    !showSleepingWorkspaces ? s.browserTabsByWorktree : null
   )
 
   return useMemo(() => {
@@ -33,11 +31,10 @@ export function useVisibleWorkspaceKanbanWorktreeIds({
     return new Set(
       computeVisibleWorktreeIds(worktreesByRepo, sortedIds, {
         filterRepoIds,
-        showActiveOnly,
+        showSleepingWorkspaces,
         tabsByWorktree,
         ptyIdsByTabId,
         browserTabsByWorktree,
-        activeWorktreeId,
         hideDefaultBranchWorkspace,
         repoMap,
         activeSpaceId,
@@ -48,14 +45,13 @@ export function useVisibleWorkspaceKanbanWorktreeIds({
       })
     )
   }, [
-    activeWorktreeId,
     allWorktrees,
     browserTabsByWorktree,
     filterRepoIds,
     hideDefaultBranchWorkspace,
     ptyIdsByTabId,
     repoMap,
-    showActiveOnly,
+    showSleepingWorkspaces,
     tabsByWorktree,
     worktreesByRepo,
     activeSpaceId,

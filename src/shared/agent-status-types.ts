@@ -13,15 +13,19 @@ export type AgentStatusState = (typeof AGENT_STATUS_STATES)[number]
 // wants to pattern-match on common agents.
 export type WellKnownAgentType =
   | 'claude'
+  | 'openclaude'
   | 'codex'
   | 'gemini'
   | 'antigravity'
+  | 'amp'
   | 'opencode'
   | 'cursor'
   | 'copilot'
   | 'aider'
   | 'pi'
+  | 'omp'
   | 'droid'
+  | 'command-code'
   | 'grok'
   | 'hermes'
   | 'unknown'
@@ -52,6 +56,15 @@ export type AgentStateHistoryEntry = {
 /** Maximum number of history entries kept per agent to bound memory. */
 export const AGENT_STATE_HISTORY_MAX = 20
 
+export type AgentStatusOrchestrationContext = {
+  taskId: string
+  dispatchId: string
+  parentTerminalHandle?: string
+  parentPaneKey?: string
+  coordinatorHandle?: string
+  orchestrationRunId?: string
+}
+
 export type AgentStatusEntry = {
   state: AgentStatusState
   /** The user's most recent prompt, when the hook payload carried one.
@@ -69,6 +82,16 @@ export type AgentStatusEntry = {
   agentType?: AgentType
   /** Composite key: `${tabId}:${leafId}` where leafId is a stable UUID layout leaf. */
   paneKey: string
+  /** Runtime terminal handle for matching retained parent rows when the parent
+   *  pane key cannot be re-derived after terminal teardown. */
+  terminalHandle?: string
+  /** Worktree attribution stamped by main when a hook can be resolved there.
+   *  Why: orchestration workers can report status before their terminal tab is
+   *  present in a renderer; retaining this lets worktree-level UI still show
+   *  the live child agent instead of dropping it as unattributed. */
+  worktreeId?: string
+  /** Tab attribution from the hook IPC payload, when available. */
+  tabId?: string
   terminalTitle?: string
   /** Rolling log of previous states. Each entry records a state the agent was in
    *  before transitioning to the current one. Capped at AGENT_STATE_HISTORY_MAX. */
@@ -86,6 +109,10 @@ export type AgentStatusEntry = {
    *  cancelled it. Undefined while the agent is working or when no interrupt
    *  signal was available. */
   interrupted?: boolean
+  /** Orchestration dispatch context for agent panes spawned by another agent.
+   *  Why: parent/child agent hierarchy is pane-level state, not worktree
+   *  lineage; workers often run in the same worktree as their coordinator. */
+  orchestration?: AgentStatusOrchestrationContext
 }
 
 export type MigrationUnsupportedPtyEntry = {
@@ -132,6 +159,7 @@ export type ParsedAgentStatusPayload = Omit<AgentStatusPayload, 'prompt'> & { pr
  */
 export type AgentStatusIpcPayload = ParsedAgentStatusPayload & {
   paneKey: string
+  terminalHandle?: string
   tabId?: string
   worktreeId?: string
   /** Identifies the SSH connection the event arrived on, or null for local.
@@ -143,6 +171,7 @@ export type AgentStatusIpcPayload = ParsedAgentStatusPayload & {
   receivedAt: number
   /** Timestamp (ms) when the current state first appeared for this pane. */
   stateStartedAt: number
+  orchestration?: AgentStatusOrchestrationContext
 }
 
 /** Maximum character length for the prompt field. Truncated on parse. */

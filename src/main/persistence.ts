@@ -10,16 +10,18 @@ import {
   renameSync,
   unlinkSync,
   copyFileSync,
-  statSync
+  statSync,
+  realpathSync
 } from 'fs'
 import { writeFile, rename, mkdir, rm, copyFile } from 'fs/promises'
-import { join, dirname } from 'path'
+import { join, dirname, isAbsolute, resolve, sep } from 'path'
 import { homedir } from 'os'
 import { randomUUID } from 'node:crypto'
 import type {
   Automation,
   AutomationCreateInput,
   AutomationDispatchResult,
+  AutomationPrecheckResult,
   AutomationRunOutputSnapshot,
   AutomationRun,
   AutomationRunTrigger,
@@ -29,13 +31,16 @@ import {
   latestAutomationOccurrenceAtOrBefore,
   nextAutomationOccurrenceAfter
 } from '../shared/automation-schedules'
+import { normalizeAutomationPrecheck } from '../shared/automation-precheck'
 import type {
   PersistedState,
   Repo,
+  ProjectGroup,
   SparsePreset,
   WorktreeMeta,
   WorktreeLineage,
   GlobalSettings,
+  OrcaWorkspaceLayout,
   NotificationSettings,
   OnboardingChecklistState,
   OnboardingOutcome,
@@ -44,6 +49,7 @@ import type {
   TerminalPaneLayoutNode,
   TerminalLayoutSnapshot,
   TerminalTab,
+  WorkspaceSessionPatch,
   WorkspaceSessionState
 } from '../shared/types'
 import type { MigrationUnsupportedPtyEntry } from '../shared/agent-status-types'
@@ -58,10 +64,12 @@ import {
   getDefaultUIState,
   getDefaultRepoHookSettings,
   getDefaultWorkspaceSession,
+  normalizeAgentActivityDisplayMode,
   normalizeWorktreeCardProperties,
   ONBOARDING_FINAL_STEP
 } from '../shared/constants'
 import { parseWorkspaceSession } from '../shared/workspace-session-schema'
+import { toRelaySshPtyId } from './providers/ssh-pty-id'
 import {
   isTerminalLeafId,
   makePaneKey,
@@ -76,17 +84,42 @@ import { agentHookServer } from './agent-hooks/server'
 import { pruneLocalTerminalScrollbackBuffers } from '../shared/workspace-session-terminal-buffers'
 import { pruneWorkspaceSessionBrowserHistory } from '../shared/workspace-session-browser-history'
 import { getRepoIdFromWorktreeId, getWorktreePathBasenameFromId } from '../shared/worktree-id'
+import { normalizeRuntimePathForComparison } from '../shared/cross-platform-path'
 import { normalizeTerminalQuickCommands } from '../shared/terminal-quick-commands'
-import { normalizeVisibleTaskProviders } from '../shared/task-providers'
+import { normalizeTaskProviderSettings } from '../shared/task-providers'
 import { normalizeOpenInApplications } from '../shared/open-in-applications'
+import { normalizeTerminalShortcutPolicy } from '../shared/keybindings'
+import {
+  normalizeFeatureInteractions,
+  type FeatureInteractionId
+} from '../shared/feature-interactions'
+import { normalizeFeatureTipIds } from '../shared/feature-tips'
 import {
   DEFAULT_WORKSPACE_STATUS_ID,
   clampWorkspaceBoardColumnWidth,
   clampWorkspaceBoardOpacity,
-  normalizeWorkspaceBoardCompact,
   normalizePersistedWorkspaceStatuses,
   normalizeWorkspaceStatuses
 } from '../shared/workspace-statuses'
+import { isLegacyRepoForExternalWorktreeVisibility } from '../shared/worktree-ownership'
+import { sanitizeRepoIcon } from '../shared/repo-icon'
+import { normalizeRepoBadgeColor } from '../shared/repo-badge-color'
+import {
+  clearMissingProjectGroupMemberships,
+  createProjectGroup,
+  getNextProjectGroupOrder,
+  getProjectGroupSubtreeIds,
+  normalizeProjectGroupName,
+  normalizeProjectGroups
+} from '../shared/project-groups'
+import {
+  mergeLegacyCommitMessageAiIntoSourceControlAi,
+  normalizeRepoSourceControlAiOverrides,
+  normalizeSourceControlAiSettings,
+  projectSourceControlAiToLegacyCommitMessageAi,
+  sourceControlAiSettingsFromLegacy
+} from '../shared/source-control-ai'
+import { normalizeDisabledTuiAgents } from '../shared/tui-agent-selection'
 
 function encrypt(plaintext: string): string {
   if (!plaintext || !safeStorage.isEncryptionAvailable()) {
@@ -157,9 +190,53 @@ function getDataFile(): string {
 // >=1-hour spacing cover recent work without churning disk on every debounce.
 const BACKUP_COUNT = 5
 const BACKUP_MIN_INTERVAL_MS = 60 * 60 * 1000
+const WORKSPACE_SESSION_PATCH_FULL_NORMALIZATION_KEYS = new Set<keyof WorkspaceSessionState>([
+  'tabsByWorktree',
+  'terminalLayoutsByTabId'
+])
+
+function workspaceSessionPatchNeedsFullNormalization(patch: WorkspaceSessionPatch): boolean {
+  return Object.keys(patch).some((key) =>
+    WORKSPACE_SESSION_PATCH_FULL_NORMALIZATION_KEYS.has(key as keyof WorkspaceSessionState)
+  )
+}
 
 function backupPath(dataFile: string, index: number): string {
   return `${dataFile}.bak.${index}`
+}
+
+function buildWorkspaceDirHistoryForUpdate(
+  current: GlobalSettings,
+  updates: Partial<GlobalSettings>
+): OrcaWorkspaceLayout[] | null {
+  if (!('workspaceDir' in updates) && !('nestWorkspaces' in updates)) {
+    return null
+  }
+  const nextPath = updates.workspaceDir ?? current.workspaceDir
+  const nextNestWorkspaces = updates.nestWorkspaces ?? current.nestWorkspaces
+  if (
+    normalizeRuntimePathForComparison(nextPath) ===
+      normalizeRuntimePathForComparison(current.workspaceDir) &&
+    nextNestWorkspaces === current.nestWorkspaces
+  ) {
+    return null
+  }
+
+  const previousLayout = {
+    path: current.workspaceDir,
+    nestWorkspaces: current.nestWorkspaces
+  }
+  const existing = current.workspaceDirHistory ?? []
+  const next = [...existing]
+  const previousKey = getWorkspaceLayoutHistoryKey(previousLayout)
+  if (!next.some((layout) => getWorkspaceLayoutHistoryKey(layout) === previousKey)) {
+    next.push(previousLayout)
+  }
+  return next
+}
+
+function getWorkspaceLayoutHistoryKey(layout: OrcaWorkspaceLayout): string {
+  return `${normalizeRuntimePathForComparison(layout.path)}:${layout.nestWorkspaces}`
 }
 
 function normalizeGroupBy(groupBy: unknown): PersistedState['ui']['groupBy'] {
@@ -177,17 +254,102 @@ function normalizeGroupBy(groupBy: unknown): PersistedState['ui']['groupBy'] {
   return getDefaultUIState().groupBy
 }
 
-function normalizeSortBy(sortBy: unknown): 'name' | 'smart' | 'recent' | 'repo' {
-  if (sortBy === 'smart' || sortBy === 'recent' || sortBy === 'repo' || sortBy === 'name') {
+function normalizeShowDotfilesByWorktree(value: unknown): Record<string, boolean> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return {}
+  }
+  const out: Record<string, boolean> = {}
+  for (const [worktreeId, showDotfiles] of Object.entries(value as Record<string, unknown>)) {
+    if (
+      !worktreeId ||
+      worktreeId === '__proto__' ||
+      worktreeId === 'constructor' ||
+      worktreeId === 'prototype' ||
+      typeof showDotfiles !== 'boolean'
+    ) {
+      continue
+    }
+    out[worktreeId] = showDotfiles
+  }
+  return out
+}
+
+function mergeFeatureInteractions(
+  current: PersistedState['ui']['featureInteractions'],
+  incoming: PersistedState['ui']['featureInteractions']
+): PersistedState['ui']['featureInteractions'] {
+  const currentNormalized = normalizeFeatureInteractions(current)
+  const incomingNormalized = normalizeFeatureInteractions(incoming)
+  const merged = { ...currentNormalized }
+  for (const [id, incomingRecord] of Object.entries(incomingNormalized)) {
+    const currentRecord = currentNormalized[id as keyof typeof currentNormalized]
+    merged[id as keyof typeof merged] = currentRecord
+      ? {
+          firstInteractedAt: Math.min(
+            currentRecord.firstInteractedAt,
+            incomingRecord.firstInteractedAt
+          ),
+          interactionCount: Math.max(
+            currentRecord.interactionCount,
+            incomingRecord.interactionCount
+          )
+        }
+      : incomingRecord
+  }
+  return merged
+}
+
+function normalizeSortBy(sortBy: unknown): PersistedState['ui']['sortBy'] {
+  if (
+    sortBy === 'smart' ||
+    sortBy === 'recent' ||
+    sortBy === 'repo' ||
+    sortBy === 'name' ||
+    sortBy === 'manual'
+  ) {
     return sortBy
   }
   return getDefaultUIState().sortBy
+}
+
+function normalizeRightSidebarTab(tab: unknown): PersistedState['ui']['rightSidebarTab'] {
+  if (
+    tab === 'explorer' ||
+    tab === 'search' ||
+    tab === 'source-control' ||
+    tab === 'checks' ||
+    tab === 'ports'
+  ) {
+    return tab
+  }
+  return getDefaultUIState().rightSidebarTab
 }
 
 function normalizeNotificationSettings(value: unknown): NotificationSettings {
   const defaults = getDefaultNotificationSettings()
   const candidate =
     value && typeof value === 'object' ? (value as Partial<NotificationSettings>) : {}
+  const rawSoundId = (candidate as { customSoundId?: unknown }).customSoundId
+  const customSoundId =
+    rawSoundId === 'system' ||
+    rawSoundId === 'two-tone' ||
+    rawSoundId === 'bong' ||
+    rawSoundId === 'thump' ||
+    rawSoundId === 'blip' ||
+    rawSoundId === 'sonar' ||
+    rawSoundId === 'blop' ||
+    rawSoundId === 'ding' ||
+    rawSoundId === 'clack' ||
+    rawSoundId === 'beep' ||
+    rawSoundId === 'custom'
+      ? rawSoundId
+      : rawSoundId === 'orca' || rawSoundId === 'chime'
+        ? 'two-tone'
+        : rawSoundId === 'pop'
+          ? 'blop'
+          : typeof candidate.customSoundPath === 'string'
+            ? 'custom'
+            : defaults.customSoundId
   const rawVolume = candidate.customSoundVolume
   const customSoundVolume =
     typeof rawVolume === 'number' && Number.isFinite(rawVolume)
@@ -196,6 +358,7 @@ function normalizeNotificationSettings(value: unknown): NotificationSettings {
   return {
     ...defaults,
     ...candidate,
+    customSoundId,
     customSoundVolume
   }
 }
@@ -226,17 +389,78 @@ function normalizeAutomationRunOutputSnapshot(
   }
 }
 
+function normalizeAutomationPrecheckResult(
+  value: AutomationPrecheckResult | null | undefined
+): AutomationPrecheckResult | null {
+  if (!value || typeof value.command !== 'string' || !value.command.trim()) {
+    return null
+  }
+  const startedAt =
+    typeof value.startedAt === 'number' && Number.isFinite(value.startedAt)
+      ? value.startedAt
+      : Date.now()
+  const completedAt =
+    typeof value.completedAt === 'number' && Number.isFinite(value.completedAt)
+      ? value.completedAt
+      : startedAt
+  return {
+    command: value.command.trim(),
+    exitCode:
+      typeof value.exitCode === 'number' && Number.isFinite(value.exitCode) ? value.exitCode : null,
+    timedOut: value.timedOut === true,
+    durationMs:
+      typeof value.durationMs === 'number' && Number.isFinite(value.durationMs)
+        ? Math.max(0, value.durationMs)
+        : Math.max(0, completedAt - startedAt),
+    stdout: typeof value.stdout === 'string' ? value.stdout : '',
+    stderr: typeof value.stderr === 'string' ? value.stderr : '',
+    stdoutTruncated: value.stdoutTruncated === true,
+    stderrTruncated: value.stderrTruncated === true,
+    error: typeof value.error === 'string' && value.error.trim() ? value.error : null,
+    startedAt,
+    completedAt
+  }
+}
+
 function normalizeAutomationSessionReuse(automation: Automation): Automation {
   return {
     ...automation,
+    precheck: normalizeAutomationPrecheck(automation.precheck),
     reuseSession: automation.workspaceMode === 'existing' && automation.reuseSession === true
   }
+}
+
+type LegacySshTarget = SshTarget & {
+  remoteWorkspaceSyncEnabled?: unknown
+  remoteWorkspaceSyncGracePeriodSeconds?: unknown
 }
 
 // Why: old persisted targets predate configHost. Default to label-based lookup
 // so imported SSH aliases keep resolving through ssh -G after upgrade.
 function normalizeSshTarget(t: SshTarget): SshTarget {
-  return { ...t, configHost: t.configHost ?? t.label ?? t.host }
+  const target = { ...(t as LegacySshTarget) }
+  const legacySyncEnabled = target.remoteWorkspaceSyncEnabled
+  const currentGracePeriodSeconds = target.relayGracePeriodSeconds
+  const legacyGracePeriodSeconds = target.remoteWorkspaceSyncGracePeriodSeconds
+  // Why: remote workspace sync now follows the SSH relay lifecycle, so the
+  // retired per-target sync opt-out and grace-period fields stop at disk load.
+  delete target.remoteWorkspaceSyncEnabled
+  delete target.remoteWorkspaceSyncGracePeriodSeconds
+  delete target.relayGracePeriodSeconds
+  // Why: synced legacy targets ignored stale relayGracePeriodSeconds values.
+  // Prefer the synced grace so a user's "unlimited" (0) survives migration.
+  const relayGracePeriodSeconds =
+    legacySyncEnabled === true && typeof legacyGracePeriodSeconds === 'number'
+      ? legacyGracePeriodSeconds
+      : currentGracePeriodSeconds
+  const normalized: SshTarget = {
+    ...target,
+    configHost: target.configHost ?? target.label ?? target.host
+  }
+  if (relayGracePeriodSeconds !== undefined) {
+    normalized.relayGracePeriodSeconds = relayGracePeriodSeconds
+  }
+  return normalized
 }
 
 // Why: shared by load-time merge and the IPC update handler so the same
@@ -319,6 +543,106 @@ function readDeprecatedExperimentFlag(parsed: PersistedState | undefined): boole
 
 function readLegacySidekickFlag(parsed: PersistedState | undefined): boolean | undefined {
   return (parsed?.settings as { experimentalSidekick?: boolean } | undefined)?.experimentalSidekick
+}
+
+function sanitizeRepoUpdatesForPersistence<
+  T extends Partial<Pick<Repo, 'badgeColor' | 'repoIcon' | 'worktreeBasePath'>>
+>(updates: T): T {
+  const sanitized = { ...updates }
+  if ('badgeColor' in sanitized) {
+    const badgeColor = normalizeRepoBadgeColor(sanitized.badgeColor)
+    if (!badgeColor) {
+      delete sanitized.badgeColor
+    } else {
+      sanitized.badgeColor = badgeColor
+    }
+  }
+  if ('repoIcon' in sanitized) {
+    const repoIcon = sanitizeRepoIcon(sanitized.repoIcon)
+    if (repoIcon === undefined) {
+      delete sanitized.repoIcon
+    } else {
+      sanitized.repoIcon = repoIcon
+    }
+  }
+  if ('worktreeBasePath' in sanitized && sanitized.worktreeBasePath !== undefined) {
+    if (typeof sanitized.worktreeBasePath === 'string') {
+      sanitized.worktreeBasePath = sanitized.worktreeBasePath.trim() || undefined
+    } else {
+      delete sanitized.worktreeBasePath
+    }
+  }
+  return sanitized
+}
+
+function expandFloatingWorkspaceHomePath(input: string, home: string): string {
+  if (input === '~') {
+    return home
+  }
+  if (input.startsWith(`~${sep}`) || (process.platform === 'win32' && input.startsWith('~/'))) {
+    return join(home, input.slice(2))
+  }
+  return input
+}
+
+function resolveFloatingWorkspacePath(input: string, home: string): string {
+  const expanded = expandFloatingWorkspaceHomePath(input, home)
+  return isAbsolute(expanded) ? resolve(expanded) : resolve(home, expanded)
+}
+
+function canonicalizePersistedFloatingWorkspaceDirectory(
+  input: string,
+  home: string
+): string | null {
+  const trimmed = input.trim()
+  if (!trimmed) {
+    return null
+  }
+  try {
+    const canonicalPath = resolve(realpathSync(resolveFloatingWorkspacePath(trimmed, home)))
+    return statSync(canonicalPath).isDirectory() ? canonicalPath : null
+  } catch {
+    return null
+  }
+}
+
+function normalizeFloatingWorkspaceTrustedCwds(
+  input: unknown,
+  home: string
+): { trustedCwds: string[]; changed: boolean } {
+  const rawTrustedCwds = Array.isArray(input) ? input : []
+  const trustedCwds: string[] = []
+  const seen = new Set<string>()
+  let changed = input !== undefined && !Array.isArray(input)
+
+  for (const rawTrustedCwd of rawTrustedCwds) {
+    if (typeof rawTrustedCwd !== 'string') {
+      changed = true
+      continue
+    }
+    const trimmedTrustedCwd = rawTrustedCwd.trim()
+    if (!trimmedTrustedCwd) {
+      changed = true
+      continue
+    }
+    const canonicalPath = canonicalizePersistedFloatingWorkspaceDirectory(trimmedTrustedCwd, home)
+    const normalizedPath = canonicalPath ?? resolveFloatingWorkspacePath(trimmedTrustedCwd, home)
+    if (!normalizedPath) {
+      changed = true
+      continue
+    }
+    if (seen.has(normalizedPath)) {
+      changed = true
+      continue
+    }
+    seen.add(normalizedPath)
+    trustedCwds.push(normalizedPath)
+    if (rawTrustedCwd !== normalizedPath) {
+      changed = true
+    }
+  }
+
+  return { trustedCwds, changed }
 }
 
 function normalizeSshRemotePtyLease(value: unknown): SshRemotePtyLease | null {
@@ -764,8 +1088,14 @@ function normalizeWorkspaceSessionPaneIdentities(
       normalizedLayout: normalized.snapshot,
       leafIdByInputLeafId: normalized.leafIdByInputLeafId
     })
-    migrationUnsupportedEntries.push(...migrationEntries.migrationUnsupportedEntries)
-    legacyPaneKeyAliasEntries.push(...migrationEntries.legacyPaneKeyAliasEntries)
+    // Why: old persisted split layouts can generate enough alias rows to
+    // exceed V8's argument limit if the arrays are spread into push().
+    for (const entry of migrationEntries.migrationUnsupportedEntries) {
+      migrationUnsupportedEntries.push(entry)
+    }
+    for (const entry of migrationEntries.legacyPaneKeyAliasEntries) {
+      legacyPaneKeyAliasEntries.push(entry)
+    }
     const leafIdByPtyId = new Map<string, string>()
     const duplicatePtyIds = new Set<string>()
     for (const [leafId, ptyId] of Object.entries(normalized.snapshot.ptyIdsByLeafId ?? {})) {
@@ -1058,6 +1388,13 @@ export class Store {
   private writeGeneration = 0
   private gitUsernameCache = new Map<string, string>()
   private loadNeedsSave = false
+  private settingsChangeListeners = new Set<
+    (
+      updates: Partial<GlobalSettings>,
+      settings: GlobalSettings,
+      originWebContentsId?: number
+    ) => void
+  >()
 
   constructor() {
     const loaded = this.load()
@@ -1196,17 +1533,34 @@ export class Store {
         const raw = readFileSync(dataFile, 'utf-8')
         const parsed = JSON.parse(raw) as PersistedState
 
-        // Why: opencodeSessionCookie is stored encrypted on disk via safeStorage.
+        // Why: secret settings are stored encrypted on disk via safeStorage.
         // Decrypt at the load boundary so the rest of the app sees plaintext.
         if (parsed.settings?.opencodeSessionCookie) {
           parsed.settings.opencodeSessionCookie = decrypt(parsed.settings.opencodeSessionCookie)
+        }
+        if (parsed.settings?.httpProxyUrl) {
+          parsed.settings.httpProxyUrl = decrypt(parsed.settings.httpProxyUrl)
         }
         if (parsed.ui?.browserKagiSessionLink) {
           parsed.ui.browserKagiSessionLink = decryptOptionalSecret(parsed.ui.browserKagiSessionLink)
         }
 
         // Merge with defaults in case new fields were added
-        const defaults = getDefaultPersistedState(homedir())
+        const homeDir = homedir()
+        const defaults = getDefaultPersistedState(homeDir)
+        const rawSourceControlAiMissing = parsed.settings?.sourceControlAi === undefined
+        if (rawSourceControlAiMissing) {
+          this.loadNeedsSave = true
+        }
+        const legacyCommitMessageAi = parsed.settings?.commitMessageAi
+        const migratedSourceControlAi = rawSourceControlAiMissing
+          ? sourceControlAiSettingsFromLegacy(
+              legacyCommitMessageAi ?? defaults.settings.commitMessageAi
+            )
+          : mergeLegacyCommitMessageAiIntoSourceControlAi(
+              parsed.settings?.sourceControlAi,
+              legacyCommitMessageAi
+            )
         // Why: before the layout-aware 'auto' mode shipped (issue #903),
         // terminalMacOptionAsAlt defaulted to 'true' globally. That silently
         // broke Option-layer characters (@ on Turkish via Option+Q, @ on
@@ -1235,6 +1589,52 @@ export class Store {
         const migratedFloatingTerminalEnabled = floatingTerminalDefaultedForAllUsers
           ? (parsed.settings?.floatingTerminalEnabled ?? true)
           : true
+        const floatingTerminalCwdMigrated =
+          parsed.settings?.floatingTerminalCwdMigratedToAppWorkspace === true
+        // Why: an earlier migration wrote '' for the default app-owned notes
+        // directory. Floating terminals should still open at home by default;
+        // markdown notes resolve their app-owned directory through a separate IPC.
+        const migratedFloatingTerminalCwd = floatingTerminalCwdMigrated
+          ? !parsed.settings?.floatingTerminalCwd
+            ? defaults.settings.floatingTerminalCwd
+            : parsed.settings.floatingTerminalCwd
+          : parsed.settings?.floatingTerminalCwd === undefined
+            ? defaults.settings.floatingTerminalCwd
+            : parsed.settings.floatingTerminalCwd
+        const normalizedFloatingTerminalTrustedCwds = normalizeFloatingWorkspaceTrustedCwds(
+          parsed.settings?.floatingTerminalTrustedCwds,
+          homeDir
+        )
+        const migratedFloatingTerminalTrustedCwds = [
+          ...normalizedFloatingTerminalTrustedCwds.trustedCwds
+        ]
+        const rawLegacyFloatingTerminalCwd = parsed.settings?.floatingTerminalCwd
+        const shouldTrustLegacyFloatingTerminalCwd =
+          !floatingTerminalCwdMigrated &&
+          typeof rawLegacyFloatingTerminalCwd === 'string' &&
+          rawLegacyFloatingTerminalCwd.trim().length > 0 &&
+          rawLegacyFloatingTerminalCwd.trim() !== '~'
+        if (!floatingTerminalCwdMigrated) {
+          this.loadNeedsSave = true
+        }
+        if (shouldTrustLegacyFloatingTerminalCwd && rawLegacyFloatingTerminalCwd) {
+          const canonicalLegacyCwd = canonicalizePersistedFloatingWorkspaceDirectory(
+            rawLegacyFloatingTerminalCwd,
+            homeDir
+          )
+          if (
+            canonicalLegacyCwd &&
+            !migratedFloatingTerminalTrustedCwds.includes(canonicalLegacyCwd)
+          ) {
+            // Why: pre-grant profiles with an explicit Floating Workspace cwd
+            // already represented user intent; migrate only that legacy value.
+            migratedFloatingTerminalTrustedCwds.push(canonicalLegacyCwd)
+            normalizedFloatingTerminalTrustedCwds.changed = true
+          }
+        }
+        if (normalizedFloatingTerminalTrustedCwds.changed) {
+          this.loadNeedsSave = true
+        }
         const experimentalActivityDefaultedOffForAllUsers =
           parsed.settings?.experimentalActivityDefaultedOffForAllUsers === true
         // Why: the Agents view moved back behind Experimental. Flip every
@@ -1242,9 +1642,30 @@ export class Store {
         const migratedExperimentalActivity = experimentalActivityDefaultedOffForAllUsers
           ? (parsed.settings?.experimentalActivity ?? false)
           : false
+        const taskProviderSettings = normalizeTaskProviderSettings({
+          visibleTaskProviders: parsed.settings?.visibleTaskProviders,
+          defaultTaskSource: parsed.settings?.defaultTaskSource
+        })
+        const primarySelectionDefaultedForLinux =
+          parsed.settings?.primarySelectionMiddleClickPasteDefaultedForLinux === true
+        const primarySelectionDefaultedForTerminalDefaults =
+          parsed.settings?.primarySelectionMiddleClickPasteDefaultedForTerminalDefaults === true
+        const primarySelectionPlatformDefaultEnabled =
+          defaults.settings.primarySelectionMiddleClickPaste === true
+        const primarySelectionAlreadyDefaultedForPlatform =
+          primarySelectionDefaultedForTerminalDefaults ||
+          (process.platform === 'linux' && primarySelectionDefaultedForLinux)
+        const migratePrimarySelectionPlatformDefault =
+          primarySelectionPlatformDefaultEnabled && !primarySelectionAlreadyDefaultedForPlatform
+        const stampPrimarySelectionTerminalDefaults =
+          primarySelectionPlatformDefaultEnabled && !primarySelectionDefaultedForTerminalDefaults
+        if (migratePrimarySelectionPlatformDefault || stampPrimarySelectionTerminalDefaults) {
+          this.loadNeedsSave = true
+        }
         result = {
           ...defaults,
           ...parsed,
+          projectGroups: normalizeProjectGroups(parsed.projectGroups),
           worktreeLineageById: parsed.worktreeLineageById ?? {},
           settings: {
             ...defaults.settings,
@@ -1253,20 +1674,46 @@ export class Store {
             // the old persisted flag forward once so enabled users don't lose it.
             experimentalPet:
               parsed.settings?.experimentalPet ?? readLegacySidekickFlag(parsed) ?? false,
+            // Why: early primary-selection builds saved the disabled default.
+            // Flip Linux/macOS profiles once so terminal-style defaults match
+            // platform convention; the guards preserve future opt-outs.
+            primarySelectionMiddleClickPaste: migratePrimarySelectionPlatformDefault
+              ? true
+              : (parsed.settings?.primarySelectionMiddleClickPaste ??
+                defaults.settings.primarySelectionMiddleClickPaste),
+            primarySelectionMiddleClickPasteDefaultedForLinux:
+              primarySelectionDefaultedForLinux ||
+              (process.platform === 'linux' && migratePrimarySelectionPlatformDefault),
+            primarySelectionMiddleClickPasteDefaultedForTerminalDefaults:
+              primarySelectionDefaultedForTerminalDefaults || stampPrimarySelectionTerminalDefaults,
             experimentalActivity: migratedExperimentalActivity,
             experimentalActivityDefaultedOffForAllUsers: true,
             terminalMacOptionAsAlt: migratedOptionAsAlt,
             terminalMacOptionAsAltMigrated: true,
             floatingTerminalEnabled: migratedFloatingTerminalEnabled,
             floatingTerminalDefaultedForAllUsers: true,
+            floatingTerminalCwd: migratedFloatingTerminalCwd,
+            floatingTerminalTrustedCwds: migratedFloatingTerminalTrustedCwds,
+            floatingTerminalCwdMigratedToAppWorkspace: true,
             terminalQuickCommands: normalizeTerminalQuickCommands(
               parsed.settings?.terminalQuickCommands
             ),
-            visibleTaskProviders: normalizeVisibleTaskProviders(
-              parsed.settings?.visibleTaskProviders
+            defaultTaskSource: taskProviderSettings.defaultTaskSource,
+            visibleTaskProviders: taskProviderSettings.visibleTaskProviders,
+            terminalShortcutPolicy: normalizeTerminalShortcutPolicy(
+              parsed.settings?.terminalShortcutPolicy
             ),
+            disabledTuiAgents: normalizeDisabledTuiAgents(parsed.settings?.disabledTuiAgents),
             openInApplications: normalizeOpenInApplications(parsed.settings?.openInApplications),
             notifications: normalizeNotificationSettings(parsed.settings?.notifications),
+            sourceControlAi: migratedSourceControlAi,
+            // Why: new builds read sourceControlAi, but rollback builds still
+            // write commitMessageAi; after merging those writes, refresh the
+            // legacy projection for continued rollback compatibility.
+            commitMessageAi: projectSourceControlAiToLegacyCommitMessageAi(
+              migratedSourceControlAi,
+              parsed.settings?.commitMessageAi ?? defaults.settings.commitMessageAi
+            ),
             voice: {
               ...getDefaultVoiceSettings(),
               ...parsed.settings?.voice
@@ -1282,6 +1729,15 @@ export class Store {
             const rawSort = parsed.ui?.sortBy
             const sort = normalizeSortBy(rawSort)
             const migrate = !parsed.ui?._sortBySmartMigrated && rawSort === 'recent'
+            const rightSidebarOpen =
+              typeof parsed.ui?.rightSidebarOpen === 'boolean'
+                ? parsed.ui.rightSidebarOpen
+                : typeof parsed.settings?.rightSidebarOpenByDefault === 'boolean'
+                  ? parsed.settings.rightSidebarOpenByDefault
+                  : defaults.ui.rightSidebarOpen
+            if (typeof parsed.ui?.rightSidebarOpen !== 'boolean') {
+              this.loadNeedsSave = true
+            }
             const workspaceStatusesDefaultOrderMigrated =
               parsed.ui?._workspaceStatusesDefaultOrderMigrated === true
             // Why: the default workflow changed to Done -> Review -> Progress -> Todo.
@@ -1337,6 +1793,8 @@ export class Store {
             // depend on the deprecated value continuing to round-trip.
             const rawCardProps = parsed.ui?.worktreeCardProperties
             const inlineAgentsMigrated = parsed.ui?._inlineAgentsDefaultedForAllUsers === true
+            const expandedCardPropsMigrated =
+              parsed.ui?._expandedWorktreeCardPropertiesDefaulted === true
             const hadExperimentOn = readDeprecatedExperimentFlag(parsed)
             const deliberateUncheck =
               hadExperimentOn &&
@@ -1354,22 +1812,46 @@ export class Store {
               const candidate = needsInlineAgentsMigration
                 ? [...rawCardProps, 'inline-agents' as const]
                 : rawCardProps
-              // Why: only Agent activity remains configurable; older hidden
-              // card fields must be restored because users can no longer
-              // toggle them back on from the sidebar menu.
-              const normalized = normalizeWorktreeCardProperties(candidate)
+              const expandedCandidate = (() => {
+                if (expandedCardPropsMigrated) {
+                  return candidate
+                }
+                const next = [...candidate]
+                // Why: Linear used to be controlled by the generic issue
+                // property and Ports were always visible. Add the split-out
+                // properties once so existing cards keep their prior surface.
+                if (candidate.includes('issue') && !candidate.includes('linear-issue')) {
+                  next.push('linear-issue' as const)
+                }
+                if (!candidate.includes('ports')) {
+                  next.push('ports' as const)
+                }
+                return next
+              })()
+              const normalized = normalizeWorktreeCardProperties(expandedCandidate)
               const changed =
                 normalized.length !== rawCardProps.length ||
                 normalized.some((property, index) => property !== rawCardProps[index])
               return changed ? normalized : undefined
             })()
-            if (migratedCardProps !== undefined || !inlineAgentsMigrated) {
+            if (
+              migratedCardProps !== undefined ||
+              !inlineAgentsMigrated ||
+              !expandedCardPropsMigrated
+            ) {
               this.loadNeedsSave = true
             }
             return {
               ...defaults.ui,
               ...parsed.ui,
+              // Why: migrate once from the retired Appearance setting only
+              // when no explicit persisted chrome preference exists yet.
+              rightSidebarOpen,
+              rightSidebarTab: normalizeRightSidebarTab(parsed.ui?.rightSidebarTab),
               sortBy: migrate ? ('smart' as const) : sort,
+              showDotfilesByWorktree: normalizeShowDotfilesByWorktree(
+                parsed.ui?.showDotfilesByWorktree
+              ),
               workspaceStatuses,
               _workspaceStatusesDefaultOrderMigrated: true,
               _workspaceStatusesDefaultWorkflowMigrated: true,
@@ -1382,7 +1864,8 @@ export class Store {
               // a rollback to a pre-default-on build that still reads it.
               // The new flag is the one that actually gates the migration.
               _inlineAgentsDefaultedForExperiment: true,
-              _inlineAgentsDefaultedForAllUsers: true
+              _inlineAgentsDefaultedForAllUsers: true,
+              _expandedWorktreeCardPropertiesDefaulted: true
             }
           })(),
           // Why: the workspace session is the most volatile persisted surface
@@ -1481,6 +1964,7 @@ export class Store {
 
     result = {
       ...result,
+      repos: clearMissingProjectGroupMemberships(result.repos, result.projectGroups ?? []),
       workspaceSession: pruneWorkspaceSessionBrowserHistory(
         pruneLocalTerminalScrollbackBuffers(result.workspaceSession, result.repos)
       )
@@ -1587,13 +2071,14 @@ export class Store {
     await mkdir(dir, { recursive: true }).catch(() => {})
     const tmpFile = `${dataFile}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`
 
-    // Why: opencodeSessionCookie must be encrypted on disk. Clone state so
-    // the in-memory this.state stays plaintext for the rest of the app.
+    // Why: secrets must be encrypted on disk. Clone state so the in-memory
+    // this.state stays plaintext for the rest of the app.
     const stateToSave = {
       ...this.state,
       settings: {
         ...this.state.settings,
-        opencodeSessionCookie: encrypt(this.state.settings.opencodeSessionCookie)
+        opencodeSessionCookie: encrypt(this.state.settings.opencodeSessionCookie),
+        httpProxyUrl: encrypt(this.state.settings.httpProxyUrl ?? '')
       },
       ui: {
         ...this.state.ui,
@@ -1641,13 +2126,14 @@ export class Store {
     }
     const tmpFile = `${dataFile}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`
 
-    // Why: opencodeSessionCookie must be encrypted on disk. Clone state so
-    // the in-memory this.state stays plaintext for the rest of the app.
+    // Why: secrets must be encrypted on disk. Clone state so the in-memory
+    // this.state stays plaintext for the rest of the app.
     const stateToSave = {
       ...this.state,
       settings: {
         ...this.state.settings,
-        opencodeSessionCookie: encrypt(this.state.settings.opencodeSessionCookie)
+        opencodeSessionCookie: encrypt(this.state.settings.opencodeSessionCookie),
+        httpProxyUrl: encrypt(this.state.settings.httpProxyUrl ?? '')
       },
       ui: {
         ...this.state.ui,
@@ -1711,6 +2197,96 @@ export class Store {
     return repo ? this.hydrateRepo(repo) : undefined
   }
 
+  getProjectGroups(): ProjectGroup[] {
+    return [...(this.state.projectGroups ?? [])].sort(
+      (left, right) => left.tabOrder - right.tabOrder || left.name.localeCompare(right.name)
+    )
+  }
+
+  createProjectGroup(input: {
+    name: string
+    parentPath?: string | null
+    parentGroupId?: string | null
+    createdFrom: ProjectGroup['createdFrom']
+  }): ProjectGroup {
+    let maxOrder = -1
+    // Why: persisted group lists can be large enough to exceed spread limits.
+    for (const existingGroup of this.state.projectGroups ?? []) {
+      maxOrder = Math.max(maxOrder, existingGroup.tabOrder)
+    }
+    const group = createProjectGroup({
+      ...input,
+      tabOrder: maxOrder + 1
+    })
+    this.state.projectGroups = [...(this.state.projectGroups ?? []), group]
+    this.scheduleSave()
+    return group
+  }
+
+  updateProjectGroup(
+    groupId: string,
+    updates: Partial<Pick<ProjectGroup, 'name' | 'isCollapsed' | 'tabOrder' | 'color'>>
+  ): ProjectGroup | null {
+    const group = (this.state.projectGroups ?? []).find((entry) => entry.id === groupId)
+    if (!group) {
+      return null
+    }
+    if (updates.name !== undefined) {
+      group.name = normalizeProjectGroupName(updates.name, group.name)
+    }
+    if (updates.isCollapsed !== undefined) {
+      group.isCollapsed = updates.isCollapsed
+    }
+    if (updates.tabOrder !== undefined && Number.isFinite(updates.tabOrder)) {
+      group.tabOrder = updates.tabOrder
+    }
+    if (updates.color !== undefined) {
+      group.color = typeof updates.color === 'string' ? updates.color : null
+    }
+    group.updatedAt = Date.now()
+    this.scheduleSave()
+    return group
+  }
+
+  deleteProjectGroup(groupId: string): boolean {
+    const before = this.state.projectGroups?.length ?? 0
+    const deletedGroupIds = getProjectGroupSubtreeIds(this.state.projectGroups ?? [], groupId)
+    this.state.projectGroups = (this.state.projectGroups ?? []).filter(
+      (group) => !deletedGroupIds.has(group.id)
+    )
+    if ((this.state.projectGroups?.length ?? 0) === before) {
+      return false
+    }
+    // Why: groups are sidebar organization only. Deleting one must not delete
+    // repos or worktrees, so contained repos from the full subtree are ungrouped.
+    this.state.repos = this.state.repos.map((repo) =>
+      repo.projectGroupId && deletedGroupIds.has(repo.projectGroupId)
+        ? { ...repo, projectGroupId: null }
+        : repo
+    )
+    this.scheduleSave()
+    return true
+  }
+
+  moveProjectToGroup(repoId: string, groupId: string | null, order?: number): Repo | null {
+    const repo = this.state.repos.find((entry) => entry.id === repoId)
+    if (!repo) {
+      return null
+    }
+    const normalizedGroupId =
+      groupId && (this.state.projectGroups ?? []).some((group) => group.id === groupId)
+        ? groupId
+        : null
+    const siblingRepos = this.state.repos.filter((entry) => entry.id !== repoId)
+    repo.projectGroupId = normalizedGroupId
+    repo.projectGroupOrder =
+      typeof order === 'number' && Number.isFinite(order)
+        ? order
+        : getNextProjectGroupOrder(siblingRepos, normalizedGroupId)
+    this.scheduleSave()
+    return this.hydrateRepo(repo)
+  }
+
   addRepo(repo: Repo): void {
     this.state.repos.push(repo)
     this.scheduleSave()
@@ -1748,7 +2324,7 @@ export class Store {
     return true
   }
 
-  removeRepo(id: string): void {
+  removeProject(id: string): void {
     this.state.repos = this.state.repos.filter((r) => r.id !== id)
     // Why: presets are repo-scoped, so removing the repo means the presets
     // can never be referenced again — drop them with the parent.
@@ -1775,10 +2351,18 @@ export class Store {
         Repo,
         | 'displayName'
         | 'badgeColor'
+        | 'repoIcon'
         | 'hookSettings'
         | 'worktreeBaseRef'
+        | 'worktreeBasePath'
         | 'kind'
+        | 'symlinkPaths'
         | 'issueSourcePreference'
+        | 'externalWorktreeVisibility'
+        | 'externalWorktreeVisibilityPromptDismissedAt'
+        | 'projectGroupId'
+        | 'projectGroupOrder'
+        | 'sourceControlAi'
       >
     >
   ): Repo | null {
@@ -1786,23 +2370,71 @@ export class Store {
     if (!repo) {
       return null
     }
-    // Why: `issueSourcePreference === undefined` in the patch means "reset to
-    // auto" (and the persisted record should drop the key, not preserve a
-    // stale explicit value via Object.assign's skip-on-undefined behavior).
-    // Without this delete branch, toggling explicit → auto would silently
-    // leave the old preference in place on disk.
-    if ('issueSourcePreference' in updates && updates.issueSourcePreference === undefined) {
-      delete repo.issueSourcePreference
-      const { issueSourcePreference: _drop, ...rest } = updates
-      Object.assign(repo, rest)
-    } else {
-      Object.assign(repo, updates)
+    const sanitizedUpdates = sanitizeRepoUpdatesForPersistence(updates)
+    if ('projectGroupId' in sanitizedUpdates) {
+      const nextGroupId = sanitizedUpdates.projectGroupId
+      if (
+        typeof nextGroupId !== 'string' ||
+        nextGroupId.trim().length === 0 ||
+        !this.state.projectGroups.some((group) => group.id === nextGroupId)
+      ) {
+        sanitizedUpdates.projectGroupId = null
+      }
     }
+    if (
+      'projectGroupOrder' in sanitizedUpdates &&
+      (typeof sanitizedUpdates.projectGroupOrder !== 'number' ||
+        !Number.isFinite(sanitizedUpdates.projectGroupOrder))
+    ) {
+      delete sanitizedUpdates.projectGroupOrder
+    }
+    const externalWorktreeVisibilityLegacy =
+      'externalWorktreeVisibility' in sanitizedUpdates &&
+      repo.externalWorktreeVisibilityLegacy === undefined
+        ? isLegacyRepoForExternalWorktreeVisibility(repo)
+        : undefined
+    // Why: selected repo fields use `undefined` as an explicit clear signal,
+    // so delete them before assigning the rest of the patch.
+    if (
+      'issueSourcePreference' in sanitizedUpdates &&
+      sanitizedUpdates.issueSourcePreference === undefined
+    ) {
+      delete repo.issueSourcePreference
+      delete sanitizedUpdates.issueSourcePreference
+    }
+    if ('worktreeBasePath' in sanitizedUpdates && sanitizedUpdates.worktreeBasePath === undefined) {
+      delete repo.worktreeBasePath
+      delete sanitizedUpdates.worktreeBasePath
+    }
+    if (
+      'externalWorktreeVisibility' in sanitizedUpdates &&
+      repo.externalWorktreeVisibilityLegacy === undefined
+    ) {
+      // Why: old persisted repos have no explicit marker. Stamp it the first
+      // time visibility changes so later hide/show choices keep legacy safety.
+      repo.externalWorktreeVisibilityLegacy = externalWorktreeVisibilityLegacy
+    }
+    if ('sourceControlAi' in sanitizedUpdates && sanitizedUpdates.sourceControlAi === undefined) {
+      delete repo.sourceControlAi
+      delete sanitizedUpdates.sourceControlAi
+    } else if ('sourceControlAi' in sanitizedUpdates) {
+      const normalizedSourceControlAi = normalizeRepoSourceControlAiOverrides(
+        sanitizedUpdates.sourceControlAi
+      )
+      if (normalizedSourceControlAi === undefined) {
+        delete sanitizedUpdates.sourceControlAi
+      } else {
+        sanitizedUpdates.sourceControlAi = normalizedSourceControlAi
+      }
+    }
+    Object.assign(repo, sanitizedUpdates)
     this.scheduleSave()
     return this.hydrateRepo(repo)
   }
 
   private hydrateRepo(repo: Repo): Repo {
+    const { repoIcon: rawRepoIcon, ...repoWithoutIcon } = repo
+    const repoIcon = sanitizeRepoIcon(rawRepoIcon)
     const gitUsername = isFolderRepo(repo)
       ? ''
       : (this.gitUsernameCache.get(repo.path) ??
@@ -1813,7 +2445,8 @@ export class Store {
         })())
 
     return {
-      ...repo,
+      ...repoWithoutIcon,
+      ...(repoIcon !== undefined ? { repoIcon } : {}),
       kind: isFolderRepo(repo) ? 'folder' : 'git',
       gitUsername,
       hookSettings: {
@@ -1862,9 +2495,12 @@ export class Store {
 
   listAutomationRuns(automationId?: string): AutomationRun[] {
     const runs = this.state.automationRuns ?? []
-    return [
-      ...(automationId ? runs.filter((run) => run.automationId === automationId) : runs)
-    ].sort((left, right) => right.createdAt - left.createdAt)
+    return [...(automationId ? runs.filter((run) => run.automationId === automationId) : runs)]
+      .map((run) => ({
+        ...run,
+        precheckResult: normalizeAutomationPrecheckResult(run.precheckResult)
+      }))
+      .sort((left, right) => right.createdAt - left.createdAt)
   }
 
   createAutomation(input: AutomationCreateInput): Automation {
@@ -1875,6 +2511,7 @@ export class Store {
       id: randomUUID(),
       name: input.name.trim() || 'Untitled automation',
       prompt: input.prompt,
+      precheck: normalizeAutomationPrecheck(input.precheck),
       agentId: input.agentId,
       projectId: input.projectId,
       executionTargetType,
@@ -1895,6 +2532,7 @@ export class Store {
       updatedAt: now
     }
     this.state.automations = [...(this.state.automations ?? []), automation]
+    this.recordFeatureInteraction('automation-created')
     this.flush()
     return automation
   }
@@ -1917,6 +2555,9 @@ export class Store {
       ...updates,
       name:
         updates.name !== undefined ? updates.name.trim() || 'Untitled automation' : current.name,
+      precheck: Object.hasOwn(updates, 'precheck')
+        ? normalizeAutomationPrecheck(updates.precheck)
+        : normalizeAutomationPrecheck(current.precheck),
       projectId: repoId,
       executionTargetType,
       executionTargetId: executionTargetType === 'ssh' ? (repo?.connectionId ?? '') : 'local',
@@ -1986,6 +2627,7 @@ export class Store {
       chatSessionId: null,
       terminalSessionId: null,
       outputSnapshot: null,
+      precheckResult: null,
       usage: null,
       error: null,
       startedAt: null,
@@ -1993,6 +2635,9 @@ export class Store {
       createdAt: now
     }
     this.state.automationRuns = [...(this.state.automationRuns ?? []), run]
+    if (trigger === 'manual') {
+      this.recordFeatureInteraction('automation-run')
+    }
     this.flush()
     return run
   }
@@ -2020,6 +2665,9 @@ export class Store {
       outputSnapshot: Object.hasOwn(result, 'outputSnapshot')
         ? normalizeAutomationRunOutputSnapshot(result.outputSnapshot)
         : normalizeAutomationRunOutputSnapshot(current.outputSnapshot),
+      precheckResult: Object.hasOwn(result, 'precheckResult')
+        ? normalizeAutomationPrecheckResult(result.precheckResult)
+        : normalizeAutomationPrecheckResult(current.precheckResult),
       usage: Object.hasOwn(result, 'usage') ? (result.usage ?? null) : (current.usage ?? null),
       error: result.error ?? null,
       startedAt: current.startedAt ?? now,
@@ -2135,20 +2783,69 @@ export class Store {
     return this.state.settings
   }
 
-  updateSettings(updates: Partial<GlobalSettings>): GlobalSettings {
+  onSettingsChanged(
+    listener: (
+      updates: Partial<GlobalSettings>,
+      settings: GlobalSettings,
+      originWebContentsId?: number
+    ) => void
+  ): () => void {
+    this.settingsChangeListeners.add(listener)
+    return () => {
+      this.settingsChangeListeners.delete(listener)
+    }
+  }
+
+  private notifySettingsChanged(
+    updates: Partial<GlobalSettings>,
+    originWebContentsId?: number
+  ): void {
+    for (const listener of this.settingsChangeListeners) {
+      listener(updates, this.state.settings, originWebContentsId)
+    }
+  }
+
+  updateSettings(
+    updates: Partial<GlobalSettings>,
+    options: { notifyListeners?: boolean; originWebContentsId?: number } = {}
+  ): GlobalSettings {
     const sanitizedUpdates = { ...updates }
+    if ('disabledTuiAgents' in updates) {
+      sanitizedUpdates.disabledTuiAgents = normalizeDisabledTuiAgents(updates.disabledTuiAgents)
+    }
     if ('terminalQuickCommands' in updates) {
       sanitizedUpdates.terminalQuickCommands = normalizeTerminalQuickCommands(
         updates.terminalQuickCommands
       )
     }
-    if ('visibleTaskProviders' in updates) {
-      sanitizedUpdates.visibleTaskProviders = normalizeVisibleTaskProviders(
-        updates.visibleTaskProviders
-      )
+    if ('visibleTaskProviders' in updates || 'defaultTaskSource' in updates) {
+      const taskProviderSettings = normalizeTaskProviderSettings({
+        visibleTaskProviders:
+          'visibleTaskProviders' in updates
+            ? updates.visibleTaskProviders
+            : this.state.settings.visibleTaskProviders,
+        defaultTaskSource:
+          'defaultTaskSource' in updates
+            ? updates.defaultTaskSource
+            : this.state.settings.defaultTaskSource
+      })
+      sanitizedUpdates.defaultTaskSource = taskProviderSettings.defaultTaskSource
+      sanitizedUpdates.visibleTaskProviders = taskProviderSettings.visibleTaskProviders
     }
     if ('openInApplications' in updates) {
       sanitizedUpdates.openInApplications = normalizeOpenInApplications(updates.openInApplications)
+    }
+    if ('terminalShortcutPolicy' in updates) {
+      sanitizedUpdates.terminalShortcutPolicy = normalizeTerminalShortcutPolicy(
+        updates.terminalShortcutPolicy
+      )
+    }
+    const historyWithPreviousLayout = buildWorkspaceDirHistoryForUpdate(
+      this.state.settings,
+      sanitizedUpdates
+    )
+    if (historyWithPreviousLayout) {
+      sanitizedUpdates.workspaceDirHistory = historyWithPreviousLayout
     }
     // Why: `telemetry` is deep-merged for the same reason `notifications` is —
     // partial updates from the Privacy pane / consent flow (e.g., flipping
@@ -2160,6 +2857,23 @@ export class Store {
       sanitizedUpdates.telemetry !== undefined
         ? { ...this.state.settings.telemetry, ...sanitizedUpdates.telemetry }
         : this.state.settings.telemetry
+    if ('sourceControlAi' in sanitizedUpdates) {
+      const normalizedSourceControlAi = normalizeSourceControlAiSettings(
+        sanitizedUpdates.sourceControlAi,
+        this.state.settings.commitMessageAi
+      )
+      sanitizedUpdates.sourceControlAi = normalizedSourceControlAi
+      sanitizedUpdates.commitMessageAi = projectSourceControlAiToLegacyCommitMessageAi(
+        normalizedSourceControlAi,
+        this.state.settings.commitMessageAi
+      )
+    } else if ('commitMessageAi' in sanitizedUpdates) {
+      sanitizedUpdates.sourceControlAi = mergeLegacyCommitMessageAiIntoSourceControlAi(
+        this.state.settings.sourceControlAi,
+        sanitizedUpdates.commitMessageAi
+      )
+    }
+    const previousSettings = this.state.settings
     this.state.settings = {
       ...this.state.settings,
       ...sanitizedUpdates,
@@ -2170,6 +2884,15 @@ export class Store {
       ...(mergedTelemetry !== undefined ? { telemetry: mergedTelemetry } : {})
     }
     this.scheduleSave()
+    const changedUpdates = {} as Partial<GlobalSettings> & Record<string, unknown>
+    for (const key of Object.keys(sanitizedUpdates) as (keyof GlobalSettings)[]) {
+      if (!Object.is(previousSettings[key], this.state.settings[key])) {
+        changedUpdates[String(key)] = this.state.settings[key]
+      }
+    }
+    if (options.notifyListeners === true && Object.keys(changedUpdates).length > 0) {
+      this.notifySettingsChanged(changedUpdates, options.originWebContentsId)
+    }
     return this.state.settings
   }
 
@@ -2181,15 +2904,23 @@ export class Store {
       ...this.state.ui,
       groupBy: normalizeGroupBy(this.state.ui?.groupBy),
       sortBy: normalizeSortBy(this.state.ui?.sortBy),
+      rightSidebarTab: normalizeRightSidebarTab(this.state.ui?.rightSidebarTab),
       worktreeCardProperties: normalizeWorktreeCardProperties(
         this.state.ui?.worktreeCardProperties
       ),
+      agentActivityDisplayMode: normalizeAgentActivityDisplayMode(
+        this.state.ui?.agentActivityDisplayMode
+      ),
       workspaceStatuses: normalizeWorkspaceStatuses(this.state.ui?.workspaceStatuses),
       workspaceBoardOpacity: clampWorkspaceBoardOpacity(this.state.ui?.workspaceBoardOpacity),
-      workspaceBoardCompact: normalizeWorkspaceBoardCompact(this.state.ui?.workspaceBoardCompact),
       workspaceBoardColumnWidth: clampWorkspaceBoardColumnWidth(
         this.state.ui?.workspaceBoardColumnWidth
-      )
+      ),
+      showDotfilesByWorktree: normalizeShowDotfilesByWorktree(
+        this.state.ui?.showDotfilesByWorktree
+      ),
+      featureTipsSeenIds: normalizeFeatureTipIds(this.state.ui?.featureTipsSeenIds),
+      featureInteractions: normalizeFeatureInteractions(this.state.ui?.featureInteractions)
     }
   }
 
@@ -2203,10 +2934,18 @@ export class Store {
       sortBy: updates.sortBy
         ? normalizeSortBy(updates.sortBy)
         : normalizeSortBy(this.state.ui?.sortBy),
+      rightSidebarTab:
+        updates.rightSidebarTab !== undefined
+          ? normalizeRightSidebarTab(updates.rightSidebarTab)
+          : normalizeRightSidebarTab(this.state.ui?.rightSidebarTab),
       worktreeCardProperties:
         updates.worktreeCardProperties !== undefined
           ? normalizeWorktreeCardProperties(updates.worktreeCardProperties)
           : normalizeWorktreeCardProperties(this.state.ui?.worktreeCardProperties),
+      agentActivityDisplayMode:
+        updates.agentActivityDisplayMode !== undefined
+          ? normalizeAgentActivityDisplayMode(updates.agentActivityDisplayMode)
+          : normalizeAgentActivityDisplayMode(this.state.ui?.agentActivityDisplayMode),
       workspaceStatuses:
         updates.workspaceStatuses !== undefined
           ? normalizeWorkspaceStatuses(updates.workspaceStatuses)
@@ -2214,14 +2953,44 @@ export class Store {
       workspaceBoardOpacity: clampWorkspaceBoardOpacity(
         updates.workspaceBoardOpacity ?? this.state.ui?.workspaceBoardOpacity
       ),
-      workspaceBoardCompact: normalizeWorkspaceBoardCompact(
-        updates.workspaceBoardCompact ?? this.state.ui?.workspaceBoardCompact
-      ),
       workspaceBoardColumnWidth: clampWorkspaceBoardColumnWidth(
         updates.workspaceBoardColumnWidth ?? this.state.ui?.workspaceBoardColumnWidth
-      )
+      ),
+      showDotfilesByWorktree:
+        updates.showDotfilesByWorktree !== undefined
+          ? normalizeShowDotfilesByWorktree(updates.showDotfilesByWorktree)
+          : normalizeShowDotfilesByWorktree(this.state.ui?.showDotfilesByWorktree),
+      featureTipsSeenIds:
+        updates.featureTipsSeenIds !== undefined
+          ? normalizeFeatureTipIds(updates.featureTipsSeenIds)
+          : normalizeFeatureTipIds(this.state.ui?.featureTipsSeenIds),
+      // Why: runtime RPCs and the renderer can both record education state.
+      // Merge instead of replacing so a stale renderer snapshot cannot erase
+      // runtime-only feature interactions.
+      featureInteractions:
+        updates.featureInteractions !== undefined
+          ? mergeFeatureInteractions(
+              this.state.ui?.featureInteractions,
+              updates.featureInteractions
+            )
+          : normalizeFeatureInteractions(this.state.ui?.featureInteractions)
     }
     this.scheduleSave()
+  }
+
+  recordFeatureInteraction(id: FeatureInteractionId): PersistedState['ui'] {
+    const featureInteractions = normalizeFeatureInteractions(this.state.ui?.featureInteractions)
+    const existing = featureInteractions[id]
+    this.updateUI({
+      featureInteractions: {
+        ...featureInteractions,
+        [id]: {
+          firstInteractedAt: existing?.firstInteractedAt ?? Date.now(),
+          interactionCount: (existing?.interactionCount ?? 0) + 1
+        }
+      }
+    })
+    return this.getUI()
   }
 
   // ── Onboarding ────────────────────────────────────────────────────
@@ -2271,6 +3040,12 @@ export class Store {
 
   getWorkspaceSession(): PersistedState['workspaceSession'] {
     return this.state.workspaceSession ?? getDefaultWorkspaceSession()
+  }
+
+  /** Resolve the worktree a terminal tab belongs to, from the session's
+   *  tab→worktree map. More reliable than agent-echoed hook fields. */
+  getWorktreeIdForTab(tabId: string): string | undefined {
+    return findWorktreeIdForTab(this.getWorkspaceSession(), tabId)
   }
 
   setWorkspaceSession(session: PersistedState['workspaceSession']): void {
@@ -2410,6 +3185,25 @@ export class Store {
     this.scheduleSave()
   }
 
+  patchWorkspaceSession(patch: WorkspaceSessionPatch): void {
+    // Why: the renderer's debounced hot path sends only changed top-level
+    // session slices. Scalar/UI patches avoid the terminal normalization path;
+    // terminal topology/layout patches still reuse the stale-PTY protections.
+    let next: WorkspaceSessionState = {
+      ...this.getWorkspaceSession(),
+      ...patch
+    }
+    if (workspaceSessionPatchNeedsFullNormalization(patch)) {
+      this.setWorkspaceSession(next)
+      return
+    }
+    if (Object.hasOwn(patch, 'browserUrlHistory')) {
+      next = pruneWorkspaceSessionBrowserHistory(next)
+    }
+    this.state.workspaceSession = next
+    this.scheduleSave()
+  }
+
   private getTerminalLayoutLeafIds(root: TerminalPaneLayoutNode | null): Set<string> {
     const leafIds = new Set<string>()
     const visit = (node: TerminalPaneLayoutNode | null): void => {
@@ -2442,6 +3236,18 @@ export class Store {
     return !leases?.some((lease) => lease.state === 'terminated' || lease.state === 'expired')
   }
 
+  private getRelayPtyIdForSshLeaseComparison(targetId: string, ptyId: string): string {
+    try {
+      return toRelaySshPtyId(targetId, ptyId)
+    } catch {
+      return ptyId
+    }
+  }
+
+  private getRelayPtyIdForSshLeaseStorage(targetId: string, ptyId: string): string {
+    return toRelaySshPtyId(targetId, ptyId)
+  }
+
   private sshRemotePtyLeaseMatchesBinding(
     lease: SshRemotePtyLease,
     binding: {
@@ -2452,7 +3258,8 @@ export class Store {
       leafId?: string
     }
   ): boolean {
-    if (lease.ptyId !== binding.ptyId) {
+    const bindingPtyId = this.getRelayPtyIdForSshLeaseComparison(lease.targetId, binding.ptyId)
+    if (lease.ptyId !== bindingPtyId) {
       return false
     }
     // Why: remote PTY ids are scoped to a relay target. Workspace PTY bindings
@@ -2496,7 +3303,8 @@ export class Store {
       leafId?: string
     }
   ): boolean {
-    if (lease.targetId !== binding.targetId || lease.ptyId !== binding.ptyId) {
+    const bindingPtyId = this.getRelayPtyIdForSshLeaseComparison(binding.targetId, binding.ptyId)
+    if (lease.targetId !== binding.targetId || lease.ptyId !== bindingPtyId) {
       return false
     }
     // Why: target removal is destructive. Legacy/contextless leases should
@@ -2675,6 +3483,12 @@ export class Store {
     if (normalizedLease.leafId !== undefined && !isTerminalLeafId(normalizedLease.leafId)) {
       delete normalizedLease.leafId
     }
+    // Why: app-facing SSH PTY ids are globally scoped; durable relay leases
+    // stay target-local so reconnect can call relay pty.attach with raw ids.
+    normalizedLease.ptyId = this.getRelayPtyIdForSshLeaseStorage(
+      normalizedLease.targetId,
+      normalizedLease.ptyId
+    )
     const now = Date.now()
     const existingIndex = this.state.sshRemotePtyLeases.findIndex(
       (entry) =>
@@ -2721,8 +3535,9 @@ export class Store {
   }
 
   markSshRemotePtyLease(targetId: string, ptyId: string, state: SshRemotePtyLease['state']): void {
+    const relayPtyId = this.getRelayPtyIdForSshLeaseStorage(targetId, ptyId)
     const lease = this.state.sshRemotePtyLeases?.find(
-      (entry) => entry.targetId === targetId && entry.ptyId === ptyId
+      (entry) => entry.targetId === targetId && entry.ptyId === relayPtyId
     )
     if (!lease || lease.state === state) {
       return
@@ -2739,13 +3554,14 @@ export class Store {
   }
 
   removeSshRemotePtyLease(targetId: string, ptyId: string): void {
+    const relayPtyId = this.getRelayPtyIdForSshLeaseStorage(targetId, ptyId)
     const leases = (this.state.sshRemotePtyLeases ?? []).filter(
-      (lease) => lease.targetId === targetId && lease.ptyId === ptyId
+      (lease) => lease.targetId === targetId && lease.ptyId === relayPtyId
     )
     const before = this.state.sshRemotePtyLeases?.length ?? 0
     this.clearSshRemotePtyBindingsForLeases(targetId, leases)
     this.state.sshRemotePtyLeases = (this.state.sshRemotePtyLeases ?? []).filter(
-      (lease) => lease.targetId !== targetId || lease.ptyId !== ptyId
+      (lease) => lease.targetId !== targetId || lease.ptyId !== relayPtyId
     )
     if (this.state.sshRemotePtyLeases.length !== before) {
       this.flush()

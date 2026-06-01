@@ -1,3 +1,5 @@
+/* oxlint-disable max-lines -- Why: keeps the mux protocol lifecycle harness
+   together across request, notification, keepalive, and disposal cases. */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { SshChannelMultiplexer, type MultiplexerTransport } from './ssh-channel-multiplexer'
 import { encodeFrame, MessageType, HEADER_LENGTH, encodeKeepAliveFrame } from './relay-protocol'
@@ -61,6 +63,16 @@ function makeNotificationFrame(
     })
   )
   return encodeFrame(MessageType.Regular, seq, 0, payload)
+}
+
+type MuxInternals = {
+  notificationHandlers: unknown[]
+  methodNotificationHandlers: Map<string, Set<unknown>>
+  disposeHandlers: unknown[]
+}
+
+function getMuxInternals(instance: SshChannelMultiplexer): MuxInternals {
+  return instance as unknown as MuxInternals
 }
 
 describe('SshChannelMultiplexer', () => {
@@ -229,6 +241,50 @@ describe('SshChannelMultiplexer', () => {
       expect(a).not.toHaveBeenCalled()
       expect(b).toHaveBeenCalledWith({ streamId: 7 })
     })
+
+    it('contains generic notification handler failures', () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const badHandler = vi.fn(() => {
+        throw new Error('subscriber exploded')
+      })
+      const goodHandler = vi.fn()
+      mux.onNotification(badHandler)
+      mux.onNotification(goodHandler)
+
+      expect(() =>
+        transport.dataCallbacks[0](makeNotificationFrame('pty.data', { id: 'pty-1' }, 1))
+      ).not.toThrow()
+
+      expect(badHandler).toHaveBeenCalled()
+      expect(goodHandler).toHaveBeenCalledWith('pty.data', { id: 'pty-1' })
+      expect(mux.isDisposed()).toBe(false)
+      expect(warnSpy).toHaveBeenCalledWith(
+        '[ssh-mux] Notification handler failed for pty.data: subscriber exploded'
+      )
+    })
+
+    it('contains method notification handler failures', () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const badHandler = vi.fn(() => {
+        throw new Error('stream consumer exploded')
+      })
+      const goodHandler = vi.fn()
+      mux.onNotificationByMethod('fs.streamChunk', badHandler)
+      mux.onNotificationByMethod('fs.streamChunk', goodHandler)
+
+      expect(() =>
+        transport.dataCallbacks[0](
+          makeNotificationFrame('fs.streamChunk', { streamId: 1, seq: 0, data: 'aGk=' }, 1)
+        )
+      ).not.toThrow()
+
+      expect(badHandler).toHaveBeenCalled()
+      expect(goodHandler).toHaveBeenCalledWith({ streamId: 1, seq: 0, data: 'aGk=' })
+      expect(mux.isDisposed()).toBe(false)
+      expect(warnSpy).toHaveBeenCalledWith(
+        '[ssh-mux] Method notification handler failed for fs.streamChunk: stream consumer exploded'
+      )
+    })
   })
 
   describe('keepalive', () => {
@@ -278,6 +334,43 @@ describe('SshChannelMultiplexer', () => {
       expect(mux.isDisposed()).toBe(false)
       mux.dispose()
       expect(mux.isDisposed()).toBe(true)
+    })
+
+    it('clears registered handlers on dispose', () => {
+      const disposeHandler = vi.fn()
+      mux.onNotification(vi.fn())
+      mux.onNotificationByMethod('fs.streamChunk', vi.fn())
+      mux.onDispose(disposeHandler)
+
+      const internals = getMuxInternals(mux)
+      expect(internals.notificationHandlers).toHaveLength(1)
+      expect(internals.methodNotificationHandlers.size).toBe(1)
+      expect(internals.disposeHandlers).toHaveLength(1)
+
+      mux.dispose()
+
+      expect(disposeHandler).toHaveBeenCalledWith('shutdown')
+      expect(internals.notificationHandlers).toHaveLength(0)
+      expect(internals.methodNotificationHandlers.size).toBe(0)
+      expect(internals.disposeHandlers).toHaveLength(0)
+    })
+
+    it('does not retain handlers registered after dispose', () => {
+      mux.dispose()
+
+      const disposeNotification = mux.onNotification(vi.fn())
+      const disposeMethod = mux.onNotificationByMethod('fs.streamChunk', vi.fn())
+      const disposeLifecycle = mux.onDispose(vi.fn())
+
+      const internals = getMuxInternals(mux)
+      expect(internals.notificationHandlers).toHaveLength(0)
+      expect(internals.methodNotificationHandlers.size).toBe(0)
+      expect(internals.disposeHandlers).toHaveLength(0)
+      expect(() => {
+        disposeNotification()
+        disposeMethod()
+        disposeLifecycle()
+      }).not.toThrow()
     })
   })
 

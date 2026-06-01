@@ -22,14 +22,25 @@ import {
   GENERAL_CACHE_TIMER_SEARCH_ENTRIES,
   GENERAL_CLI_SEARCH_ENTRIES,
   GENERAL_EDITOR_SEARCH_ENTRIES,
+  GENERAL_NAVIGATION_SEARCH_ENTRIES,
+  GENERAL_NETWORK_SEARCH_ENTRIES,
   GENERAL_PANE_SEARCH_ENTRIES,
   GENERAL_SUPPORT_SEARCH_ENTRIES,
   GENERAL_UPDATE_SEARCH_ENTRIES,
   GENERAL_WORKSPACE_SEARCH_ENTRIES
 } from './general-search'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../ui/select'
+import { RecentTabOrderControl } from './RecentTabOrderControl'
 import { SearchableSetting } from './SearchableSetting'
 import { matchesSettingsSearch } from './settings-search'
+import {
+  SettingsSegmentedControl,
+  SettingsSubsectionHeader,
+  SettingsSwitch,
+  SettingsSwitchRow
+} from './SettingsFormControls'
+import { useMountedRef } from '@/hooks/useMountedRef'
+import { normalizeProxyBypassRules, normalizeProxyUrl } from '../../../../shared/network-proxy'
 
 function createOpenInApplication(): OpenInApplication {
   return {
@@ -55,7 +66,162 @@ export function shouldCommitOpenInApplicationsDraft(applications: OpenInApplicat
   })
 }
 
+export function getDesktopPlatformFromUserAgent(userAgent: string): 'darwin' | 'win32' | 'other' {
+  if (userAgent.includes('Mac')) {
+    return 'darwin'
+  }
+  if (userAgent.includes('Windows')) {
+    return 'win32'
+  }
+  return 'other'
+}
+
 export { GENERAL_PANE_SEARCH_ENTRIES }
+
+export type AutoSaveDelayDraftState = {
+  sourceDelayMs: number
+  draft: string
+}
+
+export function createAutoSaveDelayDraftState(
+  editorAutoSaveDelayMs: number
+): AutoSaveDelayDraftState {
+  return {
+    sourceDelayMs: editorAutoSaveDelayMs,
+    draft: String(editorAutoSaveDelayMs)
+  }
+}
+
+function resolveAutoSaveDelayDraftState(
+  state: AutoSaveDelayDraftState,
+  editorAutoSaveDelayMs: number
+): AutoSaveDelayDraftState {
+  return state.sourceDelayMs === editorAutoSaveDelayMs
+    ? state
+    : createAutoSaveDelayDraftState(editorAutoSaveDelayMs)
+}
+
+export function updateAutoSaveDelayDraftState(
+  state: AutoSaveDelayDraftState,
+  editorAutoSaveDelayMs: number,
+  draft: string
+): AutoSaveDelayDraftState {
+  return {
+    // Why: settings persistence is async, so a committed draft must stay tied
+    // to the current source until the persisted value reloads.
+    ...resolveAutoSaveDelayDraftState(state, editorAutoSaveDelayMs),
+    draft
+  }
+}
+
+export type HttpProxyUrlDraftState = {
+  sourceValue: string
+  draft: string
+  error: string | null
+}
+
+export function createHttpProxyUrlDraftState(
+  httpProxyUrl: string | undefined
+): HttpProxyUrlDraftState {
+  const sourceValue = httpProxyUrl ?? ''
+  return {
+    sourceValue,
+    draft: sourceValue,
+    error: null
+  }
+}
+
+function resolveHttpProxyUrlDraftState(
+  state: HttpProxyUrlDraftState,
+  httpProxyUrl: string | undefined
+): HttpProxyUrlDraftState {
+  const sourceValue = httpProxyUrl ?? ''
+  return state.sourceValue === sourceValue ? state : createHttpProxyUrlDraftState(httpProxyUrl)
+}
+
+export function updateHttpProxyUrlDraftState(
+  state: HttpProxyUrlDraftState,
+  httpProxyUrl: string | undefined,
+  draft: string
+): HttpProxyUrlDraftState {
+  return {
+    // Why: settings persistence is async, so edits after an external settings
+    // reload must build on the latest persisted proxy source.
+    ...resolveHttpProxyUrlDraftState(state, httpProxyUrl),
+    draft,
+    error: null
+  }
+}
+
+export function setHttpProxyUrlDraftErrorState(
+  state: HttpProxyUrlDraftState,
+  httpProxyUrl: string | undefined,
+  error: string
+): HttpProxyUrlDraftState {
+  return {
+    ...resolveHttpProxyUrlDraftState(state, httpProxyUrl),
+    error
+  }
+}
+
+export type HttpProxyBypassRulesDraftState = {
+  sourceValue: string
+  draft: string
+}
+
+export function createHttpProxyBypassRulesDraftState(
+  httpProxyBypassRules: string | undefined
+): HttpProxyBypassRulesDraftState {
+  const sourceValue = httpProxyBypassRules ?? ''
+  return {
+    sourceValue,
+    draft: sourceValue
+  }
+}
+
+function resolveHttpProxyBypassRulesDraftState(
+  state: HttpProxyBypassRulesDraftState,
+  httpProxyBypassRules: string | undefined
+): HttpProxyBypassRulesDraftState {
+  const sourceValue = httpProxyBypassRules ?? ''
+  return state.sourceValue === sourceValue
+    ? state
+    : createHttpProxyBypassRulesDraftState(httpProxyBypassRules)
+}
+
+export function updateHttpProxyBypassRulesDraftState(
+  state: HttpProxyBypassRulesDraftState,
+  httpProxyBypassRules: string | undefined,
+  draft: string
+): HttpProxyBypassRulesDraftState {
+  return {
+    ...resolveHttpProxyBypassRulesDraftState(state, httpProxyBypassRules),
+    draft
+  }
+}
+
+type OpenInApplicationsDraftState = {
+  sourceApplications: OpenInApplication[] | undefined
+  draft: OpenInApplication[]
+}
+
+function createOpenInApplicationsDraftState(
+  openInApplications: OpenInApplication[] | undefined
+): OpenInApplicationsDraftState {
+  return {
+    sourceApplications: openInApplications,
+    draft: openInApplications ?? []
+  }
+}
+
+function resolveOpenInApplicationsDraftState(
+  state: OpenInApplicationsDraftState,
+  openInApplications: OpenInApplication[] | undefined
+): OpenInApplicationsDraftState {
+  return state.sourceApplications === openInApplications
+    ? state
+    : createOpenInApplicationsDraftState(openInApplications)
+}
 
 type GeneralPaneProps = {
   settings: GlobalSettings
@@ -65,6 +231,7 @@ type GeneralPaneProps = {
 export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): React.JSX.Element {
   const searchQuery = useAppStore((s) => s.settingsSearchQuery)
   const updateStatus = useAppStore((s) => s.updateStatus)
+  const mountedRef = useMountedRef()
   // Why: the 'error' variant of UpdateStatus does not carry a `version` field.
   // The main process emits `{ state: 'error' }` for both check failures (no
   // version known yet) and download/install failures (version was known from
@@ -90,11 +257,17 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
     updateVersionRef.current = null
   }
   const [appVersion, setAppVersion] = useState<string | null>(null)
-  const [autoSaveDelayDraft, setAutoSaveDelayDraft] = useState(
-    String(settings.editorAutoSaveDelayMs)
+  const [autoSaveDelayDraftState, setAutoSaveDelayDraftState] = useState(() =>
+    createAutoSaveDelayDraftState(settings.editorAutoSaveDelayMs)
   )
-  const [openInApplicationsDraft, setOpenInApplicationsDraft] = useState<OpenInApplication[]>(
-    settings.openInApplications ?? []
+  const [httpProxyUrlDraftState, setHttpProxyUrlDraftState] = useState(() =>
+    createHttpProxyUrlDraftState(settings.httpProxyUrl)
+  )
+  const [httpProxyBypassRulesDraftState, setHttpProxyBypassRulesDraftState] = useState(() =>
+    createHttpProxyBypassRulesDraftState(settings.httpProxyBypassRules)
+  )
+  const [openInApplicationsDraftState, setOpenInApplicationsDraftState] = useState(() =>
+    createOpenInApplicationsDraftState(settings.openInApplications)
   )
   // Why: the star state is derived from gh, not from settings, so it does not
   // live in the global settings store. 'hidden' covers the gh-unavailable and
@@ -110,7 +283,15 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
   >('loading')
 
   useEffect(() => {
-    window.api.updater.getVersion().then(setAppVersion)
+    let cancelled = false
+    void window.api.updater.getVersion().then((version) => {
+      if (!cancelled) {
+        setAppVersion(version)
+      }
+    })
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   useEffect(() => {
@@ -135,24 +316,86 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
       return
     }
     setStarState('starring')
-    const ok = await window.api.gh.starOrca()
+    const ok = await window.api.gh.starOrca('settings')
     if (!ok) {
-      setStarState('error')
+      if (mountedRef.current) {
+        setStarState('error')
+      }
       return
     }
-    setStarState('starred')
+    if (mountedRef.current) {
+      setStarState('starred')
+    }
     // Why: clicking star anywhere should also permanently mute the
     // threshold-based nag so the user isn't re-prompted via the popup.
     await window.api.starNag.complete()
   }
 
-  useEffect(() => {
-    setAutoSaveDelayDraft(String(settings.editorAutoSaveDelayMs))
-  }, [settings.editorAutoSaveDelayMs])
+  const resolvedAutoSaveDelayDraftState = resolveAutoSaveDelayDraftState(
+    autoSaveDelayDraftState,
+    settings.editorAutoSaveDelayMs
+  )
+  if (resolvedAutoSaveDelayDraftState !== autoSaveDelayDraftState) {
+    // Why: Settings can be updated outside this pane; reconcile drafts before
+    // paint so the visible input never lags behind the persisted value.
+    setAutoSaveDelayDraftState(resolvedAutoSaveDelayDraftState)
+  }
+  const autoSaveDelayDraft = resolvedAutoSaveDelayDraftState.draft
+  const updateAutoSaveDelayDraft = (draft: string): void => {
+    setAutoSaveDelayDraftState((current) =>
+      updateAutoSaveDelayDraftState(current, settings.editorAutoSaveDelayMs, draft)
+    )
+  }
 
-  useEffect(() => {
-    setOpenInApplicationsDraft(settings.openInApplications ?? [])
-  }, [settings.openInApplications])
+  const resolvedOpenInApplicationsDraftState = resolveOpenInApplicationsDraftState(
+    openInApplicationsDraftState,
+    settings.openInApplications
+  )
+  if (resolvedOpenInApplicationsDraftState !== openInApplicationsDraftState) {
+    // Why: the Open In rows are a local draft, but Settings can reload them
+    // externally; sync before paint instead of after an Effect pass.
+    setOpenInApplicationsDraftState(resolvedOpenInApplicationsDraftState)
+  }
+  const openInApplicationsDraft = resolvedOpenInApplicationsDraftState.draft
+  const updateOpenInApplicationsDraft = (draft: OpenInApplication[]): void => {
+    setOpenInApplicationsDraftState((current) => ({
+      ...resolveOpenInApplicationsDraftState(current, settings.openInApplications),
+      draft
+    }))
+  }
+
+  const resolvedHttpProxyUrlDraftState = resolveHttpProxyUrlDraftState(
+    httpProxyUrlDraftState,
+    settings.httpProxyUrl
+  )
+  if (resolvedHttpProxyUrlDraftState !== httpProxyUrlDraftState) {
+    // Why: Settings can change outside this pane; reconcile the proxy draft
+    // before paint so stale network values do not briefly appear.
+    setHttpProxyUrlDraftState(resolvedHttpProxyUrlDraftState)
+  }
+  const httpProxyUrlDraft = resolvedHttpProxyUrlDraftState.draft
+  const httpProxyUrlError = resolvedHttpProxyUrlDraftState.error
+  const updateHttpProxyUrlDraft = (draft: string): void => {
+    setHttpProxyUrlDraftState((current) =>
+      updateHttpProxyUrlDraftState(current, settings.httpProxyUrl, draft)
+    )
+  }
+
+  const resolvedHttpProxyBypassRulesDraftState = resolveHttpProxyBypassRulesDraftState(
+    httpProxyBypassRulesDraftState,
+    settings.httpProxyBypassRules
+  )
+  if (resolvedHttpProxyBypassRulesDraftState !== httpProxyBypassRulesDraftState) {
+    // Why: Proxy bypass rules are local input state, but settings reloads can
+    // replace their source while this pane is mounted.
+    setHttpProxyBypassRulesDraftState(resolvedHttpProxyBypassRulesDraftState)
+  }
+  const httpProxyBypassRulesDraft = resolvedHttpProxyBypassRulesDraftState.draft
+  const updateHttpProxyBypassRulesDraft = (draft: string): void => {
+    setHttpProxyBypassRulesDraftState((current) =>
+      updateHttpProxyBypassRulesDraftState(current, settings.httpProxyBypassRules, draft)
+    )
+  }
 
   const commitOpenInApplications = (applications: OpenInApplication[]): void => {
     if (!shouldCommitOpenInApplicationsDraft(applications)) {
@@ -162,7 +405,7 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
   }
 
   const applyOpenInApplicationsDraft = (applications: OpenInApplication[]): void => {
-    setOpenInApplicationsDraft(applications)
+    updateOpenInApplicationsDraft(applications)
     commitOpenInApplications(applications)
   }
 
@@ -176,13 +419,13 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
   const commitAutoSaveDelay = (): void => {
     const trimmed = autoSaveDelayDraft.trim()
     if (trimmed === '') {
-      setAutoSaveDelayDraft(String(settings.editorAutoSaveDelayMs))
+      setAutoSaveDelayDraftState(createAutoSaveDelayDraftState(settings.editorAutoSaveDelayMs))
       return
     }
 
     const value = Number(trimmed)
     if (!Number.isFinite(value)) {
-      setAutoSaveDelayDraft(String(settings.editorAutoSaveDelayMs))
+      setAutoSaveDelayDraftState(createAutoSaveDelayDraftState(settings.editorAutoSaveDelayMs))
       return
     }
 
@@ -192,7 +435,35 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
       MAX_EDITOR_AUTO_SAVE_DELAY_MS
     )
     updateSettings({ editorAutoSaveDelayMs: next })
-    setAutoSaveDelayDraft(String(next))
+    setAutoSaveDelayDraftState((current) =>
+      updateAutoSaveDelayDraftState(current, settings.editorAutoSaveDelayMs, String(next))
+    )
+  }
+
+  const commitHttpProxyUrl = (): void => {
+    const normalized = normalizeProxyUrl(httpProxyUrlDraft)
+    if (!normalized.ok) {
+      setHttpProxyUrlDraftState((current) =>
+        setHttpProxyUrlDraftErrorState(current, settings.httpProxyUrl, normalized.message)
+      )
+      return
+    }
+    setHttpProxyUrlDraftState((current) =>
+      updateHttpProxyUrlDraftState(current, settings.httpProxyUrl, normalized.value)
+    )
+    if (normalized.value !== (settings.httpProxyUrl ?? '')) {
+      updateSettings({ httpProxyUrl: normalized.value })
+    }
+  }
+
+  const commitHttpProxyBypassRules = (): void => {
+    const normalized = normalizeProxyBypassRules(httpProxyBypassRulesDraft)
+    setHttpProxyBypassRulesDraftState((current) =>
+      updateHttpProxyBypassRulesDraftState(current, settings.httpProxyBypassRules, normalized)
+    )
+    if (normalized !== (settings.httpProxyBypassRules ?? '')) {
+      updateSettings({ httpProxyBypassRules: normalized })
+    }
   }
 
   const handleRestartToUpdate = (): void => {
@@ -204,18 +475,30 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
   }
 
   const visibleSections = [
+    matchesSettingsSearch(searchQuery, GENERAL_NAVIGATION_SEARCH_ENTRIES) ? (
+      <section key="navigation" className="space-y-4">
+        <SettingsSubsectionHeader title="Navigation" />
+        <RecentTabOrderControl
+          ctrlTabOrderMode={settings.ctrlTabOrderMode ?? 'mru'}
+          keywords={GENERAL_NAVIGATION_SEARCH_ENTRIES.flatMap((entry) => [
+            entry.title,
+            entry.description ?? '',
+            ...(entry.keywords ?? [])
+          ])}
+          updateSettings={updateSettings}
+        />
+      </section>
+    ) : null,
     matchesSettingsSearch(searchQuery, GENERAL_WORKSPACE_SEARCH_ENTRIES) ? (
       <section key="workspace" className="space-y-4">
-        <div className="space-y-1">
-          <h3 className="text-sm font-semibold">Workspace</h3>
-          <p className="text-xs text-muted-foreground">
-            Configure where new worktrees are created.
-          </p>
-        </div>
+        <SettingsSubsectionHeader
+          title="Workspace"
+          description="Configure where new workspaces are created."
+        />
 
         <SearchableSetting
           title="Workspace Directory"
-          description="Root directory where worktree folders are created."
+          description="Root directory where workspace folders are created."
           keywords={['workspace', 'folder', 'path', 'worktree']}
           className="space-y-2"
         >
@@ -237,40 +520,21 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
             </Button>
           </div>
           <p className="text-xs text-muted-foreground">
-            Root directory where worktree folders are created.
+            Root directory where workspace folders are created.
           </p>
         </SearchableSetting>
 
         <SearchableSetting
           title="Nest Workspaces"
-          description="Create worktrees inside a repo-named subfolder."
+          description="Create workspaces inside a repo-named subfolder."
           keywords={['nested', 'subfolder', 'directory']}
-          className="flex items-center justify-between gap-4 px-1 py-2"
         >
-          <div className="space-y-0.5">
-            <Label>Nest Workspaces</Label>
-            <p className="text-xs text-muted-foreground">
-              Create worktrees inside a repo-named subfolder.
-            </p>
-          </div>
-          <button
-            role="switch"
-            aria-checked={settings.nestWorkspaces}
-            onClick={() =>
-              updateSettings({
-                nestWorkspaces: !settings.nestWorkspaces
-              })
-            }
-            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors ${
-              settings.nestWorkspaces ? 'bg-foreground' : 'bg-muted-foreground/30'
-            }`}
-          >
-            <span
-              className={`pointer-events-none block size-3.5 rounded-full bg-background shadow-sm transition-transform ${
-                settings.nestWorkspaces ? 'translate-x-4' : 'translate-x-0.5'
-              }`}
-            />
-          </button>
+          <SettingsSwitchRow
+            label="Nest Workspaces"
+            description="Create workspaces inside a repo-named subfolder."
+            checked={settings.nestWorkspaces}
+            onChange={() => updateSettings({ nestWorkspaces: !settings.nestWorkspaces })}
+          />
         </SearchableSetting>
 
         {/* Why: the "Don't ask again" toast in the delete-worktree dialog
@@ -281,33 +545,17 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
             title="Ask Before Deleting Workspaces"
             description="Show a confirmation dialog before deleting a workspace."
             keywords={['delete', 'worktree', 'confirm', 'dialog', 'skip', 'prompt']}
-            className="flex items-center justify-between gap-4 px-1 py-2"
           >
-            <div className="space-y-0.5">
-              <Label>Ask Before Deleting Workspaces</Label>
-              <p className="text-xs text-muted-foreground">
-                Show a confirmation before deleting a workspace from the context menu. Failed
-                deletes still surface a Force Delete fallback.
-              </p>
-            </div>
-            <button
-              role="switch"
-              aria-checked={!settings.skipDeleteWorktreeConfirm}
-              onClick={() =>
+            <SettingsSwitchRow
+              label="Ask Before Deleting Workspaces"
+              description="Show a confirmation before deleting a workspace from the context menu. Failed deletes still surface a Force Delete fallback."
+              checked={!settings.skipDeleteWorktreeConfirm}
+              onChange={() =>
                 updateSettings({
                   skipDeleteWorktreeConfirm: !settings.skipDeleteWorktreeConfirm
                 })
               }
-              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors ${
-                !settings.skipDeleteWorktreeConfirm ? 'bg-foreground' : 'bg-muted-foreground/30'
-              }`}
-            >
-              <span
-                className={`pointer-events-none block size-3.5 rounded-full bg-background shadow-sm transition-transform ${
-                  !settings.skipDeleteWorktreeConfirm ? 'translate-x-4' : 'translate-x-0.5'
-                }`}
-              />
-            </button>
+            />
           </SearchableSetting>
         </div>
 
@@ -316,38 +564,23 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
             title="Ask Before Deleting Automations"
             description="Show a confirmation dialog before deleting an automation and its run history."
             keywords={['delete', 'automation', 'confirm', 'dialog', 'skip', 'prompt']}
-            className="flex items-center justify-between gap-4 px-1 py-2"
           >
-            <div className="space-y-0.5">
-              <Label>Ask Before Deleting Automations</Label>
-              <p className="text-xs text-muted-foreground">
-                Show a confirmation before deleting automations and their run history.
-              </p>
-            </div>
-            <button
-              role="switch"
-              aria-checked={!settings.skipDeleteAutomationConfirm}
-              onClick={() =>
+            <SettingsSwitchRow
+              label="Ask Before Deleting Automations"
+              description="Show a confirmation before deleting automations and their run history."
+              checked={!settings.skipDeleteAutomationConfirm}
+              onChange={() =>
                 updateSettings({
                   skipDeleteAutomationConfirm: !settings.skipDeleteAutomationConfirm
                 })
               }
-              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors ${
-                !settings.skipDeleteAutomationConfirm ? 'bg-foreground' : 'bg-muted-foreground/30'
-              }`}
-            >
-              <span
-                className={`pointer-events-none block size-3.5 rounded-full bg-background shadow-sm transition-transform ${
-                  !settings.skipDeleteAutomationConfirm ? 'translate-x-4' : 'translate-x-0.5'
-                }`}
-              />
-            </button>
+            />
           </SearchableSetting>
         </div>
 
         <SearchableSetting
           title="Open In Menu"
-          description="Add custom launchers to the worktree Open in menu."
+          description="Add custom launchers to the workspace Open in menu."
           keywords={['open in', 'editor', 'launcher', 'cursor', 'zed', 'command', 'vscode']}
           className="space-y-3"
         >
@@ -355,7 +588,7 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
             <Label>Open In Menu</Label>
             <p className="text-xs text-muted-foreground">
               VS Code is always included first. Add executables to show extra entries in each
-              worktree&apos;s Open in menu.
+              workspace&apos;s Open in menu.
             </p>
             <p className="text-xs text-muted-foreground">
               Commands are not shell-parsed. Use only an executable command name. For flags, use a
@@ -397,7 +630,7 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
                   onChange={(event) => {
                     const next = [...openInApplicationsDraft]
                     next[index] = { ...app, label: event.target.value }
-                    setOpenInApplicationsDraft(next)
+                    updateOpenInApplicationsDraft(next)
                   }}
                   onBlur={() => commitOpenInApplications(openInApplicationsDraft)}
                   onKeyDown={(event) => {
@@ -412,7 +645,7 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
                   onChange={(event) => {
                     const next = [...openInApplicationsDraft]
                     next[index] = { ...app, command: event.target.value }
-                    setOpenInApplicationsDraft(next)
+                    updateOpenInApplicationsDraft(next)
                   }}
                   onBlur={() => commitOpenInApplications(openInApplicationsDraft)}
                   onKeyDown={(event) => {
@@ -426,7 +659,7 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
                   size="sm"
                   onClick={() => {
                     const next = openInApplicationsDraft.filter((entry) => entry.id !== app.id)
-                    setOpenInApplicationsDraft(next)
+                    updateOpenInApplicationsDraft(next)
                     commitOpenInApplications(next)
                   }}
                 >
@@ -439,7 +672,7 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
             variant="outline"
             size="sm"
             onClick={() =>
-              setOpenInApplicationsDraft([...openInApplicationsDraft, createOpenInApplication()])
+              updateOpenInApplicationsDraft([...openInApplicationsDraft, createOpenInApplication()])
             }
             disabled={openInApplicationsDraft.length >= OPEN_IN_APPLICATIONS_MAX}
           >
@@ -448,52 +681,113 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
         </SearchableSetting>
       </section>
     ) : null,
+    matchesSettingsSearch(searchQuery, GENERAL_NETWORK_SEARCH_ENTRIES) ? (
+      <section key="network" className="space-y-4">
+        <SettingsSubsectionHeader
+          title="Network"
+          description="Configure app-level network routing."
+        />
+
+        <SearchableSetting
+          title="HTTP Proxy"
+          description="Proxy URL for Orca network requests and local terminal children."
+          keywords={['proxy', 'http_proxy', 'https_proxy', 'network', 'dock', 'launchpad']}
+          className="space-y-3"
+        >
+          <div className="space-y-1">
+            <Label htmlFor="settings-http-proxy-url">HTTP Proxy</Label>
+            <p className="text-xs text-muted-foreground">
+              Leave empty to use system proxy settings and inherited proxy environment variables.
+            </p>
+          </div>
+          <Input
+            id="settings-http-proxy-url"
+            value={httpProxyUrlDraft}
+            onChange={(e) => {
+              updateHttpProxyUrlDraft(e.target.value)
+            }}
+            onBlur={commitHttpProxyUrl}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.currentTarget.blur()
+              }
+            }}
+            placeholder="http://proxy.example.com:8080"
+            autoCapitalize="none"
+            autoCorrect="off"
+            autoComplete="off"
+            spellCheck={false}
+            aria-invalid={httpProxyUrlError ? true : undefined}
+            className="font-mono text-xs"
+          />
+          {httpProxyUrlError ? (
+            <p className="text-xs text-destructive">{httpProxyUrlError}</p>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              Supports http, https, socks, socks4, and socks5 URLs.
+            </p>
+          )}
+        </SearchableSetting>
+
+        <SearchableSetting
+          title="Proxy Bypass Rules"
+          description="Hosts that should bypass the configured HTTP proxy."
+          keywords={['proxy', 'bypass', 'no_proxy', 'localhost', 'network']}
+          className="space-y-3"
+        >
+          <div className="space-y-1">
+            <Label htmlFor="settings-http-proxy-bypass-rules">Proxy Bypass Rules</Label>
+            <p className="text-xs text-muted-foreground">
+              Optional. Separate hosts with commas, semicolons, or new lines.
+            </p>
+          </div>
+          <Input
+            id="settings-http-proxy-bypass-rules"
+            value={httpProxyBypassRulesDraft}
+            onChange={(e) => updateHttpProxyBypassRulesDraft(e.target.value)}
+            onBlur={commitHttpProxyBypassRules}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.currentTarget.blur()
+              }
+            }}
+            placeholder="localhost, 127.0.0.1, *.internal"
+            autoCapitalize="none"
+            autoCorrect="off"
+            autoComplete="off"
+            spellCheck={false}
+            className="font-mono text-xs"
+          />
+        </SearchableSetting>
+      </section>
+    ) : null,
     matchesSettingsSearch(searchQuery, GENERAL_EDITOR_SEARCH_ENTRIES) ? (
       <section key="editor" className="space-y-4">
-        <div className="space-y-1">
-          <h3 className="text-sm font-semibold">Editor</h3>
-          <p className="text-xs text-muted-foreground">Configure how Orca persists file edits.</p>
-        </div>
+        <SettingsSubsectionHeader
+          title="Editor"
+          description="Configure how Orca persists file edits."
+        />
 
         <SearchableSetting
           title="Auto Save Files"
           description="Save editor and editable diff changes automatically after a short pause."
           keywords={['autosave', 'save']}
-          className="flex items-center justify-between gap-4 px-1 py-2"
         >
-          <div className="space-y-0.5">
-            <Label>Auto Save Files</Label>
-            <p className="text-xs text-muted-foreground">
-              Save editor and editable diff changes automatically after a short pause.
-            </p>
-          </div>
-          <button
-            role="switch"
-            aria-checked={settings.editorAutoSave}
-            onClick={() =>
-              updateSettings({
-                editorAutoSave: !settings.editorAutoSave
-              })
-            }
-            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors ${
-              settings.editorAutoSave ? 'bg-foreground' : 'bg-muted-foreground/30'
-            }`}
-          >
-            <span
-              className={`pointer-events-none block size-3.5 rounded-full bg-background shadow-sm transition-transform ${
-                settings.editorAutoSave ? 'translate-x-4' : 'translate-x-0.5'
-              }`}
-            />
-          </button>
+          <SettingsSwitchRow
+            label="Auto Save Files"
+            description="Save editor and editable diff changes automatically after a short pause."
+            checked={settings.editorAutoSave}
+            onChange={() => updateSettings({ editorAutoSave: !settings.editorAutoSave })}
+          />
         </SearchableSetting>
 
         <SearchableSetting
           title="Auto Save Delay"
           description="How long Orca waits after your last edit before saving automatically."
           keywords={['autosave', 'delay', 'milliseconds']}
-          className="flex items-center justify-between gap-4 px-1 py-2"
+          className="flex items-center justify-between gap-4 py-2"
         >
-          <div className="space-y-0.5">
+          <div className="min-w-0 flex-1 space-y-0.5">
             <Label>Auto Save Delay</Label>
             <p className="text-xs text-muted-foreground">
               How long Orca waits after your last edit before saving automatically. First launch
@@ -507,7 +801,7 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
               max={MAX_EDITOR_AUTO_SAVE_DELAY_MS}
               step={250}
               value={autoSaveDelayDraft}
-              onChange={(e) => setAutoSaveDelayDraft(e.target.value)}
+              onChange={(e) => updateAutoSaveDelayDraft(e.target.value)}
               onBlur={commitAutoSaveDelay}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
@@ -524,195 +818,124 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
           title="Default Diff View"
           description="Preferred presentation format for showing git diffs by default."
           keywords={['diff', 'view', 'inline', 'side-by-side', 'split']}
-          className="flex flex-col items-start gap-3 px-1 py-2 sm:flex-row sm:items-center sm:justify-between"
+          className="flex items-center justify-between gap-4 py-2"
         >
-          <div className="space-y-0.5">
+          <div className="min-w-0 flex-1 space-y-0.5">
             <Label>Default Diff View</Label>
             <p className="text-xs text-muted-foreground">
               Preferred presentation format for showing git diffs by default.
             </p>
           </div>
-          <div className="flex shrink-0 items-center rounded-md border border-border/60 bg-background/50 p-0.5">
-            {(['inline', 'side-by-side'] as const).map((option) => (
-              <button
-                key={option}
-                onClick={() => updateSettings({ diffDefaultView: option })}
-                className={`rounded-sm px-3 py-1 text-sm transition-colors ${
-                  settings.diffDefaultView === option
-                    ? 'bg-accent font-medium text-accent-foreground'
-                    : 'text-muted-foreground hover:text-foreground'
-                }`}
-              >
-                {option === 'inline' ? 'Inline' : 'Side-by-side'}
-              </button>
-            ))}
-          </div>
+          <SettingsSegmentedControl
+            ariaLabel="Default Diff View"
+            value={settings.diffDefaultView}
+            onChange={(option) => updateSettings({ diffDefaultView: option })}
+            options={[
+              { value: 'inline', label: 'Inline' },
+              { value: 'side-by-side', label: 'Side-by-side' }
+            ]}
+          />
         </SearchableSetting>
 
         <SearchableSetting
           title="Default Diff File Tree"
           description="Show or hide the file tree when opening combined diff views."
           keywords={['diff', 'tree', 'file tree', 'combined diff', 'sidebar']}
-          className="flex flex-col items-start gap-3 px-1 py-2 sm:flex-row sm:items-center sm:justify-between"
+          className="flex items-center justify-between gap-4 py-2"
         >
-          <div className="space-y-0.5">
+          <div className="min-w-0 flex-1 space-y-0.5">
             <Label>Default Diff File Tree</Label>
             <p className="text-xs text-muted-foreground">
               Show or hide the file tree when opening combined diff views.
             </p>
           </div>
-          <div className="flex shrink-0 items-center rounded-md border border-border/60 bg-background/50 p-0.5">
-            {[
-              { label: 'Shown', value: true },
-              { label: 'Hidden', value: false }
-            ].map((option) => (
-              <button
-                key={option.label}
-                type="button"
-                onClick={() =>
-                  updateSettings({ combinedDiffFileTreeVisibleByDefault: option.value })
-                }
-                className={`rounded-sm px-3 py-1 text-sm transition-colors ${
-                  settings.combinedDiffFileTreeVisibleByDefault === option.value
-                    ? 'bg-accent font-medium text-accent-foreground'
-                    : 'text-muted-foreground hover:text-foreground'
-                }`}
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
+          <SettingsSegmentedControl
+            ariaLabel="Default Diff File Tree"
+            value={settings.combinedDiffFileTreeVisibleByDefault ? 'shown' : 'hidden'}
+            onChange={(option) =>
+              updateSettings({ combinedDiffFileTreeVisibleByDefault: option === 'shown' })
+            }
+            options={[
+              { value: 'shown', label: 'Shown' },
+              { value: 'hidden', label: 'Hidden' }
+            ]}
+          />
         </SearchableSetting>
 
         <SearchableSetting
           title="Minimap"
           description="Show the minimap overview when editing a file."
           keywords={['minimap', 'overview', 'code', 'scroll']}
-          className="flex items-center justify-between gap-4 px-1 py-2"
         >
-          <div className="space-y-0.5">
-            <Label>Minimap</Label>
-            <p className="text-xs text-muted-foreground">
-              Show the minimap overview when editing a file.
-            </p>
-          </div>
-          <button
-            role="switch"
-            aria-checked={settings.editorMinimapEnabled}
-            onClick={() =>
-              updateSettings({
-                editorMinimapEnabled: !settings.editorMinimapEnabled
-              })
+          <SettingsSwitchRow
+            label="Minimap"
+            description="Show the minimap overview when editing a file."
+            checked={settings.editorMinimapEnabled}
+            onChange={() =>
+              updateSettings({ editorMinimapEnabled: !settings.editorMinimapEnabled })
             }
-            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors ${
-              settings.editorMinimapEnabled ? 'bg-foreground' : 'bg-muted-foreground/30'
-            }`}
-          >
-            <span
-              className={`pointer-events-none block size-3.5 rounded-full bg-background shadow-sm transition-transform ${
-                settings.editorMinimapEnabled ? 'translate-x-4' : 'translate-x-0.5'
-              }`}
-            />
-          </button>
+          />
         </SearchableSetting>
 
         <SearchableSetting
           title="Markdown Review Notes"
           description="Show local markdown review note controls in rich editor mode."
           keywords={['markdown', 'review', 'notes', 'annotations', 'agents']}
-          className="flex items-center justify-between gap-4 px-1 py-2"
         >
-          <div className="space-y-0.5">
-            <Label>Markdown Review Notes</Label>
-            <p className="text-xs text-muted-foreground">
-              Show local markdown note controls in rich editor mode and agent handoff actions.
-            </p>
-          </div>
-          <button
-            role="switch"
-            aria-checked={settings.markdownReviewToolsEnabled}
-            onClick={() =>
-              updateSettings({
-                markdownReviewToolsEnabled: !settings.markdownReviewToolsEnabled
-              })
+          <SettingsSwitchRow
+            label="Markdown Review Notes"
+            description="Show local markdown note controls in rich editor mode and agent handoff actions."
+            checked={settings.markdownReviewToolsEnabled}
+            onChange={() =>
+              updateSettings({ markdownReviewToolsEnabled: !settings.markdownReviewToolsEnabled })
             }
-            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors ${
-              settings.markdownReviewToolsEnabled ? 'bg-foreground' : 'bg-muted-foreground/30'
-            }`}
-          >
-            <span
-              className={`pointer-events-none block size-3.5 rounded-full bg-background shadow-sm transition-transform ${
-                settings.markdownReviewToolsEnabled ? 'translate-x-4' : 'translate-x-0.5'
-              }`}
-            />
-          </button>
+          />
         </SearchableSetting>
       </section>
     ) : null,
     matchesSettingsSearch(searchQuery, GENERAL_CLI_SEARCH_ENTRIES) ? (
       <CliSection
         key="cli"
-        currentPlatform={navigator.userAgent.includes('Mac') ? 'darwin' : 'other'}
+        currentPlatform={getDesktopPlatformFromUserAgent(navigator.userAgent)}
       />
     ) : null,
     matchesSettingsSearch(searchQuery, GENERAL_CACHE_TIMER_SEARCH_ENTRIES) ? (
       <section key="cache-timer" className="space-y-4">
-        <div className="space-y-1">
-          <h3 className="text-sm font-semibold">Prompt Cache Timer</h3>
-          <p className="text-xs text-muted-foreground">
-            Claude caches your conversation to reduce costs. When idle too long the cache expires
-            and the next message resends full context at higher cost. This shows a countdown so you
-            know when to resume.
-          </p>
-        </div>
+        <SettingsSubsectionHeader
+          title="Prompt Cache Timer"
+          description="Claude caches your conversation to reduce costs. When idle too long the cache expires and the next message resends full context at higher cost. This shows a countdown so you know when to resume."
+        />
 
         <SearchableSetting
           title="Cache Timer"
           description="Show a countdown after a Claude agent becomes idle."
-          // Why: this is the primary control for the section gated by
-          // GENERAL_CACHE_TIMER_SEARCH_ENTRIES (title "Prompt Cache Timer").
-          // Mirroring those keywords keeps a search for "Prompt Cache Timer"
-          // from rendering the section header with no body underneath.
           keywords={GENERAL_CACHE_TIMER_SEARCH_ENTRIES.flatMap((entry) => [
             entry.title,
             entry.description ?? '',
             ...(entry.keywords ?? [])
           ])}
-          className="flex items-center justify-between gap-4 px-1 py-2"
+          className="flex items-center justify-between gap-4 py-2"
         >
-          <div className="space-y-0.5">
+          <div className="min-w-0 flex-1 space-y-0.5">
             <div className="flex items-center gap-2">
-              <Timer className="size-4" />
+              <Timer className="size-4 text-muted-foreground" />
               <Label>Cache Timer</Label>
             </div>
             <p className="text-xs text-muted-foreground">
               Show a countdown in the sidebar after a Claude agent becomes idle.
             </p>
           </div>
-          <button
-            role="switch"
-            aria-checked={settings.promptCacheTimerEnabled}
-            aria-label="Cache Timer"
-            onClick={() => {
+          <SettingsSwitch
+            ariaLabel="Cache Timer"
+            checked={settings.promptCacheTimerEnabled}
+            onChange={() => {
               const enabling = !settings.promptCacheTimerEnabled
               updateSettings({ promptCacheTimerEnabled: enabling })
-              // Why: if enabling mid-session, seed timers for any Claude tabs that
-              // are already idle — their working→idle transition already happened
-              // and won't re-fire.
               if (enabling) {
                 useAppStore.getState().seedCacheTimersForIdleTabs()
               }
             }}
-            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors ${
-              settings.promptCacheTimerEnabled ? 'bg-foreground' : 'bg-muted-foreground/30'
-            }`}
-          >
-            <span
-              className={`pointer-events-none block size-3.5 rounded-full bg-background shadow-sm transition-transform ${
-                settings.promptCacheTimerEnabled ? 'translate-x-4' : 'translate-x-0.5'
-              }`}
-            />
-          </button>
+          />
         </SearchableSetting>
 
         {settings.promptCacheTimerEnabled && (
@@ -720,9 +943,9 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
             title="Timer Duration"
             description="Match this to your provider's cache TTL."
             keywords={['cache', 'timer', 'duration', 'ttl']}
-            className="flex items-center justify-between gap-4 px-1 py-2 pl-7"
+            className="flex items-center justify-between gap-4 py-2 pl-7"
           >
-            <div className="space-y-0.5">
+            <div className="min-w-0 flex-1 space-y-0.5">
               <Label>Timer Duration</Label>
               <p className="text-xs text-muted-foreground">
                 Match this to your provider&apos;s cache TTL. The default is 5 minutes.
@@ -746,10 +969,10 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
     ) : null,
     matchesSettingsSearch(searchQuery, GENERAL_UPDATE_SEARCH_ENTRIES) ? (
       <section key="updates" className="space-y-4">
-        <div className="space-y-1">
-          <h3 className="text-sm font-semibold">Updates</h3>
-          <p className="text-xs text-muted-foreground">Current version: {appVersion ?? '…'}</p>
-        </div>
+        <SettingsSubsectionHeader
+          title="Updates"
+          description={`Current version: ${appVersion ?? '…'}`}
+        />
 
         <SearchableSetting
           title="Check for Updates"
@@ -863,9 +1086,9 @@ export function GeneralPane({ settings, updateSettings }: GeneralPaneProps): Rea
   ].filter(Boolean)
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
       {visibleSections.map((section, index) => (
-        <div key={index} className="space-y-8">
+        <div key={index} className="space-y-6">
           {index > 0 ? <Separator /> : null}
           {section}
         </div>
@@ -911,9 +1134,7 @@ function SupportSection({
         <div className="space-y-8">
           {hasPrecedingSections ? <Separator /> : null}
           <div className="space-y-4">
-            <div className="space-y-1">
-              <h3 className="text-sm font-semibold">Support Orca</h3>
-            </div>
+            <SettingsSubsectionHeader title="Support Orca" />
             {state === 'loading' ? <SupportRowSkeleton /> : null}
             {state !== 'loading' && state !== 'hidden' ? (
               <SupportRow state={state} onStarClick={onStarClick} />
@@ -927,7 +1148,7 @@ function SupportSection({
 
 function SupportRowSkeleton(): React.JSX.Element {
   return (
-    <div className="flex items-center justify-between gap-4 px-1 py-2" aria-hidden="true">
+    <div className="flex items-center justify-between gap-4 py-2" aria-hidden="true">
       <div className="h-4 w-36 rounded bg-muted/50 animate-pulse" />
       <div className="h-8 w-24 rounded-md bg-muted/50 animate-pulse" />
     </div>
@@ -952,7 +1173,7 @@ function SupportRow({
       title="Star Orca on GitHub"
       description="Support the project with a GitHub star via the gh CLI."
       keywords={['star', 'github', 'support', 'feedback', 'like']}
-      className="flex items-center justify-between gap-4 px-1 py-2"
+      className="flex items-center justify-between gap-4 py-2"
     >
       <Label>Star Orca on GitHub</Label>
       {state === 'starred' ? (

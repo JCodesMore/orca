@@ -1,13 +1,11 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { Files, Search, GitBranch, ListChecks, Cable, PanelRight } from 'lucide-react'
+import { Plug, Files, Search, GitBranch, ListChecks, PanelRight } from 'lucide-react'
 import { useAppStore } from '@/store'
-import { getRepoMapFromState, useActiveWorktree, useRepoById } from '@/store/selectors'
+import { useRepoById } from '@/store/selectors'
 import { cn } from '@/lib/utils'
 import { useSidebarResize } from '@/hooks/useSidebarResize'
 import type { ActivityBarPosition } from '@/store/slices/editor'
-import type { CheckStatus } from '../../../../shared/types'
 import { isFolderRepo } from '../../../../shared/repo-kind'
-import { findWorktreeById } from '@/store/slices/worktree-helpers'
 import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/components/ui/tooltip'
 import {
   ContextMenu,
@@ -28,6 +26,14 @@ import {
   TopActivityOverflowMenu,
   type ActivityBarItem
 } from './activity-bar-buttons'
+import { getActiveChecksStatus } from './active-checks-status'
+import { getVisibleRightSidebarActivityItems } from './right-sidebar-activity-visibility'
+import { useShortcutLabel } from '@/hooks/useShortcutLabel'
+import {
+  RIGHT_SIDEBAR_HEADER_NO_DRAG_CLASS_NAME,
+  RIGHT_SIDEBAR_TOP_ACTIVITY_STRIP_CLASS_NAME,
+  RIGHT_SIDEBAR_WINDOWS_TOP_ACTIVITY_STRIP_CLASS_NAME
+} from './right-sidebar-titlebar-drag-regions'
 
 const MIN_WIDTH = 220
 // Why: long file names (e.g. construction drawing sheets, multi-part document
@@ -39,81 +45,27 @@ const MIN_NON_SIDEBAR_AREA = 320
 const ABSOLUTE_FALLBACK_MAX_WIDTH = 2000
 
 const ACTIVITY_BAR_SIDE_WIDTH = 40
-function branchDisplayName(branch: string): string {
-  return branch.replace(/^refs\/heads\//, '')
-}
 
-function getActiveChecksStatus(state: ReturnType<typeof useAppStore.getState>): CheckStatus | null {
-  const activeWorktree = state.activeWorktreeId
-    ? findWorktreeById(state.worktreesByRepo, state.activeWorktreeId)
-    : null
-  if (!activeWorktree) {
-    return null
-  }
-
-  const activeRepo = getRepoMapFromState(state).get(activeWorktree.repoId)
-  if (!activeRepo) {
-    return null
-  }
-
-  const branch = branchDisplayName(activeWorktree.branch)
-  if (!branch) {
-    return null
-  }
-
-  const prCacheKey = `${activeRepo.path}::${branch}`
-  return state.prCache[prCacheKey]?.data?.checksStatus ?? null
-}
-
-const isMac = typeof navigator !== 'undefined' && navigator.userAgent.includes('Mac')
-const mod = isMac ? '\u2318' : 'Ctrl+'
-
-const ACTIVITY_ITEMS: ActivityBarItem[] = [
-  {
-    id: 'explorer',
-    icon: Files,
-    title: 'Explorer',
-    shortcut: `${isMac ? '\u21E7' : 'Shift+'}${mod}E`
-  },
-  {
-    id: 'search',
-    icon: Search,
-    title: 'Search',
-    shortcut: `${isMac ? '\u21E7' : 'Shift+'}${mod}F`
-  },
-  {
-    id: 'source-control',
-    icon: GitBranch,
-    title: 'Source Control',
-    shortcut: `${isMac ? '\u21E7' : 'Shift+'}${mod}G`,
-    gitOnly: true
-  },
-  {
-    id: 'checks',
-    icon: ListChecks,
-    title: 'Checks',
-    shortcut: `${isMac ? '\u21E7' : 'Shift+'}${mod}K`,
-    gitOnly: true
-  },
-  {
-    id: 'ports',
-    icon: Cable,
-    title: 'Ports',
-    // Why: Ctrl+Shift+I is the DevTools accelerator on Windows/Linux, so this
-    // shortcut is macOS-only. On other platforms the tooltip omits it.
-    shortcut: isMac ? `\u21E7${mod}I` : ''
-  }
-]
-
+const isWindows = typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')
 function RightSidebarInner(): React.JSX.Element {
-  const activeWorktree = useActiveWorktree()
+  const rightSidebarShortcut = useShortcutLabel('sidebar.right.toggle')
+  const explorerShortcut = useShortcutLabel('sidebar.explorer.toggle')
+  const searchShortcut = useShortcutLabel('sidebar.search.toggle')
+  const sourceControlShortcut = useShortcutLabel('sidebar.sourceControl.toggle')
+  const checksShortcut = useShortcutLabel('sidebar.checks.toggle')
+  const portsShortcut = useShortcutLabel('sidebar.ports.toggle')
   const rightSidebarOpen = useAppStore((s) => s.rightSidebarOpen)
+  const activeWorktree = useAppStore((s) =>
+    rightSidebarOpen && s.activeWorktreeId
+      ? (s.getKnownWorktreeById(s.activeWorktreeId) ?? null)
+      : null
+  )
   const rightSidebarWidth = useAppStore((s) => s.rightSidebarWidth)
   const setRightSidebarWidth = useAppStore((s) => s.setRightSidebarWidth)
   const rightSidebarTab = useAppStore((s) => s.rightSidebarTab)
   const setRightSidebarTab = useAppStore((s) => s.setRightSidebarTab)
   const toggleRightSidebar = useAppStore((s) => s.toggleRightSidebar)
-  const checksStatus = useAppStore(getActiveChecksStatus)
+  const checksStatus = useAppStore((s) => (s.rightSidebarOpen ? getActiveChecksStatus(s) : null))
   const activityBarPosition = useAppStore((s) => s.activityBarPosition)
   const setActivityBarPosition = useAppStore((s) => s.setActivityBarPosition)
   const [topActivityStripWidth, setTopActivityStripWidth] = useState<number | null>(null)
@@ -121,16 +73,50 @@ function RightSidebarInner(): React.JSX.Element {
   // Hide those tabs so the activity bar only shows relevant actions.
   const activeRepo = useRepoById(activeWorktree?.repoId ?? null)
   const isFolder = activeRepo ? isFolderRepo(activeRepo) : false
+  const isSshRepo = Boolean(activeRepo?.connectionId)
+
+  const activityItems = useMemo<ActivityBarItem[]>(
+    () => [
+      {
+        id: 'explorer',
+        icon: Files,
+        title: 'Explorer',
+        shortcut: explorerShortcut === 'Unassigned' ? '' : explorerShortcut
+      },
+      {
+        id: 'search',
+        icon: Search,
+        title: 'Search',
+        shortcut: searchShortcut === 'Unassigned' ? '' : searchShortcut
+      },
+      {
+        id: 'source-control',
+        icon: GitBranch,
+        title: 'Source Control',
+        shortcut: sourceControlShortcut === 'Unassigned' ? '' : sourceControlShortcut,
+        gitOnly: true
+      },
+      {
+        id: 'checks',
+        icon: ListChecks,
+        title: 'Checks',
+        shortcut: checksShortcut === 'Unassigned' ? '' : checksShortcut,
+        gitOnly: true
+      },
+      {
+        id: 'ports',
+        icon: Plug,
+        title: 'Ports',
+        shortcut: portsShortcut === 'Unassigned' ? '' : portsShortcut,
+        sshOnly: true
+      }
+    ],
+    [checksShortcut, explorerShortcut, portsShortcut, searchShortcut, sourceControlShortcut]
+  )
 
   const visibleItems = useMemo(
-    () =>
-      ACTIVITY_ITEMS.filter((item) => {
-        if (item.gitOnly && isFolder) {
-          return false
-        }
-        return true
-      }),
-    [isFolder]
+    () => getVisibleRightSidebarActivityItems(activityItems, { isFolder, isSshRepo }),
+    [activityItems, isFolder, isSshRepo]
   )
 
   // If the active tab is hidden (e.g. switched from a git repo to a folder),
@@ -152,7 +138,7 @@ function RightSidebarInner(): React.JSX.Element {
   })
   const topActivityStripRef = useMeasuredWidth(setTopActivityStripWidth)
 
-  const panelContent = (
+  const panelContent = rightSidebarOpen ? (
     <div className="flex flex-col flex-1 min-h-0 overflow-hidden scrollbar-sleek-parent">
       {/* Why: sidebar panels no longer use key={activeWorktreeId} because
           the full unmount/remount cycle on every worktree switch triggered
@@ -170,10 +156,15 @@ function RightSidebarInner(): React.JSX.Element {
         {effectiveTab === 'search' && <SearchPanel />}
         {effectiveTab === 'source-control' && <SourceControl />}
         {effectiveTab === 'checks' && <ChecksPanel />}
-        {effectiveTab === 'ports' && <PortsPanel isVisible={rightSidebarOpen} />}
+        {/* Why: SSH port forwarding still depends on the raw ports.detect data,
+            which the workspace-scoped status bar popover intentionally does not
+            expose. Keep this panel reachable only for SSH worktrees. */}
+        {effectiveTab === 'ports' && (
+          <PortsPanel isVisible={rightSidebarOpen && effectiveTab === 'ports'} />
+        )}
       </div>
     </div>
-  )
+  ) : null
 
   const topActivityLayout = useMemo(
     () => getTopActivityBarLayout(visibleItems, topActivityStripWidth, effectiveTab),
@@ -204,7 +195,7 @@ function RightSidebarInner(): React.JSX.Element {
         </button>
       </TooltipTrigger>
       <TooltipContent side="bottom" sideOffset={6}>
-        {`Toggle right sidebar (${isMac ? '⌘L' : 'Ctrl+L'})`}
+        {`Toggle right sidebar (${rightSidebarShortcut})`}
       </TooltipContent>
     </Tooltip>
   ) : null
@@ -232,17 +223,80 @@ function RightSidebarInner(): React.JSX.Element {
         {activityBarPosition === 'top' ? (
           /* ── Top activity bar: horizontal icon row ── */
           <ContextMenu>
-            <div className="flex items-center border-b border-border h-[36px] min-h-[36px] pl-2 pr-1 right-sidebar-header-inset right-sidebar-header-drag overflow-hidden">
+            <div className="flex h-[36px] min-h-[36px] items-center border-b border-border right-sidebar-header-inset right-sidebar-header-drag overflow-hidden">
+              {!isWindows && (
+                <TooltipProvider delayDuration={400}>
+                  <ContextMenuTrigger asChild>
+                    <div
+                      ref={topActivityStripRef}
+                      className={RIGHT_SIDEBAR_TOP_ACTIVITY_STRIP_CLASS_NAME}
+                    >
+                      <div
+                        className={cn(
+                          'flex min-w-0 shrink',
+                          RIGHT_SIDEBAR_HEADER_NO_DRAG_CLASS_NAME
+                        )}
+                      >
+                        {/* Why: the top strip shares a narrow titlebar with the close
+                            button and Windows controls. Overflow goes behind More
+                            instead of creating a horizontally scrollable toolbar. */}
+                        <div className="flex min-w-0 shrink">
+                          {topActivityLayout.visibleItems.map((item) => (
+                            <ActivityBarButton
+                              key={item.id}
+                              item={item}
+                              active={effectiveTab === item.id}
+                              onClick={() => setRightSidebarTab(item.id)}
+                              layout="top"
+                              statusIndicator={item.id === 'checks' ? checksStatus : null}
+                            />
+                          ))}
+                        </div>
+                        {topActivityLayout.overflowItems.length > 0 && (
+                          <TopActivityOverflowMenu
+                            items={topActivityLayout.overflowItems}
+                            activeTab={effectiveTab}
+                            onSelect={setRightSidebarTab}
+                            checksStatus={checksStatus}
+                          />
+                        )}
+                      </div>
+                    </div>
+                  </ContextMenuTrigger>
+                  <div
+                    className={cn(
+                      'flex shrink-0 items-center pr-1',
+                      RIGHT_SIDEBAR_HEADER_NO_DRAG_CLASS_NAME
+                    )}
+                  >
+                    {closeButton}
+                  </div>
+                </TooltipProvider>
+              )}
+              {isWindows && (
+                <TooltipProvider delayDuration={400}>
+                  <div
+                    className={cn(
+                      'ml-auto flex shrink-0 items-center pr-1',
+                      RIGHT_SIDEBAR_HEADER_NO_DRAG_CLASS_NAME
+                    )}
+                  >
+                    {closeButton}
+                  </div>
+                </TooltipProvider>
+              )}
+            </div>
+            {isWindows && (
               <TooltipProvider delayDuration={400}>
                 <ContextMenuTrigger asChild>
                   <div
                     ref={topActivityStripRef}
-                    className="right-sidebar-activity-strip flex min-w-0 flex-1 items-center overflow-hidden right-sidebar-header-no-drag"
+                    className={RIGHT_SIDEBAR_WINDOWS_TOP_ACTIVITY_STRIP_CLASS_NAME}
                   >
-                    {/* Why: the top strip shares a narrow titlebar with the close
-                        button and Windows controls. Overflow goes behind More
-                        instead of creating a horizontally scrollable toolbar. */}
-                    <div className="flex min-w-0 shrink">
+                    {/* Why: Windows has fixed native-style controls in the titlebar
+                        area; keep sidebar navigation in the sidebar body so the
+                        titlebar stays visually native instead of crowded. */}
+                    <div className="flex min-w-0 flex-1 shrink">
                       {topActivityLayout.visibleItems.map((item) => (
                         <ActivityBarButton
                           key={item.id}
@@ -264,11 +318,8 @@ function RightSidebarInner(): React.JSX.Element {
                     )}
                   </div>
                 </ContextMenuTrigger>
-                <div className="flex shrink-0 items-center right-sidebar-header-no-drag">
-                  {closeButton}
-                </div>
               </TooltipProvider>
-            </div>
+            )}
             <ActivityBarPositionMenu
               currentPosition={activityBarPosition}
               onChangePosition={setActivityBarPosition}

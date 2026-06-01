@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- Why: PaneManager keeps live pane lifecycle, drag, rendering, and identity callbacks under one owner. */
 import type {
   PaneManagerOptions,
   PaneStyleOptions,
@@ -10,9 +11,10 @@ import {
   createDivider,
   applyDividerStyles,
   applyPaneOpacity,
-  applyRootBackground
+  applyRootBackground,
+  disposeDividersIn
 } from './pane-divider'
-import { createDragReorderState, hideDropOverlay, handlePaneDrop } from './pane-drag-reorder'
+import { cancelActivePaneDrag, createDragReorderState, handlePaneDrop } from './pane-drag-reorder'
 import { createPaneDOM, openTerminal, setLigaturesEnabled, disposePane } from './pane-lifecycle'
 import { shouldFollowMouseFocus } from './focus-follows-mouse'
 import {
@@ -47,6 +49,7 @@ export class PaneManager {
   private destroyed = false
   private renderingSuspended: boolean
   private identities = new PaneIdentityRegistry()
+  private pendingPaneReparentFrameIds = new Set<number>()
 
   // Drag-to-reorder state
   private dragState = createDragReorderState()
@@ -257,11 +260,13 @@ export class PaneManager {
 
   destroy(): void {
     this.destroyed = true
-    hideDropOverlay(this.dragState)
+    cancelActivePaneDrag(this.dragState)
+    this.cancelPendingPaneReparentFrames()
     for (const pane of this.panes.values()) {
       disposePane(pane, this.panes)
     }
     this.identities.clear()
+    disposeDividersIn(this.root)
     this.root.innerHTML = ''
     this.activePaneId = null
   }
@@ -335,7 +340,35 @@ export class PaneManager {
         applyPaneOpacity(this.panes.values(), this.activePaneId, this.styleOptions),
       applyDividerStyles: () => applyDividerStyles(this.root, this.styleOptions),
       refitPanesUnder: (el: HTMLElement) => refitPanesUnder(el, this.panes),
-      onLayoutChanged: this.options.onLayoutChanged
+      requestPaneReparentFrame: (callback: FrameRequestCallback) => {
+        this.requestPaneReparentFrame(callback)
+      },
+      onLayoutChanged: this.options.onLayoutChanged,
+      onDragActiveChange: this.options.onPaneDragActiveChange
     }
+  }
+
+  private requestPaneReparentFrame(callback: FrameRequestCallback): void {
+    let completed = false
+    let frameId: number | undefined
+    frameId = requestAnimationFrame((timestamp) => {
+      completed = true
+      if (frameId !== undefined) {
+        this.pendingPaneReparentFrameIds.delete(frameId)
+      }
+      if (!this.destroyed) {
+        callback(timestamp)
+      }
+    })
+    if (!completed) {
+      this.pendingPaneReparentFrameIds.add(frameId)
+    }
+  }
+
+  private cancelPendingPaneReparentFrames(): void {
+    for (const frameId of this.pendingPaneReparentFrameIds) {
+      cancelAnimationFrame(frameId)
+    }
+    this.pendingPaneReparentFrameIds.clear()
   }
 }

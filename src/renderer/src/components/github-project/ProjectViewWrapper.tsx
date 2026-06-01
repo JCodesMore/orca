@@ -5,7 +5,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ExternalLink,
-  Loader,
   RefreshCw,
   KanbanSquare,
   Map as MapIcon,
@@ -32,6 +31,7 @@ import { useRepoSlugIndex } from '@/lib/repo-slug-index'
 import { cn } from '@/lib/utils'
 import { callRuntimeRpc, getActiveRuntimeTarget } from '@/runtime/runtime-rpc-client'
 import { useAppStore } from '@/store'
+import { useMountedRef } from '@/hooks/useMountedRef'
 import { projectViewCacheKey } from '@/store/slices/github'
 import type {
   GetProjectViewTableResult,
@@ -48,6 +48,15 @@ import ProjectPicker, { type ResolvedProjectSelection } from './ProjectPicker'
 import ProjectViewList from './ProjectViewList'
 import ProjectItemSlugDialog from './ProjectItemSlugDialog'
 import { filterProjectTableRowsByOpenRepos } from './project-row-filtering'
+import {
+  resolveMissingRepoProjectDialogState,
+  resolveRepoBackedProjectDialogState
+} from './project-dialog-state'
+import {
+  getNextVisibleProjectTableCache,
+  getVisibleProjectTable,
+  type CachedVisibleProjectTable
+} from './project-visible-table-cache'
 
 type Props = Record<string, never>
 
@@ -76,6 +85,7 @@ export default function ProjectViewWrapper(_props: Props = {} as Props): React.J
   const addRepoFromStore = useAppStore((s) => s.addRepo)
   const repos = useAppStore((s) => s.repos)
   const { lookupSlug, ready: slugIndexReady } = useRepoSlugIndex()
+  const mountedRef = useMountedRef()
 
   const activeProject = settings?.githubProjects?.activeProject ?? null
   const lastViewByProject = useMemo(
@@ -127,18 +137,21 @@ export default function ProjectViewWrapper(_props: Props = {} as Props): React.J
           },
           { force }
         )
+        if (!mountedRef.current || fetchRunIdRef.current !== runId) {
+          return
+        }
         if (!res.ok) {
           setError({ error: res.error, totalCount: res.totalCount })
         }
       } finally {
         // Why: a manual refresh can overlap with a tab/search fetch; an older
         // request finishing first must not clear the newer refresh indicator.
-        if (fetchRunIdRef.current === runId) {
+        if (mountedRef.current && fetchRunIdRef.current === runId) {
           setLoading(false)
         }
       }
     },
-    [fetchProjectViewTable]
+    [fetchProjectViewTable, mountedRef]
   )
 
   const handleSelect = useCallback(
@@ -304,27 +317,23 @@ export default function ProjectViewWrapper(_props: Props = {} as Props): React.J
     () => (table && slugIndexReady ? filterProjectTableRowsByOpenRepos(table, lookupSlug) : null),
     [table, slugIndexReady, lookupSlug]
   )
-  const [lastFilteredTable, setLastFilteredTable] = useState<{
-    cacheKey: string
-    table: GitHubProjectTable
-  } | null>(null)
-
-  useEffect(() => {
-    if (!currentCacheKey || !table) {
-      setLastFilteredTable(null)
-      return
-    }
-    if (slugIndexReady && filteredTable) {
-      setLastFilteredTable({ cacheKey: currentCacheKey, table: filteredTable })
-    }
-  }, [currentCacheKey, table, slugIndexReady, filteredTable])
-
-  const visibleTable =
-    slugIndexReady || !currentCacheKey
-      ? filteredTable
-      : lastFilteredTable?.cacheKey === currentCacheKey
-        ? lastFilteredTable.table
-        : null
+  const lastFilteredTableRef = useRef<CachedVisibleProjectTable | null>(null)
+  // Why: this cache only prevents a blank table while the repo slug index
+  // rebuilds; a ref preserves the previous render value without scheduling
+  // a second render after every filtered-table change.
+  lastFilteredTableRef.current = getNextVisibleProjectTableCache({
+    currentCacheKey,
+    sourceTable: table,
+    slugIndexReady,
+    filteredTable,
+    previous: lastFilteredTableRef.current
+  })
+  const visibleTable = getVisibleProjectTable({
+    currentCacheKey,
+    slugIndexReady,
+    filteredTable,
+    cachedTable: lastFilteredTableRef.current
+  })
 
   // Parent-dropped toast, once per table.
   useEffect(() => {
@@ -371,26 +380,27 @@ export default function ProjectViewWrapper(_props: Props = {} as Props): React.J
   } | null>(null)
   const liveRepoIds = useMemo(() => new Set(repos.map((repo) => repo.id)), [repos])
 
-  useEffect(() => {
-    if (dialogRepoItem && !liveRepoIds.has(dialogRepoItem.repoId)) {
-      setDialogRepoItem(null)
-    }
-  }, [dialogRepoItem, liveRepoIds])
+  const resolvedDialogRepoItem = resolveRepoBackedProjectDialogState(dialogRepoItem, liveRepoIds)
+  if (resolvedDialogRepoItem !== dialogRepoItem) {
+    // Why: repo-backed Project dialogs cannot edit after their repo leaves
+    // Orca; clear them before the modal tree receives stale repo ids.
+    setDialogRepoItem(resolvedDialogRepoItem)
+  }
 
-  useEffect(() => {
-    if (!slugIndexReady) {
-      return
-    }
-    if (
-      slugDialog &&
-      lookupSlug(`${slugDialog.origin.owner}/${slugDialog.origin.repo}`).length > 0
-    ) {
-      setSlugDialog(null)
-    }
-    if (repoNotInOrca && lookupSlug(`${repoNotInOrca.owner}/${repoNotInOrca.repo}`).length > 0) {
-      setRepoNotInOrca(null)
-    }
-  }, [slugIndexReady, lookupSlug, slugDialog, repoNotInOrca])
+  const resolvedMissingRepoDialogs = resolveMissingRepoProjectDialogState({
+    slugIndexReady,
+    slugDialog,
+    repoNotInOrca,
+    lookupSlug
+  })
+  if (resolvedMissingRepoDialogs.slugDialog !== slugDialog) {
+    // Why: once a previously missing repo is registered, Project rows should
+    // use the full repo-backed dialog instead of the slug fallback.
+    setSlugDialog(resolvedMissingRepoDialogs.slugDialog)
+  }
+  if (resolvedMissingRepoDialogs.repoNotInOrca !== repoNotInOrca) {
+    setRepoNotInOrca(resolvedMissingRepoDialogs.repoNotInOrca)
+  }
 
   const buildWorkItem = useCallback(
     (row: GitHubProjectRow, repoId: string): GitHubWorkItem | null => {
@@ -724,10 +734,7 @@ export default function ProjectViewWrapper(_props: Props = {} as Props): React.J
           Choose a project to get started.
         </div>
       ) : loading && !table ? (
-        <div className="flex flex-1 items-center justify-center p-8 text-sm text-muted-foreground">
-          <Loader className="mr-2 size-4 animate-spin" />
-          Loading project view…
-        </div>
+        <ProjectTableSkeleton />
       ) : error ? (
         <ErrorState
           error={error.error}
@@ -760,12 +767,12 @@ export default function ProjectViewWrapper(_props: Props = {} as Props): React.J
           707) so a row from another repo cannot accidentally edit the active
           workspace. */}
       <GitHubItemDialog
-        workItem={dialogRepoItem?.workItem ?? null}
-        repoPath={dialogRepoItem?.repoPath ?? null}
-        repoId={dialogRepoItem?.repoId ?? null}
-        projectOrigin={dialogRepoItem?.origin}
+        workItem={resolvedDialogRepoItem?.workItem ?? null}
+        repoPath={resolvedDialogRepoItem?.repoPath ?? null}
+        repoId={resolvedDialogRepoItem?.repoId ?? null}
+        projectOrigin={resolvedDialogRepoItem?.origin}
         onUse={(item) => {
-          const current = dialogRepoItem
+          const current = resolvedDialogRepoItem
           setDialogRepoItem(null)
           if (!current) {
             return
@@ -791,21 +798,21 @@ export default function ProjectViewWrapper(_props: Props = {} as Props): React.J
           having a duplicate (always-disabled or always-routing-to-fallback)
           button here would only confuse the user. */}
       <ProjectItemSlugDialog
-        projectOrigin={slugDialog?.origin ?? null}
+        projectOrigin={resolvedMissingRepoDialogs.slugDialog?.origin ?? null}
         onClose={() => setSlugDialog(null)}
       />
 
       {/* repo-not-in-orca prompt: see design doc Interaction States. */}
       <Dialog
-        open={repoNotInOrca !== null}
+        open={resolvedMissingRepoDialogs.repoNotInOrca !== null}
         onOpenChange={(open) => !open && setRepoNotInOrca(null)}
       >
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>Repository not in Orca</DialogTitle>
             <DialogDescription>
-              {repoNotInOrca
-                ? `${repoNotInOrca.owner}/${repoNotInOrca.repo} isn't added to Orca. Add it to start work, or open in GitHub.`
+              {resolvedMissingRepoDialogs.repoNotInOrca
+                ? `${resolvedMissingRepoDialogs.repoNotInOrca.owner}/${resolvedMissingRepoDialogs.repoNotInOrca.repo} isn't added to Orca. Add it to start work, or open in GitHub.`
                 : null}
             </DialogDescription>
           </DialogHeader>
@@ -813,12 +820,12 @@ export default function ProjectViewWrapper(_props: Props = {} as Props): React.J
             <Button variant="ghost" onClick={() => setRepoNotInOrca(null)}>
               Cancel
             </Button>
-            {repoNotInOrca?.url ? (
+            {resolvedMissingRepoDialogs.repoNotInOrca?.url ? (
               <Button
                 variant="outline"
                 onClick={() => {
-                  if (repoNotInOrca.url) {
-                    void window.api.shell.openUrl(repoNotInOrca.url)
+                  if (resolvedMissingRepoDialogs.repoNotInOrca?.url) {
+                    void window.api.shell.openUrl(resolvedMissingRepoDialogs.repoNotInOrca.url)
                   }
                   setRepoNotInOrca(null)
                 }}
@@ -1091,6 +1098,49 @@ function ErrorState({
         <Button size="sm" variant="outline" onClick={onOpenInGitHub}>
           <ExternalLink className="mr-1 size-3.5" /> Open in GitHub
         </Button>
+      </div>
+    </div>
+  )
+}
+
+// Why: matches the shape of ProjectViewList's header + rows so the table
+// doesn't visibly jump in height when real data lands. A 12-row stub fills
+// a typical viewport at the table's min-h-10 row height.
+function ProjectTableSkeleton(): React.JSX.Element {
+  const headerCols = 6
+  const bodyCols = 5
+  return (
+    <div
+      aria-busy="true"
+      aria-label="Loading project view"
+      className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+    >
+      <div className="grid items-center gap-3 border-b border-border/60 bg-background/95 px-3 py-2">
+        <div
+          className="grid items-center gap-3"
+          style={{
+            gridTemplateColumns: `repeat(${headerCols}, minmax(0, 1fr))`
+          }}
+        >
+          {Array.from({ length: headerCols }).map((_, i) => (
+            <div key={i} className="h-3 w-20 animate-pulse rounded bg-muted/70" />
+          ))}
+        </div>
+      </div>
+      <div className="divide-y divide-border/30">
+        {Array.from({ length: 12 }).map((_, i) => (
+          <div
+            key={i}
+            className="grid min-h-10 items-center gap-3 px-3 py-2"
+            style={{ gridTemplateColumns: `repeat(${bodyCols}, minmax(0, 1fr))` }}
+          >
+            <div className="h-4 w-3/5 animate-pulse rounded bg-muted/70" />
+            <div className="h-4 w-4/5 animate-pulse rounded bg-muted/70" />
+            <div className="h-4 w-2/5 animate-pulse rounded-full bg-muted/60" />
+            <div className="h-4 w-3/5 animate-pulse rounded bg-muted/60" />
+            <div className="h-4 w-1/2 animate-pulse rounded bg-muted/60" />
+          </div>
+        ))}
       </div>
     </div>
   )

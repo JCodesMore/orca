@@ -1,3 +1,5 @@
+/* eslint-disable max-lines -- Why: GitLab MR operation tests share one hoisted
+   gl-utils mock; splitting the file would duplicate brittle mock setup. */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type * as GlUtils from './gl-utils'
 
@@ -33,7 +35,21 @@ vi.mock('./gl-utils', async () => {
   }
 })
 
-import { getMergeRequest, getMergeRequestForBranch, listMergeRequests } from './client'
+import {
+  _getGitLabRateLimitCacheSize,
+  _resetGitLabRateLimitCache,
+  getMergeRequest,
+  getMergeRequestForBranch,
+  getJobTrace,
+  addMRInlineComment,
+  diagnoseAuth,
+  getRateLimit,
+  listMergeRequests,
+  resolveMRDiscussion,
+  retryJob,
+  updateMR,
+  updateMRReviewers
+} from './client'
 
 describe('gitlab client — MR operations', () => {
   beforeEach(() => {
@@ -45,7 +61,12 @@ describe('gitlab client — MR operations', () => {
     acquireMock.mockReset()
     releaseMock.mockReset()
     acquireMock.mockResolvedValue(undefined)
+    _resetGitLabRateLimitCache()
     getGlabKnownHostsMock.mockResolvedValue(['gitlab.com'])
+    resolveIssueSourceMock.mockResolvedValue({
+      source: { host: 'gitlab.com', path: 'g/p' },
+      fellBack: false
+    })
   })
 
   describe('getMergeRequest', () => {
@@ -111,6 +132,73 @@ describe('gitlab client — MR operations', () => {
     })
   })
 
+  describe('diagnoseAuth', () => {
+    it('reports glab hosts from auth status', async () => {
+      glabExecFileAsyncMock.mockResolvedValueOnce({
+        stdout: '✓ Logged in to gitlab.com as alice\n',
+        stderr: ''
+      })
+
+      await expect(diagnoseAuth()).resolves.toMatchObject({
+        glabAvailable: true,
+        authenticated: true,
+        hosts: ['gitlab.com'],
+        activeHost: 'gitlab.com'
+      })
+    })
+  })
+
+  describe('getRateLimit', () => {
+    it('parses GitLab REST budget headers', async () => {
+      glabApiWithHeadersMock.mockResolvedValueOnce({
+        body: '{}',
+        headers: {
+          'ratelimit-limit': '2000',
+          'ratelimit-remaining': '1997',
+          'ratelimit-reset': '1780000000'
+        }
+      })
+
+      await expect(
+        getRateLimit({ host: 'gitlab.example.com', force: true })
+      ).resolves.toMatchObject({
+        ok: true,
+        snapshot: {
+          host: 'gitlab.example.com',
+          rest: {
+            limit: 2000,
+            remaining: 1997,
+            resetAt: 1780000000
+          }
+        }
+      })
+      expect(glabApiWithHeadersMock).toHaveBeenCalledWith([
+        '--hostname',
+        'gitlab.example.com',
+        'user'
+      ])
+    })
+
+    it('reports a null bucket when the host omits rate-limit headers', async () => {
+      glabApiWithHeadersMock.mockResolvedValueOnce({ body: '{}', headers: {} })
+
+      await expect(getRateLimit({ force: true })).resolves.toMatchObject({
+        ok: true,
+        snapshot: { host: null, rest: null }
+      })
+    })
+
+    it('bounds cached rate-limit snapshots across many hosts', async () => {
+      glabApiWithHeadersMock.mockResolvedValue({ body: '{}', headers: {} })
+
+      for (let i = 0; i < 70; i++) {
+        await getRateLimit({ host: `gitlab-${i}.example.com`, force: true })
+      }
+
+      expect(_getGitLabRateLimitCacheSize()).toBe(64)
+    })
+  })
+
   describe('getMergeRequestForBranch', () => {
     it('finds the most recently updated MR for a branch across states', async () => {
       getProjectRefMock.mockResolvedValueOnce({ host: 'gitlab.com', path: 'g/p' })
@@ -137,6 +225,25 @@ describe('gitlab client — MR operations', () => {
         ],
         { cwd: '/repo' }
       )
+    })
+
+    it('uses legacy pipeline payloads when branch MR lists omit head_pipeline', async () => {
+      getProjectRefMock.mockResolvedValueOnce({ host: 'gitlab.com', path: 'g/p' })
+      glabExecFileAsyncMock.mockResolvedValueOnce({
+        stdout: JSON.stringify([
+          {
+            iid: 8,
+            title: 'Legacy pipeline branch',
+            state: 'opened',
+            sha: 'def',
+            pipeline: { status: 'failed' }
+          }
+        ])
+      })
+
+      const mr = await getMergeRequestForBranch('/repo', 'feature/legacy-pipeline')
+      expect(mr?.number).toBe(8)
+      expect(mr?.pipelineStatus).toBe('failure')
     })
 
     it('strips refs/heads/ prefix from the branch arg', async () => {
@@ -191,13 +298,12 @@ describe('gitlab client — MR operations', () => {
   describe('listMergeRequests', () => {
     beforeEach(() => {
       resolveIssueSourceMock.mockImplementation(async () => ({
-        source: await getProjectRefMock(),
+        source: { host: 'gitlab.com', path: 'g/p' },
         fellBack: false
       }))
     })
 
-    it('paginates with X-Total / X-Total-Pages', async () => {
-      getProjectRefMock.mockResolvedValueOnce({ host: 'gitlab.com', path: 'g/p' })
+    it('returns MRs via the GitLab API', async () => {
       glabApiWithHeadersMock.mockResolvedValueOnce({
         body: JSON.stringify([
           {
@@ -214,7 +320,7 @@ describe('gitlab client — MR operations', () => {
             target_project_id: 5
           }
         ]),
-        headers: { 'x-total': '42', 'x-total-pages': '3' }
+        headers: { 'x-total': '1', 'x-total-pages': '1' }
       })
 
       const result = await listMergeRequests('/repo', 'opened', 1, 20)
@@ -230,33 +336,33 @@ describe('gitlab client — MR operations', () => {
         isCrossRepository: false,
         repoId: 'g/p'
       })
-      expect(result.totalCount).toBe(42)
-      expect(result.totalPages).toBe(3)
-      expect(result.page).toBe(1)
+      expect(glabApiWithHeadersMock).toHaveBeenCalledWith(
+        [
+          'projects/g%2Fp/merge_requests?page=1&per_page=20&order_by=updated_at&sort=desc&with_merge_status_recheck=false&state=opened'
+        ],
+        { cwd: '/repo' }
+      )
     })
 
-    it("omits the state param when state='all'", async () => {
-      getProjectRefMock.mockResolvedValueOnce({ host: 'gitlab.com', path: 'g/p' })
+    it("omits state when state='all'", async () => {
       glabApiWithHeadersMock.mockResolvedValueOnce({ body: '[]', headers: {} })
 
       await listMergeRequests('/repo', 'all', 1, 20)
-      const callPath = glabApiWithHeadersMock.mock.calls[0][0][0] as string
-      expect(callPath).not.toContain('state=')
+      const callArgs = glabApiWithHeadersMock.mock.calls[0][0] as string[]
+      expect(callArgs[0]).not.toContain('state=')
     })
 
-    it('passes through Open / Merged / Closed states', async () => {
+    it('passes through Open / Merged / Closed states as API params', async () => {
       for (const state of ['opened', 'merged', 'closed'] as const) {
         glabApiWithHeadersMock.mockReset()
-        getProjectRefMock.mockResolvedValueOnce({ host: 'gitlab.com', path: 'g/p' })
         glabApiWithHeadersMock.mockResolvedValueOnce({ body: '[]', headers: {} })
         await listMergeRequests('/repo', state, 1, 20)
-        const callPath = glabApiWithHeadersMock.mock.calls[0][0][0] as string
-        expect(callPath).toContain(`state=${state}`)
+        const callArgs = glabApiWithHeadersMock.mock.calls[0][0] as string[]
+        expect(callArgs[0]).toContain(`state=${state}`)
       }
     })
 
     it('flags fork MRs as cross-repository', async () => {
-      getProjectRefMock.mockResolvedValueOnce({ host: 'gitlab.com', path: 'g/p' })
       glabApiWithHeadersMock.mockResolvedValueOnce({
         body: JSON.stringify([
           {
@@ -266,43 +372,370 @@ describe('gitlab client — MR operations', () => {
             state: 'opened',
             source_branch: 'feat',
             target_branch: 'main',
-            // Different source/target = fork MR
             source_project_id: 11,
             target_project_id: 5
           }
         ]),
-        headers: { 'x-total': '1', 'x-total-pages': '1' }
+        headers: {}
       })
 
       const result = await listMergeRequests('/repo', 'opened', 1, 20)
       expect(result.items[0].isCrossRepository).toBe(true)
     })
 
-    it('returns a not_found error envelope when project ref is unresolved', async () => {
-      getProjectRefMock.mockResolvedValueOnce(null)
+    it('falls back to glab mr list when project ref is unresolved', async () => {
+      resolveIssueSourceMock.mockResolvedValueOnce({
+        source: null,
+        fellBack: false
+      })
+      glabExecFileAsyncMock.mockResolvedValueOnce({
+        stdout: JSON.stringify([
+          {
+            id: 300,
+            iid: 3,
+            title: 'fallback mr',
+            state: 'opened',
+            web_url: 'https://gitlab.com/-/merge_requests/3',
+            updated_at: '2026-05-05',
+            source_project_id: 5,
+            target_project_id: 5
+          }
+        ])
+      })
       const result = await listMergeRequests('/repo', 'opened')
-      expect(result.error?.type).toBe('not_found')
+      expect(result.items).toHaveLength(1)
+      expect(result.items[0].title).toBe('fallback mr')
+      expect(glabApiWithHeadersMock).not.toHaveBeenCalled()
+      expect(glabExecFileAsyncMock).toHaveBeenCalledWith(
+        [
+          'mr',
+          'list',
+          '--output',
+          'json',
+          '--per-page',
+          '20',
+          '--page',
+          '1',
+          '--order',
+          'updated_at',
+          '--sort',
+          'desc'
+        ],
+        { cwd: '/repo' }
+      )
+    })
+
+    it('classifies fallback errors into the result envelope', async () => {
+      resolveIssueSourceMock.mockResolvedValueOnce({
+        source: null,
+        fellBack: false
+      })
+      glabExecFileAsyncMock.mockRejectedValueOnce(new Error('HTTP 403 Forbidden'))
+      const result = await listMergeRequests('/repo', 'opened')
+      expect(result.error?.type).toBe('permission_denied')
       expect(result.items).toEqual([])
       expect(glabApiWithHeadersMock).not.toHaveBeenCalled()
     })
 
-    it('falls back to ceil(total/perPage) when x-total-pages is absent', async () => {
-      getProjectRefMock.mockResolvedValueOnce({ host: 'gitlab.com', path: 'g/p' })
-      glabApiWithHeadersMock.mockResolvedValueOnce({
-        body: '[]',
-        headers: { 'x-total': '57' }
+    it('does not run the cwd fallback for unresolved SSH repos', async () => {
+      resolveIssueSourceMock.mockResolvedValueOnce({
+        source: null,
+        fellBack: false
       })
-      const result = await listMergeRequests('/repo', 'opened', 1, 20)
-      expect(result.totalCount).toBe(57)
-      expect(result.totalPages).toBe(3)
+      const result = await listMergeRequests(
+        '/remote/repo',
+        'opened',
+        1,
+        20,
+        undefined,
+        undefined,
+        'conn-1'
+      )
+      expect(result.error?.type).toBe('not_found')
+      expect(result.items).toEqual([])
+      expect(glabExecFileAsyncMock).not.toHaveBeenCalled()
+      expect(glabApiWithHeadersMock).not.toHaveBeenCalled()
     })
 
     it('classifies API errors into the result envelope', async () => {
-      getProjectRefMock.mockResolvedValueOnce({ host: 'gitlab.com', path: 'g/p' })
       glabApiWithHeadersMock.mockRejectedValueOnce(new Error('HTTP 403 Forbidden'))
       const result = await listMergeRequests('/repo', 'opened')
       expect(result.error?.type).toBe('permission_denied')
       expect(result.items).toEqual([])
+    })
+  })
+
+  describe('updateMR', () => {
+    beforeEach(() => {
+      resolveIssueSourceMock.mockImplementation(async () => ({
+        source: { host: 'git.internal', path: 'g/p' },
+        fellBack: false
+      }))
+    })
+
+    it('updates title, body, and labels through the selected SSH GitLab host', async () => {
+      glabExecFileAsyncMock.mockResolvedValueOnce({ stdout: '{}' })
+
+      await expect(
+        updateMR(
+          '/repo',
+          12,
+          {
+            title: 'Renamed',
+            body: 'Updated body',
+            addLabels: ['bug'],
+            removeLabels: ['stale']
+          },
+          'upstream',
+          'conn-1'
+        )
+      ).resolves.toEqual({ ok: true })
+
+      expect(glabExecFileAsyncMock).toHaveBeenCalledWith(
+        [
+          'api',
+          '--hostname',
+          'git.internal',
+          '-X',
+          'PUT',
+          'projects/g%2Fp/merge_requests/12',
+          '-f',
+          'title=Renamed',
+          '-f',
+          'description=Updated body',
+          '-f',
+          'add_labels=bug',
+          '-f',
+          'remove_labels=stale'
+        ],
+        {}
+      )
+    })
+  })
+
+  describe('resolveMRDiscussion', () => {
+    beforeEach(() => {
+      resolveIssueSourceMock.mockImplementation(async () => ({
+        source: { host: 'git.internal', path: 'g/p' },
+        fellBack: false
+      }))
+    })
+
+    it('updates the discussion resolved state through the selected SSH GitLab host', async () => {
+      glabExecFileAsyncMock.mockResolvedValueOnce({ stdout: '{}' })
+
+      await expect(
+        resolveMRDiscussion('/repo', 12, 'discussion-1', true, 'upstream', 'conn-1')
+      ).resolves.toEqual({ ok: true })
+
+      expect(glabExecFileAsyncMock).toHaveBeenCalledWith(
+        [
+          'api',
+          '--hostname',
+          'git.internal',
+          '-X',
+          'PUT',
+          'projects/g%2Fp/merge_requests/12/discussions/discussion-1',
+          '-f',
+          'resolved=true'
+        ],
+        {}
+      )
+    })
+
+    it('rejects an empty discussion id without calling glab', async () => {
+      await expect(resolveMRDiscussion('/repo', 12, '  ', true)).resolves.toEqual({
+        ok: false,
+        error: 'Discussion id is required'
+      })
+
+      expect(glabExecFileAsyncMock).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('addMRInlineComment', () => {
+    beforeEach(() => {
+      resolveIssueSourceMock.mockImplementation(async () => ({
+        source: { host: 'git.internal', path: 'g/p' },
+        fellBack: false
+      }))
+    })
+
+    it('posts an inline discussion with GitLab position fields', async () => {
+      glabExecFileAsyncMock.mockResolvedValueOnce({
+        stdout: JSON.stringify({
+          id: 'discussion-1',
+          notes: [
+            {
+              id: 500,
+              author: { username: 'alice', avatar_url: 'https://example.com/a.png' },
+              body: 'please fix',
+              created_at: '2026-05-05T10:00:00Z',
+              position: { new_path: 'src/app.ts', new_line: 12 }
+            }
+          ]
+        })
+      })
+
+      await expect(
+        addMRInlineComment(
+          '/repo',
+          12,
+          {
+            body: 'please fix',
+            path: 'src/app.ts',
+            line: 12,
+            baseSha: 'base',
+            startSha: 'start',
+            headSha: 'head'
+          },
+          'upstream',
+          'conn-1'
+        )
+      ).resolves.toMatchObject({
+        ok: true,
+        comment: {
+          id: 500,
+          threadId: 'discussion-1',
+          path: 'src/app.ts',
+          line: 12
+        }
+      })
+
+      expect(glabExecFileAsyncMock).toHaveBeenCalledWith(
+        [
+          'api',
+          '--hostname',
+          'git.internal',
+          '-X',
+          'POST',
+          'projects/g%2Fp/merge_requests/12/discussions',
+          '-f',
+          'body=please fix',
+          '-f',
+          'position[position_type]=text',
+          '-f',
+          'position[base_sha]=base',
+          '-f',
+          'position[start_sha]=start',
+          '-f',
+          'position[head_sha]=head',
+          '-f',
+          'position[old_path]=src/app.ts',
+          '-f',
+          'position[new_path]=src/app.ts',
+          '-f',
+          'position[new_line]=12'
+        ],
+        {}
+      )
+    })
+  })
+
+  describe('job CI operations', () => {
+    beforeEach(() => {
+      resolveIssueSourceMock.mockImplementation(async () => ({
+        source: { host: 'git.internal', path: 'g/p' },
+        fellBack: false
+      }))
+    })
+
+    it('fetches a job trace through the selected SSH GitLab host', async () => {
+      glabExecFileAsyncMock.mockResolvedValueOnce({ stdout: 'trace output' })
+
+      await expect(getJobTrace('/repo', 99, 'upstream', 'conn-1')).resolves.toEqual({
+        ok: true,
+        trace: 'trace output'
+      })
+
+      expect(glabExecFileAsyncMock).toHaveBeenCalledWith(
+        ['api', '--hostname', 'git.internal', 'projects/g%2Fp/jobs/99/trace'],
+        {}
+      )
+    })
+
+    it('retries a job through the selected SSH GitLab host', async () => {
+      glabExecFileAsyncMock.mockResolvedValueOnce({
+        stdout: JSON.stringify({
+          id: 100,
+          pipeline: { id: 50 },
+          name: 'test',
+          stage: 'test',
+          status: 'pending',
+          web_url: 'https://git.internal/g/p/-/jobs/100',
+          duration: null
+        })
+      })
+
+      await expect(retryJob('/repo', 99, 'upstream', 'conn-1')).resolves.toEqual({
+        ok: true,
+        job: {
+          id: 100,
+          pipelineId: 50,
+          name: 'test',
+          stage: 'test',
+          status: 'pending',
+          webUrl: 'https://git.internal/g/p/-/jobs/100',
+          duration: null
+        }
+      })
+
+      expect(glabExecFileAsyncMock).toHaveBeenCalledWith(
+        ['api', '--hostname', 'git.internal', '-X', 'POST', 'projects/g%2Fp/jobs/99/retry'],
+        {}
+      )
+    })
+  })
+
+  describe('updateMRReviewers', () => {
+    beforeEach(() => {
+      resolveIssueSourceMock.mockImplementation(async () => ({
+        source: { host: 'git.internal', path: 'g/p' },
+        fellBack: false
+      }))
+    })
+
+    it('sets reviewers through reviewer_ids on the selected SSH GitLab host', async () => {
+      glabExecFileAsyncMock.mockResolvedValueOnce({
+        stdout: JSON.stringify({
+          reviewers: [
+            {
+              id: 1,
+              username: 'alice',
+              name: 'Alice',
+              avatar_url: 'https://example.com/a.png',
+              state: 'active'
+            }
+          ]
+        })
+      })
+
+      await expect(updateMRReviewers('/repo', 12, [1], 'upstream', 'conn-1')).resolves.toEqual({
+        ok: true,
+        reviewers: [
+          {
+            id: 1,
+            username: 'alice',
+            name: 'Alice',
+            avatarUrl: 'https://example.com/a.png',
+            state: 'active'
+          }
+        ]
+      })
+
+      expect(glabExecFileAsyncMock).toHaveBeenCalledWith(
+        [
+          'api',
+          '--hostname',
+          'git.internal',
+          '-X',
+          'PUT',
+          'projects/g%2Fp/merge_requests/12',
+          '-f',
+          'reviewer_ids[]=1'
+        ],
+        {}
+      )
     })
   })
 })

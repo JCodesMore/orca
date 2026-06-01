@@ -47,11 +47,31 @@ describe('github RPC methods', () => {
     const dispatcher = new RpcDispatcher({ runtime, methods: GITHUB_METHODS })
 
     const response = await dispatcher.dispatch(
-      makeRequest('github.listWorkItems', { repo: 'repo-1', limit: 10, query: 'is:pr' })
+      makeRequest('github.listWorkItems', {
+        repo: 'repo-1',
+        limit: 10,
+        query: 'is:pr',
+        noCache: true
+      })
     )
 
-    expect(runtime.listRepoWorkItems).toHaveBeenCalledWith('repo-1', 10, 'is:pr', undefined)
+    expect(runtime.listRepoWorkItems).toHaveBeenCalledWith('repo-1', 10, 'is:pr', undefined, true)
     expect(response).toMatchObject({ ok: true, result: { items: [] } })
+  })
+
+  it('lists issues on the runtime server', async () => {
+    const runtime = {
+      getRuntimeId: () => 'test-runtime',
+      listRepoIssues: vi.fn().mockResolvedValue([{ number: 7, title: 'Bug' }])
+    } as unknown as OrcaRuntimeService
+    const dispatcher = new RpcDispatcher({ runtime, methods: GITHUB_METHODS })
+
+    const response = await dispatcher.dispatch(
+      makeRequest('github.listIssues', { repo: 'repo-1', limit: 10 })
+    )
+
+    expect(runtime.listRepoIssues).toHaveBeenCalledWith('repo-1', 10)
+    expect(response).toMatchObject({ ok: true, result: [{ number: 7, title: 'Bug' }] })
   })
 
   it('looks up a single work item on the runtime server', async () => {
@@ -300,6 +320,34 @@ describe('github RPC methods', () => {
     expect(response).toMatchObject({ ok: true, result: true })
   })
 
+  it('updates PR metadata on the runtime server', async () => {
+    const runtime = {
+      getRuntimeId: () => 'test-runtime',
+      updateRepoPRDetails: vi.fn().mockResolvedValue({ ok: true })
+    } as unknown as OrcaRuntimeService
+    const dispatcher = new RpcDispatcher({ runtime, methods: GITHUB_METHODS })
+
+    const response = await dispatcher.dispatch(
+      makeRequest('github.updatePR', {
+        repo: 'repo-1',
+        prNumber: 7,
+        updates: { title: 'New title', body: 'Updated body' },
+        prRepo: { owner: 'acme', repo: 'widgets' }
+      })
+    )
+
+    expect(runtime.updateRepoPRDetails).toHaveBeenCalledWith(
+      'repo-1',
+      7,
+      { title: 'New title', body: 'Updated body' },
+      {
+        owner: 'acme',
+        repo: 'widgets'
+      }
+    )
+    expect(response).toMatchObject({ ok: true, result: { ok: true } })
+  })
+
   it('merges PRs on the runtime server', async () => {
     const runtime = {
       getRuntimeId: () => 'test-runtime',
@@ -321,6 +369,58 @@ describe('github RPC methods', () => {
       repo: 'widgets'
     })
     expect(response).toMatchObject({ ok: true, result: { ok: true } })
+  })
+
+  it('sets PR auto-merge on the runtime server', async () => {
+    const runtime = {
+      getRuntimeId: () => 'test-runtime',
+      setRepoPRAutoMerge: vi.fn().mockResolvedValue({ ok: true })
+    } as unknown as OrcaRuntimeService
+    const dispatcher = new RpcDispatcher({ runtime, methods: GITHUB_METHODS })
+
+    const response = await dispatcher.dispatch(
+      makeRequest('github.setPRAutoMerge', {
+        repo: 'repo-1',
+        prNumber: 7,
+        enabled: true,
+        prRepo: { owner: 'acme', repo: 'widgets' }
+      })
+    )
+
+    expect(runtime.setRepoPRAutoMerge).toHaveBeenCalledWith('repo-1', 7, true, {
+      owner: 'acme',
+      repo: 'widgets'
+    })
+    expect(response).toMatchObject({ ok: true, result: { ok: true } })
+  })
+
+  it('routes PR reviewer mutations on the runtime server', async () => {
+    const runtime = {
+      getRuntimeId: () => 'test-runtime',
+      requestRepoPRReviewers: vi.fn().mockResolvedValue({ ok: true }),
+      removeRepoPRReviewers: vi.fn().mockResolvedValue({ ok: true })
+    } as unknown as OrcaRuntimeService
+    const dispatcher = new RpcDispatcher({ runtime, methods: GITHUB_METHODS })
+
+    const requestResponse = await dispatcher.dispatch(
+      makeRequest('github.requestPRReviewers', {
+        repo: 'repo-1',
+        prNumber: 7,
+        reviewers: ['octo']
+      })
+    )
+    const removeResponse = await dispatcher.dispatch(
+      makeRequest('github.removePRReviewers', {
+        repo: 'repo-1',
+        prNumber: 7,
+        reviewers: ['octo']
+      })
+    )
+
+    expect(runtime.requestRepoPRReviewers).toHaveBeenCalledWith('repo-1', 7, ['octo'])
+    expect(runtime.removeRepoPRReviewers).toHaveBeenCalledWith('repo-1', 7, ['octo'])
+    expect(requestResponse).toMatchObject({ ok: true, result: { ok: true } })
+    expect(removeResponse).toMatchObject({ ok: true, result: { ok: true } })
   })
 
   it('updates PR state on the runtime server', async () => {
@@ -361,6 +461,30 @@ describe('github RPC methods', () => {
     expect(response).toMatchObject({ ok: true, result: { ok: true, number: 3 } })
   })
 
+  it('creates issues with metadata on the runtime server', async () => {
+    const runtime = {
+      getRuntimeId: () => 'test-runtime',
+      createRepoIssue: vi.fn().mockResolvedValue({ ok: true, number: 4, url: 'https://gh/4' })
+    } as unknown as OrcaRuntimeService
+    const dispatcher = new RpcDispatcher({ runtime, methods: GITHUB_METHODS })
+
+    const response = await dispatcher.dispatch(
+      makeRequest('github.createIssue', {
+        repo: 'repo-1',
+        title: 'Bug',
+        body: 'Body',
+        labels: ['bug'],
+        assignees: ['octo']
+      })
+    )
+
+    expect(runtime.createRepoIssue).toHaveBeenCalledWith('repo-1', 'Bug', 'Body', {
+      labels: ['bug'],
+      assignees: ['octo']
+    })
+    expect(response).toMatchObject({ ok: true, result: { ok: true, number: 4 } })
+  })
+
   it('updates issues on the runtime server', async () => {
     const runtime = {
       getRuntimeId: () => 'test-runtime',
@@ -395,11 +519,15 @@ describe('github RPC methods', () => {
         repo: 'repo-1',
         number: 3,
         body: 'Looks good',
-        type: 'pr'
+        type: 'pr',
+        prRepo: { owner: 'acme', repo: 'widgets' }
       })
     )
 
-    expect(runtime.addRepoIssueComment).toHaveBeenCalledWith('repo-1', 3, 'Looks good')
+    expect(runtime.addRepoIssueComment).toHaveBeenCalledWith('repo-1', 3, 'Looks good', {
+      owner: 'acme',
+      repo: 'widgets'
+    })
     expect(response).toMatchObject({ ok: true, result: { ok: true, comment: { id: 1 } } })
   })
 
@@ -448,7 +576,8 @@ describe('github RPC methods', () => {
         body: 'Done',
         threadId: 'PRRT_1',
         path: 'src/app.ts',
-        line: 12
+        line: 12,
+        prRepo: { owner: 'acme', repo: 'widgets' }
       })
     )
 
@@ -458,7 +587,8 @@ describe('github RPC methods', () => {
       body: 'Done',
       threadId: 'PRRT_1',
       path: 'src/app.ts',
-      line: 12
+      line: 12,
+      prRepo: { owner: 'acme', repo: 'widgets' }
     })
     expect(response).toMatchObject({ ok: true, result: { ok: true, comment: { id: 4 } } })
   })

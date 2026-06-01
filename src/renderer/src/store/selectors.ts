@@ -15,6 +15,7 @@ type WorktreeSnapshot = {
 // needs cross-render caching. WeakMap ties each snapshot to the store slice ref
 // without pinning old test/dev instances in memory once that slice is replaced.
 const worktreeSnapshotCache = new WeakMap<AppState['worktreesByRepo'], WorktreeSnapshot>()
+const hasAnyWorktreesCache = new WeakMap<AppState['worktreesByRepo'], boolean>()
 const repoMapCache = new WeakMap<AppState['repos'], Map<string, Repo>>()
 
 function getWorktreeSnapshot(worktreesByRepo: AppState['worktreesByRepo']): WorktreeSnapshot {
@@ -28,8 +29,12 @@ function getWorktreeSnapshot(worktreesByRepo: AppState['worktreesByRepo']): Work
   // within a single repo's array. Deduplicating here prevents React from
   // seeing duplicate keys, which can corrupt terminal DOM containers.
   const worktreeMap = new Map<string, Worktree>()
-  for (const worktree of Object.values(worktreesByRepo).flat()) {
-    worktreeMap.set(worktree.id, worktree)
+  // Why: this selector sits on hot Zustand subscription paths; avoid building
+  // a transient flattened array just to populate the snapshot cache.
+  for (const worktrees of Object.values(worktreesByRepo)) {
+    for (const worktree of worktrees) {
+      worktreeMap.set(worktree.id, worktree)
+    }
   }
   const allWorktrees = Array.from(worktreeMap.values())
 
@@ -48,6 +53,19 @@ function getCachedWorktreeMap(worktreesByRepo: AppState['worktreesByRepo']): Map
     return snapshot.worktreeMap
   }
   return getWorktreeSnapshot(worktreesByRepo).worktreeMap
+}
+
+function getCachedHasAnyWorktrees(worktreesByRepo: AppState['worktreesByRepo']): boolean {
+  const cached = hasAnyWorktreesCache.get(worktreesByRepo)
+  if (cached !== undefined) {
+    return cached
+  }
+
+  // Why: this selector sits in an always-mounted scanner. Cache by slice
+  // identity so unrelated store writes do not rescan every repo bucket.
+  const hasWorktrees = Object.values(worktreesByRepo).some((worktrees) => worktrees.length > 0)
+  hasAnyWorktreesCache.set(worktreesByRepo, hasWorktrees)
+  return hasWorktrees
 }
 
 function getCachedRepoMap(repos: AppState['repos']): Map<string, Repo> {
@@ -69,6 +87,10 @@ export function getWorktreeMapFromState(
   state: Pick<AppState, 'worktreesByRepo'>
 ): Map<string, Worktree> {
   return getCachedWorktreeMap(state.worktreesByRepo)
+}
+
+export function getHasAnyWorktreesFromState(state: Pick<AppState, 'worktreesByRepo'>): boolean {
+  return getCachedHasAnyWorktrees(state.worktreesByRepo)
 }
 
 export function getRepoMapFromState(state: Pick<AppState, 'repos'>): Map<string, Repo> {
@@ -96,7 +118,9 @@ export const useWorktreeById = (worktreeId: string | null) =>
   )
 export const useActiveWorktree = () => {
   const activeWorktreeId = useActiveWorktreeId()
-  return useWorktreeById(activeWorktreeId)
+  return useAppStore((s) =>
+    activeWorktreeId ? (s.getKnownWorktreeById(activeWorktreeId) ?? null) : null
+  )
 }
 
 // ─── Terminals ──────────────────────────────────────────────────────
@@ -118,6 +142,7 @@ export const useModalData = () => useAppStore((s) => s.modalData)
 export const useGroupBy = () => useAppStore((s) => s.groupBy)
 export const useSortBy = () => useAppStore((s) => s.sortBy)
 export const useShowActiveOnly = () => useAppStore((s) => s.showActiveOnly)
+export const useShowSleepingWorkspaces = () => useAppStore((s) => s.showSleepingWorkspaces)
 export const useFilterRepoIds = () => useAppStore((s) => s.filterRepoIds)
 
 // ─── GitHub ─────────────────────────────────────────────────────────

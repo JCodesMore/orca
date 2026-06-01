@@ -12,53 +12,41 @@ import {
   normalizeHostedReviewBaseRef,
   normalizeHostedReviewHeadRef
 } from '../../shared/hosted-review-refs'
-import { getAzureDevOpsRepoSlug } from '../azure-devops/client'
-import { getBitbucketRepoSlug } from '../bitbucket/client'
-import { getGiteaRepoSlug } from '../gitea/client'
-import { createGitHubPullRequest, getRepoSlug } from '../github/client'
 import { acquire, ghExecFileAsync, gitExecFileAsync, release } from '../github/gh-utils'
+import { isNoUpstreamError, normalizeGitErrorMessage } from '../../shared/git-remote-error'
+import type { GitUpstreamStatus } from '../../shared/types'
 import { gitOptionalLocksDisabledEnv } from '../git/runner'
 import { resolveDefaultBaseRefViaExec } from '../git/repo'
 import { getUpstreamStatus } from '../git/upstream'
 import { getProjectSlug } from '../gitlab/client'
+import {
+  acquire as acquireGlab,
+  glabExecFileAsync,
+  glabRepoExecOptions,
+  release as releaseGlab
+} from '../gitlab/gl-utils'
+import { getSshGitProvider } from '../providers/ssh-git-dispatch'
+import { detectHostedReviewProvider, getForgeProviderForRepository } from './forge-provider'
 import { getHostedReviewForBranch } from './hosted-review'
+
+type HostedReviewCreationEligibilityInput = HostedReviewCreationEligibilityArgs & {
+  connectionId?: string | null
+}
 
 function stripRefPrefix(ref: string): string {
   return normalizeHostedReviewHeadRef(ref)
 }
 
-function branchToTitle(branch: string): string {
-  const lastSegment = branch.split('/').filter(Boolean).at(-1) ?? branch
-  return lastSegment
-    .replace(/[-_]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/\b\w/g, (char) => char.toUpperCase())
-}
-
-async function detectHostedReviewProvider(repoPath: string): Promise<HostedReviewProvider> {
-  if (await getProjectSlug(repoPath)) {
-    return 'gitlab'
-  }
-  if (await getRepoSlug(repoPath)) {
-    return 'github'
-  }
-  if (await getBitbucketRepoSlug(repoPath)) {
-    return 'bitbucket'
-  }
-  if (await getAzureDevOpsRepoSlug(repoPath)) {
-    return 'azure-devops'
-  }
-  if (await getGiteaRepoSlug(repoPath)) {
-    return 'gitea'
-  }
-  return 'unsupported'
-}
-
-async function isGitHubAuthenticated(repoPath: string): Promise<boolean> {
+async function isGitHubAuthenticated(
+  repoPath: string,
+  connectionId?: string | null
+): Promise<boolean> {
   await acquire()
   try {
-    await ghExecFileAsync(['auth', 'status', '--hostname', 'github.com'], { cwd: repoPath })
+    await ghExecFileAsync(
+      ['auth', 'status', '--hostname', 'github.com'],
+      connectionId ? {} : { cwd: repoPath }
+    )
     return true
   } catch {
     return false
@@ -67,44 +55,76 @@ async function isGitHubAuthenticated(repoPath: string): Promise<boolean> {
   }
 }
 
-async function getLatestCommitSubject(repoPath: string): Promise<string | null> {
-  try {
-    const { stdout } = await gitExecFileAsync(['log', '-1', '--pretty=%s'], { cwd: repoPath })
-    const subject = stdout.trim()
-    return subject || null
-  } catch {
-    return null
+async function isGitLabAuthenticated(
+  repoPath: string,
+  connectionId?: string | null
+): Promise<boolean> {
+  const projectRef = await getProjectSlug(repoPath, connectionId)
+  if (!projectRef) {
+    return false
   }
-}
-
-async function getCommitSummaryBody(repoPath: string, base: string | null): Promise<string | null> {
-  if (!base) {
-    return null
-  }
+  await acquireGlab()
   try {
-    const { stdout } = await gitExecFileAsync(
-      ['log', '--pretty=format:- %s', '--max-count=20', `${base}..HEAD`],
-      { cwd: repoPath }
+    await glabExecFileAsync(
+      ['auth', 'status', '--hostname', projectRef.host],
+      glabRepoExecOptions(repoPath, connectionId)
     )
-    const body = stdout.trim()
-    return body || null
+    return true
   } catch {
-    return null
+    return false
+  } finally {
+    releaseGlab()
   }
 }
 
-async function getDefaultBaseRef(repoPath: string): Promise<string | null> {
-  return resolveDefaultBaseRefViaExec((argv) => gitExecFileAsync(argv, { cwd: repoPath }))
+async function runGitForHostedReview(
+  repoPath: string,
+  args: string[],
+  connectionId?: string | null
+): Promise<{ stdout: string; stderr?: string }> {
+  if (connectionId) {
+    const provider = getSshGitProvider(connectionId)
+    if (!provider) {
+      throw new Error(
+        'Remote connection dropped. Click Reconnect on the SSH target before retrying.'
+      )
+    }
+    return provider.exec(args, repoPath)
+  }
+  return gitExecFileAsync(args, { cwd: repoPath })
 }
 
-async function getCurrentBranch(repoPath: string): Promise<string> {
-  const { stdout } = await gitExecFileAsync(['rev-parse', '--abbrev-ref', 'HEAD'], {
-    cwd: repoPath
-  })
+async function getDefaultBaseRef(
+  repoPath: string,
+  connectionId?: string | null
+): Promise<string | null> {
+  return resolveDefaultBaseRefViaExec((argv) => runGitForHostedReview(repoPath, argv, connectionId))
+}
+
+async function getCurrentBranch(repoPath: string, connectionId?: string | null): Promise<string> {
+  const { stdout } = await runGitForHostedReview(
+    repoPath,
+    ['rev-parse', '--abbrev-ref', 'HEAD'],
+    connectionId
+  )
   return stripRefPrefix(stdout.trim())
 }
 
-async function hasUncommittedChanges(repoPath: string): Promise<boolean> {
+async function hasUncommittedChanges(
+  repoPath: string,
+  connectionId?: string | null
+): Promise<boolean> {
+  if (connectionId) {
+    const provider = getSshGitProvider(connectionId)
+    if (!provider) {
+      throw new Error(
+        'Remote connection dropped. Click Reconnect on the SSH target before retrying.'
+      )
+    }
+    // Why: the relay intentionally restricts generic git.exec. Use the
+    // structured status RPC for SSH dirty checks instead of raw `git status`.
+    return (await provider.getStatus(repoPath)).entries.length > 0
+  }
   const { stdout } = await gitExecFileAsync(['status', '--porcelain'], {
     cwd: repoPath,
     // Why: create-PR validation should not take Git's optional index lock while
@@ -114,56 +134,106 @@ async function hasUncommittedChanges(repoPath: string): Promise<boolean> {
   return stdout.trim().length > 0
 }
 
-const blockedCreateResultByReason = {
-  auth_required: {
-    ok: false,
-    code: 'auth_required',
-    error:
-      'Create PR failed: GitHub is not authenticated. Next step: run gh auth login in this environment.'
-  },
-  unsupported_provider: {
-    ok: false,
-    code: 'unsupported_provider',
-    error: 'Creating pull requests requires a GitHub remote.'
-  },
-  dirty: {
-    ok: false,
-    code: 'validation',
-    error: 'Create PR failed: commit or discard local changes before creating a pull request.'
-  },
-  detached_head: {
-    ok: false,
-    code: 'validation',
-    error: 'Create PR failed: switch to a branch before creating a pull request.'
-  },
-  default_branch: {
-    ok: false,
-    code: 'validation',
-    error: 'Create PR failed: choose a feature branch before creating a pull request.'
-  },
-  no_upstream: {
-    ok: false,
-    code: 'validation',
-    error: 'Create PR failed: publish this branch before creating a pull request.'
-  },
-  needs_push: {
-    ok: false,
-    code: 'validation',
-    error: 'Create PR failed: push this branch before creating a pull request.'
-  },
-  needs_sync: {
-    ok: false,
-    code: 'validation',
-    error: 'Create PR failed: sync this branch before creating a pull request.'
-  },
-  fork_head_unsupported: {
-    ok: false,
-    code: 'validation',
-    error: 'Create PR failed: refresh source control status and try again.'
+async function getHostedReviewUpstreamStatus(
+  repoPath: string,
+  connectionId?: string | null
+): Promise<GitUpstreamStatus> {
+  if (!connectionId) {
+    return getUpstreamStatus(repoPath)
   }
-} satisfies Partial<
-  Record<NonNullable<HostedReviewCreationBlockedReason>, CreateHostedReviewResult>
->
+  const provider = getSshGitProvider(connectionId)
+  if (!provider) {
+    throw new Error('Remote connection dropped. Click Reconnect on the SSH target before retrying.')
+  }
+  try {
+    // Why: SSH exposes upstream divergence through a dedicated relay RPC;
+    // generic git.exec intentionally does not allow rev-list/status plumbing.
+    return await provider.getUpstreamStatus(repoPath)
+  } catch (error) {
+    if (isNoUpstreamError(error)) {
+      return { hasUpstream: false, ahead: 0, behind: 0 }
+    }
+    throw new Error(normalizeGitErrorMessage(error, 'upstream'))
+  }
+}
+
+function reviewCopy(provider: HostedReviewProvider): {
+  shortLabel: 'PR' | 'MR'
+  reviewLabel: 'pull request' | 'merge request'
+  providerName: 'GitHub' | 'GitLab'
+  authCommand: 'gh auth login' | 'glab auth login'
+} {
+  return provider === 'gitlab'
+    ? {
+        shortLabel: 'MR',
+        reviewLabel: 'merge request',
+        providerName: 'GitLab',
+        authCommand: 'glab auth login'
+      }
+    : {
+        shortLabel: 'PR',
+        reviewLabel: 'pull request',
+        providerName: 'GitHub',
+        authCommand: 'gh auth login'
+      }
+}
+
+function blockedCreateResultForReason(
+  reason: NonNullable<HostedReviewCreationBlockedReason>,
+  provider: HostedReviewProvider
+): CreateHostedReviewResult | null {
+  const copy = reviewCopy(provider)
+  const blockedCreateResultByReason = {
+    auth_required: {
+      ok: false,
+      code: 'auth_required',
+      error: `Create ${copy.shortLabel} failed: ${copy.providerName} is not authenticated. Next step: run ${copy.authCommand} in this environment.`
+    },
+    unsupported_provider: {
+      ok: false,
+      code: 'unsupported_provider',
+      error: `Creating ${copy.reviewLabel}s requires a ${copy.providerName} remote.`
+    },
+    dirty: {
+      ok: false,
+      code: 'validation',
+      error: `Create ${copy.shortLabel} failed: commit or discard local changes before creating a ${copy.reviewLabel}.`
+    },
+    detached_head: {
+      ok: false,
+      code: 'validation',
+      error: `Create ${copy.shortLabel} failed: switch to a branch before creating a ${copy.reviewLabel}.`
+    },
+    default_branch: {
+      ok: false,
+      code: 'validation',
+      error: `Create ${copy.shortLabel} failed: choose a feature branch before creating a ${copy.reviewLabel}.`
+    },
+    no_upstream: {
+      ok: false,
+      code: 'validation',
+      error: `Create ${copy.shortLabel} failed: publish this branch before creating a ${copy.reviewLabel}.`
+    },
+    needs_push: {
+      ok: false,
+      code: 'validation',
+      error: `Create ${copy.shortLabel} failed: push this branch before creating a ${copy.reviewLabel}.`
+    },
+    needs_sync: {
+      ok: false,
+      code: 'validation',
+      error: `Create ${copy.shortLabel} failed: sync this branch before creating a ${copy.reviewLabel}.`
+    },
+    fork_head_unsupported: {
+      ok: false,
+      code: 'validation',
+      error: `Create ${copy.shortLabel} failed: refresh source control status and try again.`
+    }
+  } satisfies Partial<
+    Record<NonNullable<HostedReviewCreationBlockedReason>, CreateHostedReviewResult>
+  >
+  return blockedCreateResultByReason[reason] ?? null
+}
 
 function blockedEligibilityToCreateResult(
   eligibility: HostedReviewCreationEligibility
@@ -172,41 +242,45 @@ function blockedEligibilityToCreateResult(
     return null
   }
   if (eligibility.review?.url) {
+    const copy = reviewCopy(eligibility.provider)
     return {
       ok: false,
       code: 'already_exists',
-      error: 'A pull request already exists for this branch.',
+      error: `A ${copy.reviewLabel} already exists for this branch.`,
       existingReview: eligibility.review
     }
   }
   if (eligibility.blockedReason) {
-    return blockedCreateResultByReason[eligibility.blockedReason] ?? null
+    return blockedCreateResultForReason(eligibility.blockedReason, eligibility.provider)
   }
+  const copy = reviewCopy(eligibility.provider)
   return {
     ok: false,
     code: 'validation',
-    error: 'Create PR failed: refresh source control status and try again.'
+    error: `Create ${copy.shortLabel} failed: refresh source control status and try again.`
   }
 }
 
 async function validateCurrentBranchCanCreateReview(
   repoPath: string,
+  connectionId: string | null | undefined,
   input: CreateHostedReviewInput
 ): Promise<CreateHostedReviewResult | null> {
   const requestedHead = input.head ? stripRefPrefix(input.head).trim() : ''
-  const currentBranch = await getCurrentBranch(repoPath)
+  const currentBranch = await getCurrentBranch(repoPath, connectionId)
+  const copy = reviewCopy(input.provider)
   if (requestedHead && requestedHead !== currentBranch) {
     return {
       ok: false,
       code: 'validation',
-      error: 'Create PR failed: switch back to the selected branch before creating a pull request.'
+      error: `Create ${copy.shortLabel} failed: switch back to the selected branch before creating a ${copy.reviewLabel}.`
     }
   }
 
   try {
     const [dirty, upstreamStatus] = await Promise.all([
-      hasUncommittedChanges(repoPath),
-      getUpstreamStatus(repoPath)
+      hasUncommittedChanges(repoPath, connectionId),
+      getHostedReviewUpstreamStatus(repoPath, connectionId)
     ])
     const eligibility = await getHostedReviewCreationEligibility({
       repoPath,
@@ -215,7 +289,8 @@ async function validateCurrentBranchCanCreateReview(
       hasUncommittedChanges: dirty,
       hasUpstream: upstreamStatus.hasUpstream,
       ahead: upstreamStatus.ahead,
-      behind: upstreamStatus.behind
+      behind: upstreamStatus.behind,
+      connectionId
     })
     // Why: renderer eligibility can be stale by submit time; the main process
     // is the last chance to avoid creating a PR from an out-of-date remote head.
@@ -225,38 +300,39 @@ async function validateCurrentBranchCanCreateReview(
     return {
       ok: false,
       code: 'validation',
-      error:
-        'Create PR failed: could not verify branch status. Refresh source control and try again.'
+      error: `Create ${copy.shortLabel} failed: could not verify branch status. Refresh source control and try again.`
     }
   }
 }
 
 export async function getHostedReviewCreationEligibility(
-  args: HostedReviewCreationEligibilityArgs
+  args: HostedReviewCreationEligibilityInput
 ): Promise<HostedReviewCreationEligibility> {
   const branch = stripRefPrefix(args.branch).trim()
-  const provider = await detectHostedReviewProvider(args.repoPath)
-  const defaultBaseRef = args.base?.trim() || (await getDefaultBaseRef(args.repoPath))
+  const provider = await detectHostedReviewProvider({
+    repoPath: args.repoPath,
+    connectionId: args.connectionId
+  })
+  const defaultBaseRef =
+    args.base?.trim() || (await getDefaultBaseRef(args.repoPath, args.connectionId))
   const baseBranch = defaultBaseRef ? normalizeHostedReviewBaseRef(defaultBaseRef) : null
   const review = await getHostedReviewForBranch({
     repoPath: args.repoPath,
     branch,
     linkedGitHubPR: args.linkedGitHubPR ?? null,
+    fallbackGitHubPR: args.linkedGitHubPR == null ? (args.fallbackGitHubPR ?? null) : null,
     linkedGitLabMR: args.linkedGitLabMR ?? null,
     linkedBitbucketPR: args.linkedBitbucketPR ?? null,
     linkedAzureDevOpsPR: args.linkedAzureDevOpsPR ?? null,
-    linkedGiteaPR: args.linkedGiteaPR ?? null
+    linkedGiteaPR: args.linkedGiteaPR ?? null,
+    connectionId: args.connectionId ?? null
   })
 
-  const title = (await getLatestCommitSubject(args.repoPath)) ?? branchToTitle(branch)
-  const body = await getCommitSummaryBody(args.repoPath, defaultBaseRef ?? null)
   const baseResult = {
     provider,
     review: review ? { number: review.number, url: review.url } : null,
     defaultBaseRef,
-    head: branch || null,
-    title,
-    body
+    head: branch || null
   }
 
   if (!branch || branch === 'HEAD') {
@@ -270,7 +346,7 @@ export async function getHostedReviewCreationEligibility(
       nextAction: 'open_existing_review'
     }
   }
-  if (provider !== 'github') {
+  if (provider !== 'github' && provider !== 'gitlab') {
     return {
       ...baseResult,
       canCreate: false,
@@ -293,7 +369,11 @@ export async function getHostedReviewCreationEligibility(
   if ((args.behind ?? 0) > 0) {
     return { ...baseResult, canCreate: false, blockedReason: 'needs_sync', nextAction: 'sync' }
   }
-  if (!(await isGitHubAuthenticated(args.repoPath))) {
+  const authenticated =
+    provider === 'gitlab'
+      ? await isGitLabAuthenticated(args.repoPath, args.connectionId)
+      : await isGitHubAuthenticated(args.repoPath, args.connectionId)
+  if (!authenticated) {
     return {
       ...baseResult,
       canCreate: false,
@@ -309,26 +389,28 @@ export async function getHostedReviewCreationEligibility(
 
 export async function createHostedReview(
   repoPath: string,
-  input: CreateHostedReviewInput
+  input: CreateHostedReviewInput,
+  connectionId?: string | null
 ): Promise<CreateHostedReviewResult> {
-  if (input.provider !== 'github') {
+  if (input.provider !== 'github' && input.provider !== 'gitlab') {
     return {
       ok: false,
       code: 'unsupported_provider',
       error: 'Creating reviews for this provider is not supported yet.'
     }
   }
-  const provider = await detectHostedReviewProvider(repoPath)
-  if (provider !== 'github') {
+  const provider = await getForgeProviderForRepository({ repoPath, connectionId })
+  if (provider?.id !== input.provider || !provider.createReview) {
+    const copy = reviewCopy(input.provider)
     return {
       ok: false,
       code: 'unsupported_provider',
-      error: 'Creating pull requests requires a GitHub remote.'
+      error: `Creating ${copy.reviewLabel}s requires a ${copy.providerName} remote.`
     }
   }
-  const blocked = await validateCurrentBranchCanCreateReview(repoPath, input)
+  const blocked = await validateCurrentBranchCanCreateReview(repoPath, connectionId, input)
   if (blocked) {
     return blocked
   }
-  return createGitHubPullRequest(repoPath, input)
+  return provider.createReview(repoPath, input, connectionId)
 }

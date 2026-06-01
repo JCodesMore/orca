@@ -1,7 +1,7 @@
 /* oxlint-disable max-lines -- Why: the drag-split hook co-locates drop-zone
  * resolution, same-group reordering, and cross-group handoff so state
  * transitions stay readable in one place. */
-import { useCallback, useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 import {
   closestCenter,
   pointerWithin,
@@ -15,7 +15,7 @@ import {
   useSensor,
   useSensors
 } from '@dnd-kit/core'
-import type { TabGroup } from '../../../../shared/types'
+import type { TabGroup, TuiAgent } from '../../../../shared/types'
 import type { RuntimeMobileSessionTabMove } from '../../../../shared/runtime-types'
 import { useAppStore } from '../../store'
 import {
@@ -28,6 +28,7 @@ import {
   useHoveredTabInsertion,
   type HoveredTabInsertion
 } from './tab-insertion'
+import { acquireWebviewsDragPassthrough } from '../browser-pane/webview-registry'
 
 export type { HoveredTabInsertion }
 
@@ -47,6 +48,11 @@ export type TabDragItemData = {
   label: string
   iconPath?: string
   color?: string | null
+  /** Coding-harness agent running in a terminal tab, so the drag ghost shows
+   *  the provider glyph and matches the resting tab. Resolved per-tab in
+   *  SortableTab (not at the TabBar level) to avoid re-rendering the whole tab
+   *  strip on every agent-status ping. */
+  agent?: TuiAgent | null
 }
 
 export type TabPaneDropData = {
@@ -198,11 +204,13 @@ export function useTabDragSplit({
   onDragOver: (event: DragOverEvent) => void
   onDragStart: (event: DragStartEvent) => void
   sensors: ReturnType<typeof useSensors>
+  setDragRootNode: (node: HTMLDivElement | null) => void
 } {
   const reorderUnifiedTabs = useAppStore((state) => state.reorderUnifiedTabs)
   const dropUnifiedTab = useAppStore((state) => state.dropUnifiedTab)
   const [activeDrag, setActiveDrag] = useState<TabDragItemData | null>(null)
   const [hoveredDropTarget, setHoveredDropTarget] = useState<HoveredTabDropTarget | null>(null)
+  const releaseWebviewDragPassthroughRef = useRef<(() => void) | null>(null)
   const tabInsertion = useHoveredTabInsertion(isTabDragData, getDragCenter)
 
   // Why: hidden worktrees stay mounted so their PTYs survive worktree
@@ -216,11 +224,36 @@ export function useTabDragSplit({
   })
   const sensors = useSensors(pointerSensor)
 
+  const releaseWebviewDragPassthrough = useCallback(() => {
+    releaseWebviewDragPassthroughRef.current?.()
+    releaseWebviewDragPassthroughRef.current = null
+  }, [])
+
+  const acquireWebviewDragPassthrough = useCallback(() => {
+    // Why: dnd-kit tab drags are pointer-driven, so the native drag listeners
+    // in webview-registry never fire. Put webviews in passthrough explicitly.
+    releaseWebviewDragPassthrough()
+    releaseWebviewDragPassthroughRef.current = acquireWebviewsDragPassthrough()
+  }, [releaseWebviewDragPassthrough])
+
+  const setDragRootNode = useCallback(
+    (node: HTMLDivElement | null): void => {
+      if (node) {
+        return
+      }
+      // Why: this root owns the dnd-kit gesture that temporarily puts browser
+      // webviews in pointer passthrough, so root teardown must release it.
+      releaseWebviewDragPassthrough()
+    },
+    [releaseWebviewDragPassthrough]
+  )
+
   const clearDragState = useCallback(() => {
+    releaseWebviewDragPassthrough()
     setActiveDrag(null)
     setHoveredDropTarget(null)
     tabInsertion.clear()
-  }, [tabInsertion])
+  }, [releaseWebviewDragPassthrough, tabInsertion])
 
   const updateHoveredPane = useCallback(
     (event: DragMoveEvent | DragOverEvent) => {
@@ -279,8 +312,9 @@ export function useTabDragSplit({
       }
 
       setActiveDrag(dragData)
+      acquireWebviewDragPassthrough()
     },
-    [clearDragState, worktreeId]
+    [acquireWebviewDragPassthrough, clearDragState, worktreeId]
   )
 
   const onDragMove = useCallback(
@@ -442,6 +476,7 @@ export function useTabDragSplit({
     onDragMove,
     onDragOver,
     onDragStart,
-    sensors
+    sensors,
+    setDragRootNode
   }
 }
