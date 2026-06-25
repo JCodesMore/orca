@@ -7,13 +7,29 @@ import {
   copyFileSync,
   existsSync,
   chmodSync,
+  lstatSync,
   mkdirSync,
+  readlinkSync,
   readdirSync,
   readFileSync,
+  renameSync,
+  rmdirSync,
   rmSync,
-  statSync
+  statSync,
+  symlinkSync,
+  unlinkSync
 } from 'node:fs'
-import { dirname, extname, join, parse, relative, win32 as pathWin32 } from 'node:path'
+import { execFileSync } from 'node:child_process'
+import {
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  parse,
+  relative,
+  resolve,
+  win32 as pathWin32
+} from 'node:path'
 import { app } from 'electron'
 import type { CodexManagedAccount } from '../../shared/types'
 import type { Store } from '../persistence'
@@ -23,21 +39,11 @@ import {
   getSystemCodexHomePath,
   syncSystemCodexResourcesIntoManagedHome
 } from '../codex/codex-home-paths'
-import {
-  ensureOrcaCodexLaunchHome,
-  ensureScopedCodexLaunchHome,
-  materializeOrcaCodexActiveHome,
-  materializeOrcaCodexLaunchHome,
-  materializeScopedCodexLaunchHome,
-  pointActiveCodexHomeAtLaunchHome,
-  removeOrcaCodexLaunchHome,
-  removeScopedCodexLaunchHome
-} from '../codex/codex-launch-home-paths'
-import { syncSystemCodexSessionsIntoManagedHome } from '../codex/codex-session-bridge'
+import { startSystemCodexSessionBridgeInBackground } from '../codex/codex-session-bridge'
 import { syncSystemConfigIntoManagedCodexHome } from '../codex/codex-config-mirror'
-import { trustCodexLaunchHomeHooks } from '../codex/hook-service'
 import { parseWslUncPath } from '../../shared/wsl-paths'
 import {
+  getWslSelectionKey,
   getSelectedCodexAccountIdForTarget,
   normalizeCodexRuntimeSelection,
   setSelectedCodexAccountIdForTarget,
@@ -87,19 +93,19 @@ export class CodexRuntimeHomeService {
   // login (e.g. `codex auth login`) overwrote it — so Orca adopts the file as
   // the new system default instead of restoring a stale snapshot.
   private lastWrittenAuthJson: string | null = null
-  private readonly lastWrittenHostAuthJsonBySelection = new Map<string, string | null>()
   // Why: WSL terminals have their own stable runtime homes per distro. They
   // cannot share the host baseline or host sync can make stale WSL auth look
   // newer than managed storage.
-  private readonly lastWrittenWslAuthJsonBySelection = new Map<string, string | null>()
+  private readonly lastWrittenWslAuthJsonByDistro = new Map<string, string | null>()
   private readonly lastSyncedWslAccountIdByDistro = new Map<string, string | null>()
+  private readonly wslRuntimeHomePathByDistro = new Map<string, string>()
   private skipNextReadBackForAccountId: string | null = null
 
   constructor(private readonly store: Store) {
     this.safeMigrateLegacyManagedState()
+    this.safeMigrateLegacyActiveHomePointer()
     this.initializeLastSyncedState()
     this.safeSyncForCurrentSelection()
-    this.safeRefreshCurrentHostActiveHome()
   }
 
   private initializeLastSyncedState(): void {
@@ -116,19 +122,51 @@ export class CodexRuntimeHomeService {
       : normalizeCodexRuntimeSelection(settings).host
   }
 
+  /**
+   * Materializes the runtime home needed before launching the CLI.
+   *
+   * Historical session bridging is requested in the background so launch setup
+   * returns as soon as the active runtime home is ready.
+   */
   prepareForCodexLaunch(target?: CodexAccountSelectionTarget): string | null {
     if (target?.runtime === 'wsl') {
       const wslTarget = this.resolveWslDefaultTarget(target)
-      const launchHomePath =
+      return (
         this.syncWslRuntimeForCurrentSelection(wslTarget) ??
         this.getWslSystemCodexHomePath(wslTarget)
-      return this.pointWslActiveHomeForLaunch(wslTarget, launchHomePath)
+      )
     }
     this.syncForCurrentSelection()
     syncSystemCodexResourcesIntoManagedHome()
     syncSystemConfigIntoManagedCodexHome()
-    syncSystemCodexSessionsIntoManagedHome()
-    return this.materializeCurrentHostActiveHome()
+    // Why: historical Codex sessions can be large; bridge them after launch
+    // setup so starting a fresh Codex TUI never waits on a full tree walk.
+    void startSystemCodexSessionBridgeInBackground()
+    return this.getRuntimeHomePath()
+  }
+
+  getHostRuntimeHomePath(): string {
+    return this.getRuntimeHomePath()
+  }
+
+  syncActiveWslSelectionsBeforeRestart(): void {
+    if (process.platform !== 'win32') {
+      return
+    }
+
+    const settings = this.store.getSettings()
+    for (const [selectedDistroKey, accountId] of Object.entries(
+      normalizeCodexRuntimeSelection(settings).wsl
+    )) {
+      if (!accountId) {
+        continue
+      }
+      const account = this.getActiveAccount(settings.codexManagedAccounts, accountId)
+      if (!account || account.managedHomeRuntime !== 'wsl') {
+        continue
+      }
+      this.safeReadBackActiveWslAccountBeforeRestart(account, selectedDistroKey)
+    }
   }
 
   private getWslSystemCodexHomePath(target: CodexAccountSelectionTarget): string | null {
@@ -154,30 +192,7 @@ export class CodexRuntimeHomeService {
     this.syncForCurrentSelection()
     syncSystemCodexResourcesIntoManagedHome()
     syncSystemConfigIntoManagedCodexHome()
-    return this.materializeCurrentHostLaunchHome()
-  }
-
-  refreshCurrentHostActiveHome(): string | null {
-    try {
-      syncSystemCodexResourcesIntoManagedHome()
-      syncSystemConfigIntoManagedCodexHome()
-      syncSystemCodexSessionsIntoManagedHome()
-      return this.materializeCurrentHostActiveHome()
-    } catch (error) {
-      console.warn('[codex-runtime-home] Failed to refresh host launch home:', error)
-      return null
-    }
-  }
-
-  refreshCurrentLaunchHome(target?: CodexAccountSelectionTarget): string | null {
-    if (target?.runtime === 'wsl') {
-      const wslTarget = this.resolveWslDefaultTarget(target)
-      const launchHomePath =
-        this.syncWslRuntimeForCurrentSelection(wslTarget) ??
-        this.getWslSystemCodexHomePath(wslTarget)
-      return this.pointWslActiveHomeForLaunch(wslTarget, launchHomePath)
-    }
-    return this.refreshCurrentHostActiveHome()
+    return this.getRuntimeHomePath()
   }
 
   syncForCurrentSelection(target?: CodexAccountSelectionTarget): void {
@@ -213,7 +228,6 @@ export class CodexRuntimeHomeService {
       }
       this.lastSyncedAccountId = null
       this.lastWrittenAuthJson = null
-      this.setLastWrittenHostAuthJson(null, null)
       this.skipNextReadBackForAccountId = null
       return
     }
@@ -326,54 +340,27 @@ export class CodexRuntimeHomeService {
   ): void {
     if (accountId === normalizeCodexRuntimeSelection(this.store.getSettings()).host) {
       this.lastWrittenAuthJson = null
-      this.setLastWrittenHostAuthJson(accountId, null)
     }
     this.skipNextReadBackForAccountId = accountId
-  }
-
-  removeHostLaunchHomeForAccount(accountId: string): void {
-    removeOrcaCodexLaunchHome(accountId)
-    this.lastWrittenHostAuthJsonBySelection.delete(this.getHostLaunchSelectionKey(accountId))
-  }
-
-  removeLaunchHomeForAccount(account: CodexManagedAccount): void {
-    const distro = this.getWslDistroForAccount(account)
-    if (distro) {
-      const launchRootPath = this.getWslLaunchRootPath(distro)
-      if (launchRootPath) {
-        removeScopedCodexLaunchHome(launchRootPath, account.id)
-      }
-      this.lastWrittenWslAuthJsonBySelection.delete(
-        this.getWslLaunchSelectionKey(distro, account.id)
-      )
-      return
-    }
-    this.removeHostLaunchHomeForAccount(account.id)
   }
 
   private readBackRefreshedTokens(options: {
     updateLastWrittenAuthJson: boolean
   }): CodexReadBackResult {
-    const accountId = normalizeCodexRuntimeSelection(this.store.getSettings()).host
-    const launchResult = this.readBackRefreshedTokensFromPath(
-      this.getHostLaunchAuthPath(accountId),
-      {
-        ...options,
-        lastWrittenAuthJson: this.getLastWrittenHostAuthJson(accountId),
-        setLastWrittenAuthJson: (contents) => {
-          this.setLastWrittenHostAuthJson(accountId, contents)
+    const selectedAccountId = normalizeCodexRuntimeSelection(this.store.getSettings()).host
+    if (selectedAccountId) {
+      const selectedAccountResult = this.readBackRefreshedTokensFromPath(
+        this.getRuntimeAuthPath(),
+        {
+          ...options,
+          expectedAccountId: selectedAccountId
         }
+      )
+      if (selectedAccountResult !== 'rejected') {
+        return selectedAccountResult
       }
-    )
-    if (launchResult !== 'unchanged') {
-      return launchResult
     }
-    if (accountId !== null) {
-      return this.readBackRefreshedTokensFromPath(this.getRuntimeAuthPath(), {
-        ...options,
-        expectedAccountId: accountId
-      })
-    }
+
     return this.readBackRefreshedTokensFromPath(this.getRuntimeAuthPath(), options)
   }
 
@@ -441,26 +428,8 @@ export class CodexRuntimeHomeService {
     account: CodexManagedAccount,
     options: { updateLastWrittenAuthJson: boolean }
   ): CodexReadBackResult {
-    const launchResult = this.readBackRefreshedTokensFromPath(
-      this.getHostLaunchAuthPath(account.id),
-      {
-        ...options,
-        lastWrittenAuthJson: this.getLastWrittenHostAuthJson(account.id),
-        setLastWrittenAuthJson: (contents) => {
-          this.setLastWrittenHostAuthJson(account.id, contents)
-        },
-        expectedAccountId: account.id
-      }
-    )
-    if (launchResult !== 'unchanged') {
-      return launchResult
-    }
     return this.readBackRefreshedTokensFromPath(this.getRuntimeAuthPath(), {
       ...options,
-      lastWrittenAuthJson: this.lastWrittenAuthJson,
-      setLastWrittenAuthJson: (contents) => {
-        this.lastWrittenAuthJson = contents
-      },
       expectedAccountId: account.id
     })
   }
@@ -470,14 +439,6 @@ export class CodexRuntimeHomeService {
       this.syncForCurrentSelection()
     } catch (error) {
       console.warn('[codex-runtime-home] Failed to sync runtime auth state:', error)
-    }
-  }
-
-  private safeRefreshCurrentHostActiveHome(): void {
-    try {
-      this.refreshCurrentHostActiveHome()
-    } catch (error) {
-      console.warn('[codex-runtime-home] Failed to refresh active host Codex home:', error)
     }
   }
 
@@ -521,36 +482,31 @@ export class CodexRuntimeHomeService {
     if (!runtimeHomePath) {
       return null
     }
-    const launchRootPath = this.getWslLaunchRootPathFromRuntimeHome(runtimeHomePath)
+    this.wslRuntimeHomePathByDistro.set(distro, runtimeHomePath)
 
     mkdirSync(runtimeHomePath, { recursive: true })
+    this.safeMigrateLegacyWslActiveHomePointer(distro, runtimeHomePath)
     this.seedWslRuntimeHome(runtimeHomePath, activeAccount, distro)
 
     const runtimeAuthPath = join(runtimeHomePath, 'auth.json')
-    const hadPreviousWslSelection = this.lastSyncedWslAccountIdByDistro.has(distro)
-    const previousWslAccountId = hadPreviousWslSelection
-      ? (this.lastSyncedWslAccountIdByDistro.get(distro) ?? null)
-      : null
-    if (activeAccount && hadPreviousWslSelection && previousWslAccountId === null) {
-      this.preserveWslSystemDefaultRefresh(distro, launchRootPath, runtimeAuthPath)
-    }
-    const readBackAccountId =
-      previousWslAccountId ?? (!hadPreviousWslSelection ? activeAccount?.id : null)
-    if (readBackAccountId) {
-      if (this.skipNextReadBackForAccountId === readBackAccountId) {
+    const previousWslAccountId = this.lastSyncedWslAccountIdByDistro.get(distro) ?? null
+    if (previousWslAccountId) {
+      if (this.skipNextReadBackForAccountId === previousWslAccountId) {
         this.skipNextReadBackForAccountId = null
       } else {
         const previousWslAccount = this.getActiveAccount(
           settings.codexManagedAccounts,
-          readBackAccountId
+          previousWslAccountId
         )
         if (previousWslAccount) {
-          this.readBackWslManagedAccountRefresh(
-            distro,
-            launchRootPath,
-            runtimeAuthPath,
-            previousWslAccount
-          )
+          this.readBackRefreshedTokensFromPath(runtimeAuthPath, {
+            updateLastWrittenAuthJson: true,
+            lastWrittenAuthJson: this.lastWrittenWslAuthJsonByDistro.get(distro) ?? null,
+            setLastWrittenAuthJson: (contents) => {
+              this.lastWrittenWslAuthJsonByDistro.set(distro, contents)
+            },
+            expectedAccountId: previousWslAccount.id
+          })
         }
       }
     }
@@ -559,13 +515,9 @@ export class CodexRuntimeHomeService {
     if (activeAccount && activeAuthPath && existsSync(activeAuthPath)) {
       const activeAuth = readFileSync(activeAuthPath, 'utf-8')
       this.writeRuntimeAuthAtPath(runtimeAuthPath, activeAuth)
-      this.writeRuntimeAuthAtPath(
-        this.getWslLaunchAuthPath(launchRootPath, activeAccount.id),
-        activeAuth
-      )
-      this.setLastWrittenWslAuthJson(distro, activeAccount.id, activeAuth)
+      this.lastWrittenWslAuthJsonByDistro.set(distro, activeAuth)
       this.lastSyncedWslAccountIdByDistro.set(distro, activeAccount.id)
-      return materializeScopedCodexLaunchHome(runtimeHomePath, launchRootPath, activeAccount.id)
+      return runtimeHomePath
     }
     if (activeAccount && activeAuthPath) {
       console.warn(
@@ -584,40 +536,36 @@ export class CodexRuntimeHomeService {
     const systemAuthPath = this.getWslSystemCodexAuthPath({ runtime: 'wsl', wslDistro: distro })
     if (systemAuthPath && existsSync(systemAuthPath)) {
       const systemAuth = readFileSync(systemAuthPath, 'utf-8')
-      const mirroredSystemDefaultAuth = this.getLastWrittenWslAuthJson(distro, null)
+      const mirroredSystemDefaultAuth = this.lastWrittenWslAuthJsonByDistro.get(distro) ?? null
       const runtimeAuth = existsSync(runtimeAuthPath)
         ? readFileSync(runtimeAuthPath, 'utf-8')
         : null
-      const systemLaunchAuthPath = this.getWslLaunchAuthPath(launchRootPath, null)
-      const launchAuth = existsSync(systemLaunchAuthPath)
-        ? readFileSync(systemLaunchAuthPath, 'utf-8')
-        : null
-      const refreshedAuth = this.selectWslSystemDefaultRefreshCandidate({
-        launchAuth,
-        runtimeAuth,
-        systemAuth,
-        mirroredSystemDefaultAuth
-      })
-      if (refreshedAuth) {
-        this.writeRuntimeAuthAtPath(systemAuthPath, refreshedAuth)
-        this.writeRuntimeAuthAtPath(runtimeAuthPath, refreshedAuth)
-        this.writeRuntimeAuthAtPath(systemLaunchAuthPath, refreshedAuth)
-        this.setLastWrittenWslAuthJson(distro, null, refreshedAuth)
+      if (
+        runtimeAuth !== null &&
+        runtimeAuth !== systemAuth &&
+        this.runtimeAuthMatchesSystemDefaultIdentity(runtimeAuth, systemAuth) &&
+        ((mirroredSystemDefaultAuth !== null && systemAuth === mirroredSystemDefaultAuth) ||
+          (mirroredSystemDefaultAuth === null &&
+            this.runtimeAuthIsFresher(runtimeAuth, systemAuth)))
+      ) {
+        // Why: WSL runtime homes are per-distro and their in-memory baseline is
+        // lost on app restart. A same-identity fresher runtime auth is a Codex
+        // token refresh and should be copied back before we mirror ~/.codex.
+        this.writeRuntimeAuthAtPath(systemAuthPath, runtimeAuth)
+        this.lastWrittenWslAuthJsonByDistro.set(distro, runtimeAuth)
         this.lastSyncedWslAccountIdByDistro.set(distro, null)
-        return materializeScopedCodexLaunchHome(runtimeHomePath, launchRootPath, null)
+        return runtimeHomePath
       }
       this.writeRuntimeAuthAtPath(runtimeAuthPath, systemAuth)
-      this.writeRuntimeAuthAtPath(systemLaunchAuthPath, systemAuth)
-      this.setLastWrittenWslAuthJson(distro, null, systemAuth)
+      this.lastWrittenWslAuthJsonByDistro.set(distro, systemAuth)
       this.lastSyncedWslAccountIdByDistro.set(distro, null)
-      return materializeScopedCodexLaunchHome(runtimeHomePath, launchRootPath, null)
+      return runtimeHomePath
     }
 
     rmSync(runtimeAuthPath, { force: true })
-    rmSync(this.getWslLaunchAuthPath(launchRootPath, null), { force: true })
-    this.setLastWrittenWslAuthJson(distro, null, null)
+    this.lastWrittenWslAuthJsonByDistro.set(distro, null)
     this.lastSyncedWslAccountIdByDistro.set(distro, null)
-    return materializeScopedCodexLaunchHome(runtimeHomePath, launchRootPath, null)
+    return runtimeHomePath
   }
 
   private getWslRuntimeHomePath(distro: string): string | null {
@@ -627,131 +575,96 @@ export class CodexRuntimeHomeService {
       : null
   }
 
-  private getWslLaunchRootPath(distro: string): string | null {
-    const runtimeHomePath = this.getWslRuntimeHomePath(distro)
-    return runtimeHomePath ? this.getWslLaunchRootPathFromRuntimeHome(runtimeHomePath) : null
-  }
-
-  private getWslLaunchRootPathFromRuntimeHome(runtimeHomePath: string): string {
-    return this.joinWslPath(dirname(runtimeHomePath), 'launch', 'wsl')
-  }
-
-  private getWslLaunchAuthPath(launchRootPath: string, accountId: string | null): string {
-    return join(ensureScopedCodexLaunchHome(launchRootPath, accountId), 'auth.json')
-  }
-
-  private getWslDistroForAccount(account: CodexManagedAccount): string | null {
-    if (!this.getWslManagedHomePath(account)) {
-      return null
-    }
-    return account.wslDistro ?? parseWslUncPath(account.managedHomePath)?.distro ?? null
-  }
-
-  private getWslLaunchSelectionKey(distro: string, accountId: string | null): string {
-    return `${distro}\0${accountId ?? 'system'}`
-  }
-
-  private getLastWrittenWslAuthJson(distro: string, accountId: string | null): string | null {
-    return (
-      this.lastWrittenWslAuthJsonBySelection.get(
-        this.getWslLaunchSelectionKey(distro, accountId)
-      ) ?? null
-    )
-  }
-
-  private setLastWrittenWslAuthJson(
-    distro: string,
-    accountId: string | null,
-    contents: string | null
+  private safeReadBackActiveWslAccountBeforeRestart(
+    account: CodexManagedAccount,
+    selectedDistroKey: string
   ): void {
-    this.lastWrittenWslAuthJsonBySelection.set(
-      this.getWslLaunchSelectionKey(distro, accountId),
-      contents
-    )
-  }
-
-  private readBackWslManagedAccountRefresh(
-    distro: string,
-    launchRootPath: string,
-    runtimeAuthPath: string,
-    account: CodexManagedAccount
-  ): void {
-    const launchResult = this.readBackRefreshedTokensFromPath(
-      this.getWslLaunchAuthPath(launchRootPath, account.id),
-      {
-        updateLastWrittenAuthJson: true,
-        lastWrittenAuthJson: this.getLastWrittenWslAuthJson(distro, account.id),
-        setLastWrittenAuthJson: (contents) => {
-          this.setLastWrittenWslAuthJson(distro, account.id, contents)
-        },
-        expectedAccountId: account.id
-      }
-    )
-    if (launchResult === 'unchanged') {
-      this.readBackRefreshedTokensFromPath(runtimeAuthPath, {
-        updateLastWrittenAuthJson: true,
-        lastWrittenAuthJson: this.getLastWrittenWslAuthJson(distro, account.id),
-        setLastWrittenAuthJson: (contents) => {
-          this.setLastWrittenWslAuthJson(distro, account.id, contents)
-        },
-        expectedAccountId: account.id
-      })
+    try {
+      this.readBackActiveWslAccountBeforeRestart(account, selectedDistroKey)
+    } catch (error) {
+      console.warn('[codex-runtime-home] Failed to preserve WSL Codex auth before restart:', error)
     }
   }
 
-  private preserveWslSystemDefaultRefresh(
-    distro: string,
-    launchRootPath: string,
-    runtimeAuthPath: string
+  private readBackActiveWslAccountBeforeRestart(
+    account: CodexManagedAccount,
+    selectedDistroKey: string
   ): void {
-    const systemAuthPath = this.getWslSystemCodexAuthPath({ runtime: 'wsl', wslDistro: distro })
-    if (!systemAuthPath || !existsSync(systemAuthPath)) {
+    const distro =
+      selectedDistroKey === getWslSelectionKey(null)
+        ? account.wslDistro?.trim()
+        : selectedDistroKey.trim() || account.wslDistro?.trim()
+    if (!distro) {
       return
     }
-    const systemAuth = readFileSync(systemAuthPath, 'utf-8')
-    const systemLaunchAuthPath = this.getWslLaunchAuthPath(launchRootPath, null)
-    const refreshedAuth = this.selectWslSystemDefaultRefreshCandidate({
-      launchAuth: existsSync(systemLaunchAuthPath)
-        ? readFileSync(systemLaunchAuthPath, 'utf-8')
-        : null,
-      runtimeAuth: existsSync(runtimeAuthPath) ? readFileSync(runtimeAuthPath, 'utf-8') : null,
-      systemAuth,
-      mirroredSystemDefaultAuth: this.getLastWrittenWslAuthJson(distro, null)
-    })
-    if (!refreshedAuth) {
+
+    const runtimeHomePath = this.wslRuntimeHomePathByDistro.get(distro)
+    if (!runtimeHomePath) {
       return
     }
-    this.writeRuntimeAuthAtPath(systemAuthPath, refreshedAuth)
-    this.writeRuntimeAuthAtPath(runtimeAuthPath, refreshedAuth)
-    this.writeRuntimeAuthAtPath(systemLaunchAuthPath, refreshedAuth)
-    this.setLastWrittenWslAuthJson(distro, null, refreshedAuth)
+
+    this.readBackRefreshedTokensFromPath(join(runtimeHomePath, 'auth.json'), {
+      updateLastWrittenAuthJson: true,
+      lastWrittenAuthJson: this.lastWrittenWslAuthJsonByDistro.get(distro) ?? null,
+      setLastWrittenAuthJson: (contents) => {
+        this.lastWrittenWslAuthJsonByDistro.set(distro, contents)
+      },
+      expectedAccountId: account.id
+    })
   }
 
-  private selectWslSystemDefaultRefreshCandidate(options: {
-    launchAuth: string | null
-    runtimeAuth: string | null
-    systemAuth: string
-    mirroredSystemDefaultAuth: string | null
-  }): string | null {
-    const candidates = [options.launchAuth, options.runtimeAuth].filter((value): value is string =>
-      Boolean(value)
+  private safeMigrateLegacyWslActiveHomePointer(distro: string, runtimeHomePath: string): void {
+    try {
+      this.migrateLegacyWslActiveHomePointer(distro, runtimeHomePath)
+    } catch (error) {
+      console.warn('[codex-runtime-home] Failed to migrate legacy WSL active Codex home:', error)
+    }
+  }
+
+  private migrateLegacyWslActiveHomePointer(distro: string, runtimeHomePath: string): void {
+    const runtimeWsl = parseWslUncPath(runtimeHomePath)
+    if (!runtimeWsl?.linuxPath.endsWith('/codex-runtime-home/home')) {
+      return
+    }
+    const activeLinuxPath = runtimeWsl.linuxPath.replace(
+      /\/codex-runtime-home\/home$/,
+      '/codex-runtime-home/active/wsl/home'
     )
-    const refreshedCandidates = candidates.filter((candidate) => {
-      if (candidate === options.systemAuth) {
-        return false
-      }
-      if (!this.runtimeAuthMatchesSystemDefaultIdentity(candidate, options.systemAuth)) {
-        return false
-      }
-      return options.mirroredSystemDefaultAuth !== null
-        ? options.systemAuth === options.mirroredSystemDefaultAuth
-        : this.runtimeAuthIsFresher(candidate, options.systemAuth)
-    })
-    return (
-      refreshedCandidates.sort((left, right) =>
-        this.runtimeAuthIsFresher(right, left) ? 1 : -1
-      )[0] ?? null
+    const nextLinuxPath = `${activeLinuxPath}.next-${process.pid}-${Date.now()}`
+    const activeLinuxParentPath = this.dirnameLinuxPath(activeLinuxPath)
+    // Why: WSL drops bash argv here and login-shell cleanup can turn explicit
+    // `exit 0` into status 1, so keep this script literal and fall-through.
+    execFileSync(
+      'wsl.exe',
+      [
+        '-d',
+        distro,
+        '--',
+        'bash',
+        '-lc',
+        [
+          'set -e',
+          `if [ ! -e ${this.quoteBashString(activeLinuxPath)} ] && [ ! -L ${this.quoteBashString(activeLinuxPath)} ]; then :`,
+          `elif [ -e ${this.quoteBashString(activeLinuxPath)} ] && [ ! -L ${this.quoteBashString(activeLinuxPath)} ]; then :`,
+          'else',
+          `mkdir -p ${this.quoteBashString(activeLinuxParentPath)}`,
+          `rm -rf -- ${this.quoteBashString(nextLinuxPath)}`,
+          `ln -s -- ${this.quoteBashString(runtimeWsl.linuxPath)} ${this.quoteBashString(nextLinuxPath)}`,
+          `mv -Tf -- ${this.quoteBashString(nextLinuxPath)} ${this.quoteBashString(activeLinuxPath)}`,
+          'fi'
+        ].join('\n')
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 }
     )
+  }
+
+  private dirnameLinuxPath(value: string): string {
+    const index = value.lastIndexOf('/')
+    return index > 0 ? value.slice(0, index) : '/'
+  }
+
+  private quoteBashString(value: string): string {
+    return `'${value.replace(/'/g, `'\\''`)}'`
   }
 
   private joinWslPath(basePath: string, ...segments: string[]): string {
@@ -1066,75 +979,24 @@ export class CodexRuntimeHomeService {
     }
   }
 
+  private safeMigrateLegacyActiveHomePointer(): void {
+    try {
+      const activeHomePath = this.getLegacyHostActiveHomePath()
+      if (!this.legacyActiveHomePathExists(activeHomePath)) {
+        return
+      }
+      this.repointLegacyActiveHomePointer(activeHomePath, this.getRuntimeHomePath())
+    } catch (error) {
+      console.warn('[codex-runtime-home] Failed to migrate legacy active Codex home:', error)
+    }
+  }
+
   private getRuntimeHomePath(): string {
     return getOrcaManagedCodexHomePath()
   }
 
   private getRuntimeAuthPath(): string {
     return join(this.getRuntimeHomePath(), 'auth.json')
-  }
-
-  private getHostLaunchAuthPath(accountId: string | null): string {
-    return join(ensureOrcaCodexLaunchHome(accountId), 'auth.json')
-  }
-
-  private materializeCurrentHostLaunchHome(): string {
-    const launchHomePath = materializeOrcaCodexLaunchHome(
-      normalizeCodexRuntimeSelection(this.store.getSettings()).host
-    )
-    try {
-      trustCodexLaunchHomeHooks(launchHomePath)
-    } catch (error) {
-      console.warn('[codex-runtime-home] Failed to trust host launch-home hooks:', error)
-    }
-    return launchHomePath
-  }
-
-  private materializeCurrentHostActiveHome(): string {
-    const launchHomePath = this.materializeCurrentHostLaunchHome()
-    // Why: terminals keep CODEX_HOME for their lifetime. Pointing that stable
-    // path at the selected launch home restores hot-swap for the next `codex`.
-    return materializeOrcaCodexActiveHome(launchHomePath)
-  }
-
-  private pointWslActiveHomeAtLaunchHome(runtimeHomePath: string, launchHomePath: string): string {
-    const activeHomePath = this.joinWslPath(dirname(runtimeHomePath), 'active', 'wsl', 'home')
-    return pointActiveCodexHomeAtLaunchHome(activeHomePath, launchHomePath)
-  }
-
-  private pointWslActiveHomeForLaunch(
-    target: CodexAccountSelectionTarget,
-    launchHomePath: string | null
-  ): string | null {
-    if (!launchHomePath || process.platform !== 'win32') {
-      return launchHomePath
-    }
-    const distro = target.wslDistro?.trim() || getDefaultWslDistro()
-    if (!distro) {
-      return launchHomePath
-    }
-    const runtimeHomePath = this.getWslRuntimeHomePath(distro)
-    return runtimeHomePath
-      ? this.pointWslActiveHomeAtLaunchHome(runtimeHomePath, launchHomePath)
-      : launchHomePath
-  }
-
-  private getHostLaunchSelectionKey(accountId: string | null): string {
-    return accountId ?? 'system'
-  }
-
-  private getLastWrittenHostAuthJson(accountId: string | null): string | null {
-    const key = this.getHostLaunchSelectionKey(accountId)
-    return this.lastWrittenHostAuthJsonBySelection.has(key)
-      ? (this.lastWrittenHostAuthJsonBySelection.get(key) ?? null)
-      : this.lastWrittenAuthJson
-  }
-
-  private setLastWrittenHostAuthJson(accountId: string | null, contents: string | null): void {
-    this.lastWrittenHostAuthJsonBySelection.set(this.getHostLaunchSelectionKey(accountId), contents)
-    if (accountId === normalizeCodexRuntimeSelection(this.store.getSettings()).host) {
-      this.lastWrittenAuthJson = contents
-    }
   }
 
   private getSystemDefaultSnapshotPath(): string {
@@ -1151,6 +1013,10 @@ export class CodexRuntimeHomeService {
     return metadataDir
   }
 
+  private getLegacyHostActiveHomePath(): string {
+    return join(this.getRuntimeMetadataDir(), 'active', 'host', 'home')
+  }
+
   private getMigrationMarkerPath(): string {
     return join(this.getRuntimeMetadataDir(), 'migration-v1.json')
   }
@@ -1161,6 +1027,105 @@ export class CodexRuntimeHomeService {
 
   private getManagedAccountsRoot(): string {
     return join(app.getPath('userData'), 'codex-accounts')
+  }
+
+  private repointLegacyActiveHomePointer(activeHomePath: string, runtimeHomePath: string): void {
+    if (this.activeHomeAlreadyPointsToRuntimeHome(activeHomePath, runtimeHomePath)) {
+      return
+    }
+    if (!this.legacyActiveHomeLinkIsReplaceable(activeHomePath)) {
+      return
+    }
+
+    mkdirSync(runtimeHomePath, { recursive: true })
+    mkdirSync(dirname(activeHomePath), { recursive: true })
+    const nextLinkPath = `${activeHomePath}.next-${process.pid}-${Date.now()}`
+    this.removeLegacyActiveHomeLinkIfOwned(nextLinkPath)
+    try {
+      symlinkSync(
+        runtimeHomePath,
+        nextLinkPath,
+        process.platform === 'win32' && lstatSync(runtimeHomePath).isDirectory()
+          ? 'junction'
+          : undefined
+      )
+      try {
+        renameSync(nextLinkPath, activeHomePath)
+      } catch (error) {
+        if (!this.legacyActiveHomeLinkIsReplaceable(activeHomePath)) {
+          throw error
+        }
+        this.removeLegacyActiveHomeLinkIfOwned(activeHomePath)
+        renameSync(nextLinkPath, activeHomePath)
+      }
+    } finally {
+      this.removeLegacyActiveHomeLinkIfOwned(nextLinkPath)
+    }
+  }
+
+  private activeHomeAlreadyPointsToRuntimeHome(
+    activeHomePath: string,
+    runtimeHomePath: string
+  ): boolean {
+    try {
+      return this.linkTargetsMatch(readlinkSync(activeHomePath), activeHomePath, runtimeHomePath)
+    } catch {
+      return false
+    }
+  }
+
+  private linkTargetsMatch(
+    linkTarget: string,
+    linkPath: string,
+    expectedTargetPath: string
+  ): boolean {
+    const resolvedLinkTarget = isAbsolute(linkTarget)
+      ? resolve(linkTarget)
+      : resolve(dirname(linkPath), linkTarget)
+    return resolvedLinkTarget === resolve(expectedTargetPath)
+  }
+
+  private legacyActiveHomeLinkIsReplaceable(activeHomePath: string): boolean {
+    try {
+      const stat = lstatSync(activeHomePath)
+      return stat.isSymbolicLink() || this.isWindowsReadableLink(activeHomePath)
+    } catch {
+      return true
+    }
+  }
+
+  private legacyActiveHomePathExists(activeHomePath: string): boolean {
+    try {
+      lstatSync(activeHomePath)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  private removeLegacyActiveHomeLinkIfOwned(activeHomePath: string): void {
+    try {
+      const stat = lstatSync(activeHomePath)
+      if (stat.isSymbolicLink()) {
+        unlinkSync(activeHomePath)
+      } else if (this.isWindowsReadableLink(activeHomePath)) {
+        rmdirSync(activeHomePath)
+      }
+    } catch {
+      // Missing or inaccessible temporary links are handled by the caller.
+    }
+  }
+
+  private isWindowsReadableLink(targetPath: string): boolean {
+    if (process.platform !== 'win32') {
+      return false
+    }
+    try {
+      readlinkSync(targetPath)
+      return true
+    } catch {
+      return false
+    }
   }
 
   private migrateLegacyManagedStateIfNeeded(): void {
@@ -1329,26 +1294,16 @@ export class CodexRuntimeHomeService {
 
   private syncRuntimeAuthWithSystemDefault(): void {
     const runtimeAuthPath = this.getRuntimeAuthPath()
-    const launchAuthPath = this.getHostLaunchAuthPath(null)
     const systemDefaultAuthPath = join(getSystemCodexHomePath(), 'auth.json')
-    if (!existsSync(runtimeAuthPath) && !existsSync(launchAuthPath)) {
+    if (!existsSync(runtimeAuthPath)) {
       return
     }
 
     try {
-      const launchAuth = existsSync(launchAuthPath) ? readFileSync(launchAuthPath, 'utf-8') : null
-      const sharedAuth = existsSync(runtimeAuthPath) ? readFileSync(runtimeAuthPath, 'utf-8') : null
+      const runtimeAuth = readFileSync(runtimeAuthPath, 'utf-8')
       if (!existsSync(systemDefaultAuthPath)) {
         const snapshot = this.readSystemDefaultSnapshot(this.getSystemDefaultSnapshotPath())
         const mirroredSystemDefaultAuth = this.lastWrittenAuthJson ?? snapshot?.authJson ?? null
-        const runtimeAuth = this.selectSystemDefaultRuntimeAuthCandidate({
-          launchAuth,
-          sharedAuth,
-          mirroredSystemDefaultAuth
-        })
-        if (runtimeAuth === null) {
-          return
-        }
         if (mirroredSystemDefaultAuth !== null && runtimeAuth === mirroredSystemDefaultAuth) {
           this.clearRuntimeAuthAfterSystemDefaultLogout(runtimeAuthPath)
           return
@@ -1362,17 +1317,9 @@ export class CodexRuntimeHomeService {
         return
       }
       const systemDefaultAuth = readFileSync(systemDefaultAuthPath, 'utf-8')
-      const snapshot = this.readSystemDefaultSnapshot(this.getSystemDefaultSnapshotPath())
-      const mirroredSystemDefaultAuth = this.lastWrittenAuthJson ?? snapshot?.authJson ?? null
-      const runtimeAuth = this.selectSystemDefaultRuntimeAuthCandidate({
-        launchAuth,
-        sharedAuth,
-        mirroredSystemDefaultAuth: mirroredSystemDefaultAuth ?? systemDefaultAuth
-      })
-      if (runtimeAuth === null) {
-        return
-      }
       if (runtimeAuth !== systemDefaultAuth) {
+        const snapshot = this.readSystemDefaultSnapshot(this.getSystemDefaultSnapshotPath())
+        const mirroredSystemDefaultAuth = this.lastWrittenAuthJson ?? snapshot?.authJson ?? null
         if (
           mirroredSystemDefaultAuth !== null &&
           systemDefaultAuth === mirroredSystemDefaultAuth &&
@@ -1383,9 +1330,7 @@ export class CodexRuntimeHomeService {
           // sync does not overwrite fresh runtime credentials with stale ones.
           this.writeSystemDefaultAuth(runtimeAuth)
           this.captureSystemDefaultSnapshot({ force: true })
-          this.setLastWrittenHostAuthJson(null, runtimeAuth)
-          this.writeRuntimeAuthAtPath(runtimeAuthPath, runtimeAuth)
-          this.writeRuntimeAuthAtPath(launchAuthPath, runtimeAuth)
+          this.lastWrittenAuthJson = runtimeAuth
           return
         }
         // Why: the unmanaged path used to read ~/.codex directly. Mirror later
@@ -1393,66 +1338,10 @@ export class CodexRuntimeHomeService {
         // Codex sessions keep matching the user's current system-default state.
         this.captureSystemDefaultSnapshot({ force: true })
         this.writeRuntimeAuth(systemDefaultAuth)
-      } else if (sharedAuth !== null && sharedAuth !== runtimeAuth) {
-        this.writeRuntimeAuthAtPath(runtimeAuthPath, runtimeAuth)
       }
     } catch (error) {
       console.warn('[codex-runtime-home] Failed to sync system-default auth:', error)
     }
-  }
-
-  private selectSystemDefaultRuntimeAuthCandidate(options: {
-    launchAuth: string | null
-    sharedAuth: string | null
-    mirroredSystemDefaultAuth: string | null
-  }): string | null {
-    const launchMatches = this.systemDefaultCandidateMatchesMirror(
-      options.launchAuth,
-      options.mirroredSystemDefaultAuth
-    )
-    const sharedMatches = this.systemDefaultCandidateMatchesMirror(
-      options.sharedAuth,
-      options.mirroredSystemDefaultAuth
-    )
-    const launchChanged = launchMatches && options.launchAuth !== options.mirroredSystemDefaultAuth
-    const sharedChanged = sharedMatches && options.sharedAuth !== options.mirroredSystemDefaultAuth
-
-    if (launchChanged && !sharedChanged) {
-      return options.launchAuth
-    }
-    if (sharedChanged && !launchChanged) {
-      return options.sharedAuth
-    }
-    if (launchChanged && sharedChanged) {
-      if (
-        options.launchAuth !== null &&
-        options.sharedAuth !== null &&
-        this.runtimeAuthIsFresher(options.sharedAuth, options.launchAuth)
-      ) {
-        return options.sharedAuth
-      }
-      return options.launchAuth
-    }
-    if (launchMatches) {
-      return options.launchAuth
-    }
-    if (sharedMatches) {
-      return options.sharedAuth
-    }
-    return options.launchAuth ?? options.sharedAuth
-  }
-
-  private systemDefaultCandidateMatchesMirror(
-    authJson: string | null,
-    mirroredSystemDefaultAuth: string | null
-  ): boolean {
-    if (authJson === null) {
-      return false
-    }
-    return (
-      mirroredSystemDefaultAuth === null ||
-      this.runtimeAuthMatchesSystemDefaultIdentity(authJson, mirroredSystemDefaultAuth)
-    )
   }
 
   private restoreSystemDefaultSnapshot(options: { detectExternalLogin: boolean }): void {
@@ -1471,7 +1360,7 @@ export class CodexRuntimeHomeService {
       // a local logout signal for Orca-launched Codex sessions, not a reason to
       // rewrite the user's real ~/.codex snapshot back into place.
       this.persistRuntimeLogoutMarker()
-      this.clearHostRuntimeAuthBaseline()
+      this.lastWrittenAuthJson = null
       return
     }
 
@@ -1479,10 +1368,10 @@ export class CodexRuntimeHomeService {
       // Why: while a managed account is selected, the runtime auth file exists
       // with managed credentials. If ~/.codex/auth.json vanished meanwhile,
       // switching back must preserve that external system-default logout.
-      this.removeHostRuntimeAuth(runtimeAuthPath)
+      rmSync(runtimeAuthPath, { force: true })
       this.captureSystemDefaultSnapshot({ force: true })
       this.persistRuntimeLogoutMarker()
-      this.clearHostRuntimeAuthBaseline()
+      this.lastWrittenAuthJson = null
       return
     }
 
@@ -1497,21 +1386,21 @@ export class CodexRuntimeHomeService {
       this.captureSystemDefaultSnapshot({ force: true })
       const refreshedSnapshot = this.readSystemDefaultSnapshot(snapshotPath)
       if (!refreshedSnapshot) {
-        this.removeHostRuntimeAuth(runtimeAuthPath)
-        this.clearHostRuntimeAuthBaseline()
+        rmSync(runtimeAuthPath, { force: true })
+        this.lastWrittenAuthJson = null
         return
       }
       if (refreshedSnapshot.authJson === null) {
-        this.removeHostRuntimeAuth(runtimeAuthPath)
-        this.clearHostRuntimeAuthBaseline()
+        rmSync(runtimeAuthPath, { force: true })
+        this.lastWrittenAuthJson = null
         return
       }
       this.writeRuntimeAuth(refreshedSnapshot.authJson)
       return
     }
     if (snapshot.authJson === null) {
-      this.removeHostRuntimeAuth(runtimeAuthPath)
-      this.clearHostRuntimeAuthBaseline()
+      rmSync(runtimeAuthPath, { force: true })
+      this.lastWrittenAuthJson = null
       return
     }
     this.writeRuntimeAuth(snapshot.authJson)
@@ -1528,10 +1417,10 @@ export class CodexRuntimeHomeService {
     // Why: when the real ~/.codex auth disappears, Orca should treat that as an
     // external logout for unmanaged sessions, even if runtime auth had already
     // refreshed inside Orca's CODEX_HOME.
-    this.removeHostRuntimeAuth(runtimeAuthPath)
+    rmSync(runtimeAuthPath, { force: true })
     this.captureSystemDefaultSnapshot({ force: true })
     this.persistRuntimeLogoutMarker()
-    this.clearHostRuntimeAuthBaseline()
+    this.lastWrittenAuthJson = null
   }
 
   private readSystemDefaultAuth(): string | null {
@@ -1543,18 +1432,13 @@ export class CodexRuntimeHomeService {
     // Why: auth.json contains sensitive credentials. Restrict to owner-only
     // so other users on a shared Linux/macOS machine cannot read it.
     this.clearRuntimeLogoutMarker()
-    const accountId = normalizeCodexRuntimeSelection(this.store.getSettings()).host
-    const runtimeAuthPath = this.getRuntimeAuthPath()
-    const launchAuthPath = this.getHostLaunchAuthPath(accountId)
-    if (this.fileContentsEqual(runtimeAuthPath, contents)) {
-      this.ensureOwnerOnlyMode(runtimeAuthPath)
-      this.setLastWrittenHostAuthJson(accountId, contents)
-      this.writeRuntimeAuthAtPath(launchAuthPath, contents)
+    if (this.fileContentsEqual(this.getRuntimeAuthPath(), contents)) {
+      this.ensureOwnerOnlyMode(this.getRuntimeAuthPath())
+      this.lastWrittenAuthJson = contents
       return
     }
-    writeFileAtomically(runtimeAuthPath, contents, { mode: 0o600 })
-    this.setLastWrittenHostAuthJson(accountId, contents)
-    this.writeRuntimeAuthAtPath(launchAuthPath, contents)
+    writeFileAtomically(this.getRuntimeAuthPath(), contents, { mode: 0o600 })
+    this.lastWrittenAuthJson = contents
   }
 
   private writeRuntimeAuthAtPath(authPath: string, contents: string): void {
@@ -1564,21 +1448,6 @@ export class CodexRuntimeHomeService {
     }
     mkdirSync(dirname(authPath), { recursive: true })
     writeFileAtomically(authPath, contents, { mode: 0o600 })
-  }
-
-  private removeHostRuntimeAuth(runtimeAuthPath: string): void {
-    rmSync(runtimeAuthPath, { force: true })
-    rmSync(
-      this.getHostLaunchAuthPath(normalizeCodexRuntimeSelection(this.store.getSettings()).host),
-      { force: true }
-    )
-  }
-
-  private clearHostRuntimeAuthBaseline(): void {
-    this.setLastWrittenHostAuthJson(
-      normalizeCodexRuntimeSelection(this.store.getSettings()).host,
-      null
-    )
   }
 
   private fileContentsEqual(targetPath: string, contents: string): boolean {

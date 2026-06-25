@@ -15,8 +15,11 @@ export default function RepoSpacePickerItems({ repoId }: Props): React.JSX.Eleme
   const repoSpaceAssignments = useAppStore((s) => s.repoSpaceAssignments)
   const moveRepoToSpace = useAppStore((s) => s.moveRepoToSpace)
 
-  const currentSpaceId = repoSpaceAssignments[repoId] ?? null
-  const sortedSpaces = React.useMemo(() => [...spaces].sort((a, b) => a.order - b.order), [spaces])
+  const currentSpaceId = (repoSpaceAssignments ?? {})[repoId] ?? null
+  const sortedSpaces = React.useMemo(
+    () => [...(spaces ?? [])].sort((a, b) => a.order - b.order),
+    [spaces]
+  )
 
   const handleMove = useCallback(
     (spaceId: string | null) => {

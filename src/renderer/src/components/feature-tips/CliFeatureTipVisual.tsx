@@ -5,6 +5,7 @@ import {
   ORCHESTRATION_CLI_COMMAND_TIMINGS_MS
 } from '@/components/feature-wall/agents-orchestration/orchestration-types'
 import { usePrefersReducedMotion } from '@/components/feature-wall/feature-wall-modal-helpers'
+import { translate } from '@/i18n/i18n'
 
 const CLI_AGENT_COMMANDS = [
   'orca worktree create --name auth-pr-1',
@@ -55,7 +56,6 @@ export function CliFeatureTipVisual(): JSX.Element {
       className="relative flex min-h-[27rem] flex-col overflow-hidden bg-muted/60 px-6 py-7"
       aria-hidden="true"
     >
-      <div className="absolute inset-x-0 top-0 h-16 bg-gradient-to-b from-background/55 to-transparent" />
       <div className="relative rounded-lg border border-border/70 bg-card/95 shadow-xs">
         <div className="flex items-center gap-2 border-b border-border/70 px-3 py-2">
           <span className="size-2 rounded-full bg-muted-foreground/35" />
@@ -64,7 +64,11 @@ export function CliFeatureTipVisual(): JSX.Element {
         </div>
         <div className="space-y-1.5 px-3 py-3 font-mono text-[10.5px] leading-[1.35] text-foreground">
           <div className="truncate text-muted-foreground">
-            <span className="mr-1.5 text-foreground">●</span>Claude Code session started
+            <span className="mr-1.5 text-foreground">●</span>
+            {translate(
+              'auto.components.feature.tips.CliFeatureTipVisual.22e62f3bab',
+              'Claude Code session started'
+            )}
           </div>
           {CLI_AGENT_COMMANDS.map((command, index) => {
             const isVisible = index < visibleCommandCount
@@ -74,7 +78,9 @@ export function CliFeatureTipVisual(): JSX.Element {
                 key={command}
                 className={`truncate ${isVisible ? 'animate-cli-tip-command-line' : 'invisible'}`}
               >
-                <span className="text-foreground">&gt; </span>
+                <span className="text-foreground">
+                  {translate('auto.components.feature.tips.CliFeatureTipVisual.badb4fc342', '>')}
+                </span>
                 <span>{command}</span>
                 {isCurrentLine ? (
                   <span className="animate-cli-tip-caret ml-0.5 inline-block h-3 w-1 translate-y-0.5 rounded-sm bg-foreground/70" />

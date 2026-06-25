@@ -23,7 +23,7 @@ export function selectSpaceNotificationCounts(state: AppState): Record<string, n
   // each live-agent pane lookup is O(1) instead of scanning every worktree's
   // tab list for every entry.
   const tabIdToWorktreeId = new Map<string, string>()
-  for (const [worktreeId, tabs] of Object.entries(state.tabsByWorktree)) {
+  for (const [worktreeId, tabs] of Object.entries(state.tabsByWorktree ?? {})) {
     for (const tab of tabs) {
       tabIdToWorktreeId.set(tab.id, worktreeId)
     }
@@ -35,7 +35,7 @@ export function selectSpaceNotificationCounts(state: AppState): Record<string, n
   // re-parsing the encoded id (which several stale-snapshot ids in tests do
   // not follow).
   const worktreeIdToRepoId = new Map<string, string>()
-  for (const [repoId, worktrees] of Object.entries(state.worktreesByRepo)) {
+  for (const [repoId, worktrees] of Object.entries(state.worktreesByRepo ?? {})) {
     for (const worktree of worktrees) {
       worktreeIdToRepoId.set(worktree.id, repoId)
     }
@@ -49,15 +49,15 @@ export function selectSpaceNotificationCounts(state: AppState): Record<string, n
     if (!repoId) {
       return
     }
-    const spaceId = state.repoSpaceAssignments[repoId]
+    const spaceId = state.repoSpaceAssignments?.[repoId]
     if (!spaceId) {
       return
     }
     counts[spaceId] = (counts[spaceId] ?? 0) + events
   }
 
-  for (const [paneKey, entry] of Object.entries(state.agentStatusByPaneKey)) {
-    const events = countUnreadAgentEvents(entry, state.acknowledgedAgentsByPaneKey[paneKey] ?? 0)
+  for (const [paneKey, entry] of Object.entries(state.agentStatusByPaneKey ?? {})) {
+    const events = countUnreadAgentEvents(entry, state.acknowledgedAgentsByPaneKey?.[paneKey] ?? 0)
     if (events === 0) {
       continue
     }
@@ -68,22 +68,22 @@ export function selectSpaceNotificationCounts(state: AppState): Record<string, n
     addToSpace(tabIdToWorktreeId.get(parsed.tabId), events)
   }
 
-  for (const [paneKey, retained] of Object.entries(state.retainedAgentsByPaneKey)) {
+  for (const [paneKey, retained] of Object.entries(state.retainedAgentsByPaneKey ?? {})) {
     const events = countUnreadAgentEvents(
       retained.entry,
-      state.acknowledgedAgentsByPaneKey[paneKey] ?? 0
+      state.acknowledgedAgentsByPaneKey?.[paneKey] ?? 0
     )
     addToSpace(retained.worktreeId, events)
   }
 
-  for (const unsupported of Object.values(state.migrationUnsupportedByPtyId)) {
+  for (const unsupported of Object.values(state.migrationUnsupportedByPtyId ?? {})) {
     const entry = migrationUnsupportedToAgentStatusEntry(unsupported)
     if (!entry) {
       continue
     }
     const events = countUnreadAgentEvents(
       entry,
-      state.acknowledgedAgentsByPaneKey[entry.paneKey] ?? 0
+      state.acknowledgedAgentsByPaneKey?.[entry.paneKey] ?? 0
     )
     if (events === 0) {
       continue
@@ -116,18 +116,18 @@ export function useSpaceNotificationCounts(): Record<string, number> {
  */
 export function selectAllAgentsUnreadCount(state: AppState): number {
   let count = 0
-  for (const [paneKey, entry] of Object.entries(state.agentStatusByPaneKey)) {
-    count += countUnreadAgentEvents(entry, state.acknowledgedAgentsByPaneKey[paneKey] ?? 0)
+  for (const [paneKey, entry] of Object.entries(state.agentStatusByPaneKey ?? {})) {
+    count += countUnreadAgentEvents(entry, state.acknowledgedAgentsByPaneKey?.[paneKey] ?? 0)
   }
-  for (const [paneKey, retained] of Object.entries(state.retainedAgentsByPaneKey)) {
-    count += countUnreadAgentEvents(retained.entry, state.acknowledgedAgentsByPaneKey[paneKey] ?? 0)
+  for (const [paneKey, retained] of Object.entries(state.retainedAgentsByPaneKey ?? {})) {
+    count += countUnreadAgentEvents(retained.entry, state.acknowledgedAgentsByPaneKey?.[paneKey] ?? 0)
   }
-  for (const unsupported of Object.values(state.migrationUnsupportedByPtyId)) {
+  for (const unsupported of Object.values(state.migrationUnsupportedByPtyId ?? {})) {
     const entry = migrationUnsupportedToAgentStatusEntry(unsupported)
     if (!entry) {
       continue
     }
-    count += countUnreadAgentEvents(entry, state.acknowledgedAgentsByPaneKey[entry.paneKey] ?? 0)
+    count += countUnreadAgentEvents(entry, state.acknowledgedAgentsByPaneKey?.[entry.paneKey] ?? 0)
   }
   return count
 }

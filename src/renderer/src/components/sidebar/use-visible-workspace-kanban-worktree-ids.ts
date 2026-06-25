@@ -2,6 +2,7 @@ import { useMemo } from 'react'
 import { useAppStore } from '@/store'
 import type { Repo, Worktree } from '../../../../shared/types'
 import { computeVisibleWorktreeIds } from './visible-worktrees'
+import { getSettingsFocusedExecutionHostId } from '../../../../shared/execution-host'
 
 type UseVisibleWorkspaceKanbanWorktreeIdsParams = {
   allWorktrees: readonly Worktree[]
@@ -15,6 +16,10 @@ export function useVisibleWorkspaceKanbanWorktreeIds({
   const worktreesByRepo = useAppStore((s) => s.worktreesByRepo)
   const showSleepingWorkspaces = useAppStore((s) => s.showSleepingWorkspaces)
   const hideDefaultBranchWorkspace = useAppStore((s) => s.hideDefaultBranchWorkspace)
+  const hideAutomationGeneratedWorkspaces = useAppStore((s) => s.hideAutomationGeneratedWorkspaces)
+  const workspaceHostScope = useAppStore((s) => s.workspaceHostScope)
+  const visibleWorkspaceHostIds = useAppStore((s) => s.visibleWorkspaceHostIds)
+  const settings = useAppStore((s) => s.settings)
   const filterRepoIds = useAppStore((s) => s.filterRepoIds)
   const activeSpaceId = useAppStore((s) => s.activeSpaceId)
   const repoSpaceAssignments = useAppStore((s) => s.repoSpaceAssignments)
@@ -36,9 +41,13 @@ export function useVisibleWorkspaceKanbanWorktreeIds({
         ptyIdsByTabId,
         browserTabsByWorktree,
         hideDefaultBranchWorkspace,
+        hideAutomationGeneratedWorkspaces,
         repoMap,
         activeSpaceId,
         repoSpaceAssignments,
+        workspaceHostScope,
+        visibleWorkspaceHostIds,
+        defaultHostId: getSettingsFocusedExecutionHostId(settings),
         // Why: the board has no nested lineage presentation. Ancestor injection
         // would make filtered-out parents appear as ordinary cards.
         worktreeLineageById: {}
@@ -49,6 +58,10 @@ export function useVisibleWorkspaceKanbanWorktreeIds({
     browserTabsByWorktree,
     filterRepoIds,
     hideDefaultBranchWorkspace,
+    hideAutomationGeneratedWorkspaces,
+    workspaceHostScope,
+    visibleWorkspaceHostIds,
+    settings,
     ptyIdsByTabId,
     repoMap,
     showSleepingWorkspaces,

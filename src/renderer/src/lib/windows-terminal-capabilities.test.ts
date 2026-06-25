@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   getCachedWindowsTerminalCapabilities,
+  hasCachedWindowsTerminalCapabilities,
   loadWindowsTerminalCapabilities,
   refreshWindowsTerminalCapabilities,
   resetWindowsTerminalCapabilitiesForTests,
@@ -60,6 +61,7 @@ describe('windows terminal capabilities', () => {
       gitBashAvailable: true
     })
 
+    expect(hasCachedWindowsTerminalCapabilities()).toBe(false)
     expect(getCachedWindowsTerminalCapabilities()).toEqual({
       wslAvailable: false,
       wslDistros: [],
@@ -78,6 +80,7 @@ describe('windows terminal capabilities', () => {
       isLoading: false
     }
     await expect(loadWindowsTerminalCapabilities()).resolves.toEqual(expected)
+    expect(hasCachedWindowsTerminalCapabilities()).toBe(true)
     expect(getCachedWindowsTerminalCapabilities()).toEqual(expected)
 
     await loadWindowsTerminalCapabilities()
@@ -195,6 +198,64 @@ describe('windows terminal capabilities', () => {
     })
     expect(isGitBashAvailable).toHaveBeenCalledTimes(2)
     expect(runtimeGetStatus).toHaveBeenCalledTimes(2)
+  })
+
+  it('loads remote runtime host capabilities through runtime RPC', async () => {
+    const runtimeEnvironmentCall = vi.fn(async (args: { selector: string; method: string }) => {
+      const resultByMethod: Record<string, unknown> = {
+        'status.get': {
+          hostPlatform: 'win32',
+          runtimeProtocolVersion: 3,
+          minCompatibleRuntimeClientVersion: 2
+        },
+        'host.wsl.isAvailable': true,
+        'host.wsl.listDistros': ['Ubuntu'],
+        'host.pwsh.isAvailable': true,
+        'host.gitBash.isAvailable': false
+      }
+      return {
+        id: args.method,
+        ok: true,
+        result: resultByMethod[args.method]
+      }
+    })
+    vi.stubGlobal('window', {
+      api: {
+        runtimeEnvironments: {
+          call: runtimeEnvironmentCall
+        }
+      }
+    })
+
+    await expect(
+      loadWindowsTerminalCapabilities({
+        ownerKey: 'runtime:env-win',
+        target: { kind: 'environment', environmentId: 'env-win' }
+      })
+    ).resolves.toEqual({
+      wslAvailable: true,
+      wslDistros: ['Ubuntu'],
+      pwshAvailable: true,
+      gitBashAvailable: false,
+      hostPlatform: 'win32',
+      isLoading: false
+    })
+
+    expect(runtimeEnvironmentCall).toHaveBeenCalledWith(
+      expect.objectContaining({ selector: 'env-win', method: 'host.wsl.isAvailable' })
+    )
+    expect(runtimeEnvironmentCall).toHaveBeenCalledWith(
+      expect.objectContaining({ selector: 'env-win', method: 'host.wsl.listDistros' })
+    )
+    expect(runtimeEnvironmentCall).toHaveBeenCalledWith(
+      expect.objectContaining({ selector: 'env-win', method: 'host.pwsh.isAvailable' })
+    )
+    expect(runtimeEnvironmentCall).toHaveBeenCalledWith(
+      expect.objectContaining({ selector: 'env-win', method: 'host.gitBash.isAvailable' })
+    )
+    expect(runtimeEnvironmentCall).toHaveBeenCalledWith(
+      expect.objectContaining({ selector: 'env-win', method: 'status.get' })
+    )
   })
 
   it('prunes expired runtime owner capability caches', async () => {

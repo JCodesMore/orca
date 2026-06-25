@@ -13,8 +13,6 @@ function renderRepoStep(overrides: Partial<ComponentProps<typeof RepoStep>> = {}
         nestedScan={null}
         nestedSelectedPaths={new Set()}
         onNestedSelectedPathsChange={vi.fn()}
-        nestedGroupName=""
-        onNestedGroupNameChange={vi.fn()}
         onImportNested={vi.fn()}
         onCancelNested={vi.fn()}
         onStopNestedScan={vi.fn()}
@@ -42,11 +40,24 @@ describe('RepoStep', () => {
     const html = renderRepoStep()
 
     expect(html).not.toContain('Project already added')
-    expect(html).toContain('Open a folder')
+    expect(html).toContain('Browse for a folder')
     expect(html).toContain('Clone a repo')
   })
 
-  it('disables nested import actions when no repositories are selected', () => {
+  it('presents the local-folder card itself as the browse action', () => {
+    const html = renderRepoStep()
+
+    expect(html).toContain('border-border bg-muted/30')
+    expect(html).toContain('focus:border-foreground/70')
+    expect(html).toContain('focus:ring-2 focus:ring-inset focus:ring-foreground/25')
+    expect(html).toContain('autofocus=""')
+    expect(html).toContain('Browse for a folder')
+    expect(html).toContain('group-hover:translate-x-0.5')
+    expect(html).toContain('w-fit max-w-[calc(100%-3.75rem)]')
+    expect(html).toContain('Want to import many repos at once? Select the parent folder.')
+  })
+
+  it('disables the nested import action when no repositories are selected', () => {
     const html = renderRepoStep({
       nestedScan: {
         selectedPath: '/workspace/platform',
@@ -59,13 +70,15 @@ describe('RepoStep', () => {
         maxDepth: 3,
         maxRepos: 100,
         timeoutMs: null
-      },
-      nestedGroupName: 'platform'
+      }
     })
 
-    expect(html).toContain('Import separately')
-    expect(html).toContain('Import as project group')
-    expect(html.match(/disabled=""/g)?.length).toBeGreaterThanOrEqual(2)
+    expect(html).toContain('Import repositories')
+    expect(html).toContain('Scanned folder: platform - /workspace/platform')
+    expect(html).not.toContain('Group name')
+    expect(html).not.toContain('Import separately')
+    expect(html).not.toContain('Import as project group')
+    expect(html.match(/disabled=""/g)?.length).toBeGreaterThanOrEqual(1)
   })
 
   it('shows a stop action and disables import while nested scan is still running', () => {
@@ -83,13 +96,40 @@ describe('RepoStep', () => {
         timeoutMs: null
       },
       nestedScanInProgress: true,
-      nestedSelectedPaths: new Set(['/workspace/platform/apps/web']),
-      nestedGroupName: 'platform'
+      nestedSelectedPaths: new Set(['/workspace/platform/apps/web'])
     })
 
-    expect(html).toContain('Scanning... Found 1 git repository in this folder.')
+    expect(html).toContain('Scanning... Found 1 repository in this folder.')
     expect(html).toContain('aria-label="Stop scan"')
     expect(html).toContain('Showing partial scan results.')
     expect(html.match(/disabled=""/g)?.length).toBeGreaterThanOrEqual(3)
+  })
+
+  it('shows a flat nested repository checklist with collision labels', () => {
+    const html = renderRepoStep({
+      nestedScan: {
+        selectedPath: '/workspace/platform',
+        selectedPathKind: 'non_git_folder',
+        repos: [
+          { path: '/workspace/platform/web', displayName: 'web', depth: 1 },
+          { path: '/workspace/platform/payments/api', displayName: 'api', depth: 2 },
+          { path: '/workspace/platform/billing/api', displayName: 'api', depth: 2 }
+        ],
+        truncated: false,
+        timedOut: false,
+        stopped: false,
+        durationMs: 4,
+        maxDepth: 3,
+        maxRepos: 100,
+        timeoutMs: null
+      },
+      nestedSelectedPaths: new Set(['/workspace/platform/web'])
+    })
+
+    expect(html).toContain('Found 3 repositories in this folder.')
+    expect(html).toContain('web')
+    expect(html).toContain('payments/api')
+    expect(html).toContain('billing/api')
+    expect(html).not.toContain('Project group')
   })
 })

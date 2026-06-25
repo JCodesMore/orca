@@ -47,12 +47,18 @@ import { BottomDrawer } from '../../../src/components/BottomDrawer'
 import { ConfirmModal } from '../../../src/components/ConfirmModal'
 import { MobileMarkdown } from '../../../src/components/MobileMarkdown'
 import { MobileAgentIcon } from '../../../src/components/MobileAgentIcon'
+import { MobileWorkspaceNameInput } from '../../../src/components/MobileWorkspaceNameInput'
+import { MobileSyntaxSegments } from '../../../src/components/MobileSyntaxSegments'
 import { PickerModal, type PickerOption } from '../../../src/components/PickerModal'
 import { TaskProviderLogo } from '../../../src/components/TaskProviderLogo'
 import {
   buildGitHubPrFileDiffPreview,
   type GitHubPrFileDiffLine
 } from '../../../src/tasks/github-pr-file-diff'
+import {
+  highlightMobileDiffLines,
+  resolveMobileSyntaxLanguage
+} from '../../../src/session/mobile-file-syntax'
 import { buildGitHubCheckSummary } from '../../../src/tasks/github-check-summary'
 import { buildTaskWorkspaceCreateParams } from '../../../src/tasks/workspace-create-params'
 import {
@@ -111,6 +117,10 @@ import {
   resolveVisibleTaskProvider,
   type TaskProvider
 } from '../../../src/tasks/mobile-task-providers'
+import {
+  extractLinearIssueReadItems,
+  type LinearMobileIssue
+} from '../../../src/tasks/linear-mobile-issue-read'
 import { MOBILE_TUI_AGENT_AUTO_PICK_ORDER } from '../../../src/tasks/mobile-tui-agents'
 import { resolveComposerBranchSelection } from '../../../src/tasks/mobile-composer-branch-selection'
 import {
@@ -276,25 +286,7 @@ type LinearIssueChild = {
   url: string
 }
 
-type LinearIssue = {
-  id: string
-  workspaceId?: string
-  workspaceName?: string
-  identifier: string
-  title: string
-  description?: string
-  url: string
-  state: { name: string; type: string; color: string }
-  team: { id: string; name: string; key: string }
-  project?: LinearProject
-  subIssues?: LinearIssueChild[]
-  labels: string[]
-  labelIds?: string[]
-  assignee?: { id?: string; displayName: string }
-  estimate?: number | null
-  priority: number
-  updatedAt: string
-}
+type LinearIssue = LinearMobileIssue
 
 type LinearState = {
   id: string
@@ -2042,7 +2034,11 @@ function GitHubPrFileDiff({
       ),
     [contents.modified, contents.original]
   )
-  const visibleDiffLines = diffPreview.lines
+  const syntaxLanguage = useMemo(() => resolveMobileSyntaxLanguage(filePath), [filePath])
+  const visibleDiffLines = useMemo(
+    () => highlightMobileDiffLines(diffPreview.lines, syntaxLanguage),
+    [diffPreview.lines, syntaxLanguage]
+  )
   const hiddenDiffLineCount = Math.max(0, diffPreview.totalLineCount - visibleDiffLines.length)
 
   if (diffPreview.totalLineCount === 0) {
@@ -2086,7 +2082,9 @@ function GitHubPrFileDiff({
                       : null
                 ]}
               >
-                {diffLinePrefix(line.kind)} {line.text || ' '}
+                <Text>{diffLinePrefix(line.kind)} </Text>
+                <MobileSyntaxSegments segments={line.segments} />
+                {line.text ? null : ' '}
               </Text>
             </View>
             {commentLine !== undefined ? (
@@ -3524,7 +3522,7 @@ export default function MobileTasksScreen() {
           if (!isSuccess(response)) {
             throw new Error(response.error.message)
           }
-          const issues = response.result as LinearIssue[]
+          const issues = extractLinearIssueReadItems(response.result)
           const filtered =
             selectedLinearTeamIds.size > 0
               ? issues.filter((issue) => selectedLinearTeamIds.has(issue.team.id))
@@ -4873,7 +4871,6 @@ export default function MobileTasksScreen() {
       }
     ]
   }, [runtimeTaskSettings.disabledTuiAgents, workspaceAgent, workspaceDetectedAgentIds])
-
   const openWorkspaceCreate = useCallback((item: ActionableTaskItem, repoIdOverride?: string) => {
     const suggestedName = taskWorkspaceSuggestedName(item)
     setWorkspaceCreateDraft({ item, ...(repoIdOverride ? { repoIdOverride } : {}) })
@@ -10980,14 +10977,12 @@ export default function MobileTasksScreen() {
                 <Text style={styles.workspaceCreateLabel}>
                   Workspace Name <Text style={styles.workspaceCreateLabelHint}>[Optional]</Text>
                 </Text>
-                <TextInput
+                <MobileWorkspaceNameInput
                   style={styles.input}
                   value={workspaceNameDraft}
                   onChangeText={handleWorkspaceNameDraftChange}
-                  placeholder="Workspace name"
                   placeholderTextColor={colors.textMuted}
-                  autoCapitalize="none"
-                  autoCorrect={false}
+                  shouldAutoFocus={taskUiReady && workspaceCreateDraft !== null}
                 />
               </View>
 

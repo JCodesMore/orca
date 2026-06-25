@@ -132,6 +132,37 @@ describe('runtime git client', () => {
     })
   })
 
+  it('forwards upstream-negative-cache bypass to local git status only when enabled', async () => {
+    gitStatus.mockResolvedValue({ entries: [], conflictOperation: 'unknown' })
+
+    await getRuntimeGitStatus(
+      {
+        settings: { activeRuntimeEnvironmentId: null },
+        worktreeId: 'wt-1',
+        worktreePath: '/repo'
+      },
+      { bypassEffectiveUpstreamNegativeCache: true }
+    )
+    await getRuntimeGitStatus(
+      {
+        settings: { activeRuntimeEnvironmentId: null },
+        worktreeId: 'wt-1',
+        worktreePath: '/repo'
+      },
+      { bypassEffectiveUpstreamNegativeCache: false }
+    )
+
+    expect(gitStatus).toHaveBeenNthCalledWith(1, {
+      worktreePath: '/repo',
+      connectionId: undefined,
+      bypassEffectiveUpstreamNegativeCache: true
+    })
+    expect(gitStatus).toHaveBeenNthCalledWith(2, {
+      worktreePath: '/repo',
+      connectionId: undefined
+    })
+  })
+
   it('checks ignored paths through local git IPC', async () => {
     gitCheckIgnored.mockResolvedValue(['dist/bundle.js'])
 
@@ -215,14 +246,14 @@ describe('runtime git client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(1, {
       selector: 'env-1',
       method: 'git.status',
-      params: { worktree: 'wt-1' },
+      params: { worktree: 'id:wt-1' },
       timeoutMs: 15_000
     })
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(2, {
       selector: 'env-1',
       method: 'git.diff',
       params: {
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         filePath: 'src/a.ts',
         staged: false,
         compareAgainstHead: true
@@ -232,7 +263,7 @@ describe('runtime git client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(3, {
       selector: 'env-1',
       method: 'git.history',
-      params: { worktree: 'wt-1', limit: 50, baseRef: 'origin/main' },
+      params: { worktree: 'id:wt-1', limit: 50, baseRef: 'origin/main' },
       timeoutMs: 15_000
     })
   })
@@ -257,7 +288,32 @@ describe('runtime git client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
       selector: 'env-1',
       method: 'git.status',
-      params: { worktree: 'wt-1', includeIgnored: true },
+      params: { worktree: 'id:wt-1', includeIgnored: true },
+      timeoutMs: 15_000
+    })
+  })
+
+  it('forwards upstream-negative-cache bypass through the active runtime environment', async () => {
+    runtimeEnvironmentCall.mockResolvedValue({
+      id: 'rpc-1',
+      ok: true,
+      result: { entries: [], conflictOperation: 'unknown' },
+      _meta: { runtimeId: 'remote-runtime' }
+    })
+
+    await getRuntimeGitStatus(
+      {
+        settings: { activeRuntimeEnvironmentId: 'env-1' },
+        worktreeId: 'wt-1',
+        worktreePath: '/repo'
+      },
+      { bypassEffectiveUpstreamNegativeCache: true }
+    )
+
+    expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
+      selector: 'env-1',
+      method: 'git.status',
+      params: { worktree: 'id:wt-1', bypassEffectiveUpstreamNegativeCache: true },
       timeoutMs: 15_000
     })
   })
@@ -282,7 +338,7 @@ describe('runtime git client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
       selector: 'env-1',
       method: 'git.checkIgnored',
-      params: { worktree: 'wt-1', paths: ['dist/bundle.js'] },
+      params: { worktree: 'id:wt-1', paths: ['dist/bundle.js'] },
       timeoutMs: 15_000
     })
     expect(result).toEqual(['dist/bundle.js'])
@@ -317,38 +373,38 @@ describe('runtime git client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(1, {
       selector: 'env-1',
       method: 'git.bulkStage',
-      params: { worktree: 'wt-1', filePaths: ['a.ts', 'b.ts'] },
+      params: { worktree: 'id:wt-1', filePaths: ['a.ts', 'b.ts'] },
       timeoutMs: 15_000
     })
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(2, {
       selector: 'env-1',
       method: 'git.bulkDiscard',
-      params: { worktree: 'wt-1', filePaths: ['c.ts', 'd.ts'] },
+      params: { worktree: 'id:wt-1', filePaths: ['c.ts', 'd.ts'] },
       timeoutMs: 15_000
     })
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(3, {
       selector: 'env-1',
       method: 'git.commit',
-      params: { worktree: 'wt-1', message: 'feat: test' },
+      params: { worktree: 'id:wt-1', message: 'feat: test' },
       timeoutMs: 30_000
     })
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(4, {
       selector: 'env-1',
       method: 'git.generateCommitMessage',
-      params: { worktree: 'wt-1', commitMessageDiscoveryHostKey: 'runtime:env-1' },
+      params: { worktree: 'id:wt-1', commitMessageDiscoveryHostKey: 'runtime:env-1' },
       timeoutMs: 75_000
     })
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(5, {
       selector: 'env-1',
       method: 'git.cancelGenerateCommitMessage',
-      params: { worktree: 'wt-1' },
+      params: { worktree: 'id:wt-1' },
       timeoutMs: 5_000
     })
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(6, {
       selector: 'env-1',
       method: 'git.push',
       params: {
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         publish: true,
         pushTarget: { remoteName: 'origin', branchName: 'feature' }
       },
@@ -358,7 +414,7 @@ describe('runtime git client', () => {
       selector: 'env-1',
       method: 'git.fetch',
       params: {
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         pushTarget: { remoteName: 'fork', branchName: 'feature' }
       },
       timeoutMs: 30_000
@@ -367,7 +423,7 @@ describe('runtime git client', () => {
       selector: 'env-1',
       method: 'git.fastForward',
       params: {
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         pushTarget: { remoteName: 'fork', branchName: 'feature' }
       },
       timeoutMs: 30_000
@@ -375,7 +431,7 @@ describe('runtime git client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(9, {
       selector: 'env-1',
       method: 'git.rebaseFromBase',
-      params: { worktree: 'wt-1', baseRef: 'origin/main' },
+      params: { worktree: 'id:wt-1', baseRef: 'origin/main' },
       timeoutMs: 30_000
     })
   })
@@ -412,11 +468,60 @@ describe('runtime git client', () => {
       selector: 'env-1',
       method: 'git.generateCommitMessage',
       params: {
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         commitMessageAi,
         agentCmdOverrides,
         enableGitHubAttribution: true,
         commitMessageDiscoveryHostKey: 'runtime:env-1'
+      },
+      timeoutMs: 75_000
+    })
+  })
+
+  it('passes one-shot commit-message params to local and runtime generation', async () => {
+    const sourceControlAiResolvedParams = {
+      agentId: 'codex' as const,
+      model: 'gpt-5.5',
+      thinkingLevel: 'high',
+      customPrompt: 'Use Conventional Commits.'
+    }
+    runtimeEnvironmentCall.mockResolvedValue({
+      id: 'rpc-1',
+      ok: true,
+      result: { success: true, message: 'feat: test' },
+      _meta: { runtimeId: 'remote-runtime' }
+    })
+
+    await generateRuntimeCommitMessage(
+      {
+        settings: { activeRuntimeEnvironmentId: null },
+        worktreeId: 'repo-1::/repo',
+        worktreePath: '/repo'
+      },
+      { sourceControlAiResolvedParams }
+    )
+    await generateRuntimeCommitMessage(
+      {
+        settings: { activeRuntimeEnvironmentId: 'env-1' },
+        worktreeId: 'wt-1',
+        worktreePath: '/repo'
+      },
+      { sourceControlAiResolvedParams }
+    )
+
+    expect(gitGenerateCommitMessage).toHaveBeenCalledWith({
+      worktreePath: '/repo',
+      repoId: 'repo-1',
+      connectionId: undefined,
+      sourceControlAiResolvedParams
+    })
+    expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
+      selector: 'env-1',
+      method: 'git.generateCommitMessage',
+      params: {
+        worktree: 'id:wt-1',
+        commitMessageDiscoveryHostKey: 'runtime:env-1',
+        sourceControlAiResolvedParams
       },
       timeoutMs: 75_000
     })
@@ -443,7 +548,7 @@ describe('runtime git client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
       selector: 'env-1',
       method: 'git.discoverCommitMessageModels',
-      params: { worktree: 'wt-1', agentId: 'cursor', agentCmdOverrides },
+      params: { worktree: 'id:wt-1', agentId: 'cursor', agentCmdOverrides },
       timeoutMs: 75_000
     })
     expect(gitDiscoverCommitMessageModels).not.toHaveBeenCalled()

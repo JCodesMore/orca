@@ -42,7 +42,10 @@ export default function SpaceTabs(): React.JSX.Element {
   const scrollRef = useRef<HTMLDivElement>(null)
   const outerRef = useRef<HTMLDivElement>(null)
 
-  const sortedSpaces = React.useMemo(() => [...spaces].sort((a, b) => a.order - b.order), [spaces])
+  const sortedSpaces = React.useMemo(
+    () => [...(spaces ?? [])].sort((a, b) => a.order - b.order),
+    [spaces]
+  )
   const sortableIds = React.useMemo(() => sortedSpaces.map((s) => s.id), [sortedSpaces])
 
   useEffect(() => {

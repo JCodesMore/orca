@@ -1,3 +1,4 @@
+/* oxlint-disable react-doctor/no-adjust-state-on-prop-change -- Why: image surface size is measured with ResizeObserver and DOM refs, which are external layout systems outside render derivation. */
 import { Image as ImageIcon, RotateCcw, ZoomIn, ZoomOut } from 'lucide-react'
 import { type JSX, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { cn } from '@/lib/utils'
@@ -18,6 +19,7 @@ import {
   type ImageViewerSurfaceSize,
   getZoomedImageLayoutSize
 } from './image-viewer-zoom'
+import { translate } from '@/i18n/i18n'
 
 const FALLBACK_IMAGE_MIME_TYPE = 'image/png'
 
@@ -46,6 +48,14 @@ export default function ImageViewer({
 
   const filename = useMemo(() => filePath.split(/[/\\]/).pop() || filePath, [filePath])
   const cleanedContent = useMemo(() => content.replace(/\s/g, ''), [content])
+  const imageStateKey = `${filePath}\n${mimeType}\n${cleanedContent}`
+  const [lastImageStateKey, setLastImageStateKey] = useState(imageStateKey)
+  if (lastImageStateKey !== imageStateKey) {
+    setLastImageStateKey(imageStateKey)
+    setInlineZoom(1)
+    setPopupZoom(1)
+    setImageDimensions(null)
+  }
   const isPdf = mimeType === 'application/pdf'
   const isIntrinsicLayout = layout === 'intrinsic'
   const previewSrc = useMemo(
@@ -196,12 +206,6 @@ export default function ImageViewer({
     return () => observer.disconnect()
   }, [isPopupOpen])
 
-  useEffect(() => {
-    setInlineZoom(1)
-    setPopupZoom(1)
-    setImageDimensions(null)
-  }, [filePath, mimeType, cleanedContent])
-
   if (isPdf) {
     return <PdfViewer content={cleanedContent} filePath={filePath} />
   }
@@ -215,7 +219,12 @@ export default function ImageViewer({
         )}
       >
         <ImageIcon size={40} />
-        <div>Failed to load file preview</div>
+        <div>
+          {translate(
+            'auto.components.editor.ImageViewer.d9d2944855',
+            'Failed to load file preview'
+          )}
+        </div>
         <div className="max-w-md break-all text-center text-xs">{filename}</div>
       </div>
     )
@@ -229,7 +238,7 @@ export default function ImageViewer({
           isIntrinsicLayout ? 'min-h-64' : 'h-full'
         )}
       >
-        Loading preview...
+        {translate('auto.components.editor.ImageViewer.3ef9551ba2', 'Loading preview...')}
       </div>
     )
   }
@@ -246,7 +255,7 @@ export default function ImageViewer({
               : 'flex-1 overflow-auto scrollbar-editor'
           )}
           onClick={openPopup}
-          title="Open image in popup"
+          title={translate('auto.components.editor.ImageViewer.77bfc9b35a', 'Open image in popup')}
         >
           <div
             className={cn(
@@ -296,7 +305,7 @@ export default function ImageViewer({
                 applyInlineZoomChange((currentZoom) => currentZoom / IMAGE_VIEWER_ZOOM_STEP)
               }
               disabled={inlineZoom <= MIN_IMAGE_VIEWER_ZOOM}
-              title="Zoom out"
+              title={translate('auto.components.editor.ImageViewer.be27304574', 'Zoom out')}
             >
               <ZoomOut size={14} />
             </button>
@@ -305,7 +314,7 @@ export default function ImageViewer({
               className="rounded p-1 hover:bg-accent hover:text-foreground disabled:opacity-50"
               onClick={() => applyInlineZoomChange(() => 1)}
               disabled={inlineZoom === 1}
-              title="Reset zoom"
+              title={translate('auto.components.editor.ImageViewer.6c89c73d9f', 'Reset zoom')}
             >
               <RotateCcw size={14} />
             </button>
@@ -316,7 +325,7 @@ export default function ImageViewer({
                 applyInlineZoomChange((currentZoom) => currentZoom * IMAGE_VIEWER_ZOOM_STEP)
               }
               disabled={inlineZoom >= MAX_IMAGE_VIEWER_ZOOM}
-              title="Zoom in"
+              title={translate('auto.components.editor.ImageViewer.3c9217f5a6', 'Zoom in')}
             >
               <ZoomIn size={14} />
             </button>

@@ -4,6 +4,13 @@ import { isInactiveWorkspace } from '@/lib/worktree-activity-state'
 import { useAppStore } from '@/store'
 import { getAllWorktreesFromState, getRepoMapFromState } from '@/store/selectors'
 import { DEFAULT_SHOW_SLEEPING_WORKSPACES } from '../../../../shared/constants'
+import {
+  ALL_EXECUTION_HOSTS_SCOPE,
+  getRepoExecutionHostId,
+  getSettingsFocusedExecutionHostId,
+  type ExecutionHostId,
+  type ExecutionHostScope
+} from '../../../../shared/execution-host'
 
 /**
  * Whether a worktree represents the repo's default-branch row that the
@@ -18,7 +25,11 @@ export function isDefaultBranchWorkspace(worktree: Worktree): boolean {
   return worktree.isMainWorktree && worktree.branch.trim() !== ''
 }
 
-/** Inputs describing every sidebar filter that can leave the list empty. */
+export function isAutomationGeneratedWorkspace(worktree: Worktree): boolean {
+  return worktree.automationProvenance?.kind === 'created-by-automation'
+}
+
+/** Inputs describing sidebar filter settings that the Clear Filters path owns. */
 // Why: Space membership is intentionally excluded — Spaces are navigation
 // (the user picked a tab), not a clearable filter. Clear Filters must not
 // rip the user out of their active Space.
@@ -26,6 +37,9 @@ export type SidebarFilterState = {
   showSleepingWorkspaces: boolean
   filterRepoIds: readonly string[]
   hideDefaultBranchWorkspace: boolean
+  hideAutomationGeneratedWorkspaces: boolean
+  visibleWorkspaceHostIds?: readonly ExecutionHostId[] | null
+  workspaceHostScope?: ExecutionHostScope
 }
 
 /**
@@ -41,7 +55,10 @@ export function sidebarHasActiveFilters(state: SidebarFilterState): boolean {
   return (
     state.showSleepingWorkspaces !== DEFAULT_SHOW_SLEEPING_WORKSPACES ||
     state.filterRepoIds.length > 0 ||
-    state.hideDefaultBranchWorkspace
+    state.hideDefaultBranchWorkspace ||
+    state.hideAutomationGeneratedWorkspaces ||
+    state.visibleWorkspaceHostIds != null ||
+    (state.workspaceHostScope != null && state.workspaceHostScope !== ALL_EXECUTION_HOSTS_SCOPE)
   )
 }
 
@@ -51,6 +68,8 @@ export type ClearFilterActions = {
   resetShowSleepingWorkspaces: boolean
   resetFilterRepoIds: boolean
   resetHideDefaultBranchWorkspace: boolean
+  resetHideAutomationGeneratedWorkspaces: boolean
+  resetVisibleWorkspaceHostIds: boolean
 }
 
 /**
@@ -67,7 +86,11 @@ export function computeClearFilterActions(state: SidebarFilterState): ClearFilte
   return {
     resetShowSleepingWorkspaces: state.showSleepingWorkspaces !== DEFAULT_SHOW_SLEEPING_WORKSPACES,
     resetFilterRepoIds: state.filterRepoIds.length > 0,
-    resetHideDefaultBranchWorkspace: state.hideDefaultBranchWorkspace
+    resetHideDefaultBranchWorkspace: state.hideDefaultBranchWorkspace,
+    resetHideAutomationGeneratedWorkspaces: state.hideAutomationGeneratedWorkspaces,
+    resetVisibleWorkspaceHostIds:
+      state.visibleWorkspaceHostIds != null ||
+      (state.workspaceHostScope != null && state.workspaceHostScope !== ALL_EXECUTION_HOSTS_SCOPE)
   }
 }
 
@@ -95,12 +118,16 @@ export function computeVisibleWorktreeIds(
     // required prevents a future caller from silently dropping the filter by
     // forgetting to pass it.
     hideDefaultBranchWorkspace: boolean
+    hideAutomationGeneratedWorkspaces: boolean
     repoMap: Map<string, Repo>
     // Why required: same reasoning as hideDefaultBranchWorkspace — the Space
     // filter is part of the active sidebar view contract. A caller that
     // forgot to pass it would silently widen the list across all Spaces.
     activeSpaceId: string | null
     repoSpaceAssignments: Record<string, string>
+    workspaceHostScope: ExecutionHostScope
+    visibleWorkspaceHostIds?: readonly ExecutionHostId[] | null
+    defaultHostId: ExecutionHostId
     worktreeLineageById: Record<string, WorktreeLineage>
   }
 ): string[] {
@@ -117,13 +144,38 @@ export function computeVisibleWorktreeIds(
     all = all.filter((w) => !isDefaultBranchWorkspace(w))
   }
 
+  if (opts.hideAutomationGeneratedWorkspaces) {
+    all = all.filter((w) => !isAutomationGeneratedWorkspace(w))
+  }
+
+  const visibleHostIds =
+    opts.visibleWorkspaceHostIds ??
+    (opts.workspaceHostScope === ALL_EXECUTION_HOSTS_SCOPE ? null : [opts.workspaceHostScope])
+  if (visibleHostIds) {
+    const visibleHostIdSet = new Set(visibleHostIds)
+    all = all.filter((w) => {
+      const repo = opts.repoMap.get(w.repoId)
+      if (!repo) {
+        return false
+      }
+      const hostId =
+        repo.connectionId || repo.executionHostId
+          ? getRepoExecutionHostId(repo)
+          : opts.defaultHostId
+      return visibleHostIdSet.has(hostId)
+    })
+  }
+
   // Filter by repo
   if (opts.filterRepoIds.length > 0) {
     const selectedRepoIds = new Set(opts.filterRepoIds)
     all = all.filter((w) => selectedRepoIds.has(w.repoId))
   }
 
-  if (opts.activeSpaceId !== null) {
+  // Why: guard activeSpaceId with != null (catches undefined too) and verify
+  // the assignments map exists — callers with partial store state (e.g. tests)
+  // can omit these even though the type marks them required.
+  if (opts.activeSpaceId != null && opts.repoSpaceAssignments) {
     all = all.filter((w) => opts.repoSpaceAssignments[w.repoId] === opts.activeSpaceId)
   }
 
@@ -269,9 +321,13 @@ export function getVisibleWorktreeIds(): string[] {
     ptyIdsByTabId: state.ptyIdsByTabId,
     browserTabsByWorktree: state.browserTabsByWorktree,
     hideDefaultBranchWorkspace: state.hideDefaultBranchWorkspace,
+    hideAutomationGeneratedWorkspaces: state.hideAutomationGeneratedWorkspaces,
     repoMap,
     activeSpaceId: state.activeSpaceId,
     repoSpaceAssignments: state.repoSpaceAssignments,
+    workspaceHostScope: state.workspaceHostScope,
+    visibleWorkspaceHostIds: state.visibleWorkspaceHostIds,
+    defaultHostId: getSettingsFocusedExecutionHostId(state.settings),
     worktreeLineageById: state.worktreeLineageById
   })
 }

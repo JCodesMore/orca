@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { toast } from 'sonner'
-import { prepareSkippedOnboardingPreferences } from './use-onboarding-flow'
+import {
+  prepareSkippedOnboardingPreferences,
+  remapOpenOnboardingLastCompletedStep
+} from './use-onboarding-flow'
+import { getDefaultOnboardingState } from '../../../../shared/constants'
 
 vi.mock('sonner', () => ({
   toast: { error: vi.fn(), info: vi.fn(), success: vi.fn() }
@@ -63,5 +67,53 @@ describe('prepareSkippedOnboardingPreferences', () => {
     expect(updateSettings).toHaveBeenCalledWith({ defaultTuiAgent: 'codex' })
     expect(setError).not.toHaveBeenCalled()
     expect(toast.error).not.toHaveBeenCalled()
+  })
+})
+
+describe('remapOpenOnboardingLastCompletedStep', () => {
+  it('remaps unversioned seven-step open progress to the current flow', () => {
+    const base = { ...getDefaultOnboardingState(), flowVersion: 1 }
+
+    expect(remapOpenOnboardingLastCompletedStep({ ...base, lastCompletedStep: 3 })).toBe(2)
+    expect(remapOpenOnboardingLastCompletedStep({ ...base, lastCompletedStep: 4 })).toBe(2)
+    expect(remapOpenOnboardingLastCompletedStep({ ...base, lastCompletedStep: 5 })).toBe(3)
+    expect(remapOpenOnboardingLastCompletedStep({ ...base, lastCompletedStep: 9 })).toBe(3)
+  })
+
+  it('remaps versioned five-step open progress to the current flow', () => {
+    const base = { ...getDefaultOnboardingState(), flowVersion: 2 }
+
+    expect(remapOpenOnboardingLastCompletedStep({ ...base, lastCompletedStep: 3 })).toBe(2)
+    expect(remapOpenOnboardingLastCompletedStep({ ...base, lastCompletedStep: 4 })).toBe(3)
+    expect(remapOpenOnboardingLastCompletedStep({ ...base, lastCompletedStep: 5 })).toBe(3)
+    expect(remapOpenOnboardingLastCompletedStep({ ...base, lastCompletedStep: 9 })).toBe(3)
+  })
+
+  it('remaps versioned four-step open progress around the inserted Windows step', () => {
+    const base = { ...getDefaultOnboardingState(), flowVersion: 3 }
+
+    expect(remapOpenOnboardingLastCompletedStep({ ...base, lastCompletedStep: 3 })).toBe(3)
+    expect(remapOpenOnboardingLastCompletedStep({ ...base, lastCompletedStep: 4 })).toBe(4)
+    expect(remapOpenOnboardingLastCompletedStep({ ...base, lastCompletedStep: 9 })).toBe(4)
+  })
+
+  it('keeps current five-step progress intact', () => {
+    expect(
+      remapOpenOnboardingLastCompletedStep({
+        ...getDefaultOnboardingState(),
+        lastCompletedStep: 3
+      })
+    ).toBe(3)
+  })
+
+  it('maps unversioned completed onboarding to the current final step', () => {
+    expect(
+      remapOpenOnboardingLastCompletedStep({
+        ...getDefaultOnboardingState(),
+        flowVersion: 1,
+        outcome: 'completed',
+        lastCompletedStep: 7
+      })
+    ).toBe(5)
   })
 })

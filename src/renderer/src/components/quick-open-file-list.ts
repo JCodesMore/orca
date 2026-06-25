@@ -1,7 +1,9 @@
+/* oxlint-disable react-doctor/no-adjust-state-on-prop-change -- Why: quick-open file lists are fetched over local or SSH runtime IPC, so loading/error/results track the request lifecycle. */
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Worktree } from '../../../shared/types'
 import { isWindowsAbsolutePathLike } from '../../../shared/cross-platform-path'
 import { getConnectionId } from '@/lib/connection-context'
+import { getSettingsForWorktreeRuntimeOwner } from '@/lib/worktree-runtime-owner'
 import { listRuntimeFiles } from '@/runtime/runtime-file-client'
 import { useAppStore } from '@/store'
 import { useWorktreeById, useWorktreesForRepo } from '@/store/selectors'
@@ -121,7 +123,9 @@ export function useRuntimeFileListForWorktree({
 
     void listRuntimeFiles(
       {
-        settings: useAppStore.getState().settings,
+        // Why: Quick Open lists files for the selected workspace. It must
+        // follow that workspace's owner host, not the globally focused host.
+        settings: getSettingsForWorktreeRuntimeOwner(useAppStore.getState(), worktreeId),
         worktreeId,
         worktreePath,
         connectionId

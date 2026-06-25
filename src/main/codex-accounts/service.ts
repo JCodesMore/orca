@@ -156,7 +156,6 @@ export class CodexAccountService {
       this.safeSyncCanonicalConfigToManagedHomes()
       this.runtimeHome.clearLastWrittenAuthJson(account.id)
       this.runtimeHome.syncForCurrentSelection()
-      this.runtimeHome.refreshCurrentLaunchHome(targetSelection)
 
       // Why: the new account becomes active, so the previous active account is
       // now inactive and its last-known usage should be cached for the switcher.
@@ -171,8 +170,9 @@ export class CodexAccountService {
 
   private async doReauthenticateAccount(accountId: string): Promise<CodexRateLimitAccountsState> {
     const account = this.requireAccount(accountId)
-    const managedHomePath = this.assertManagedHomePath(account.managedHomePath)
+    const managedHomePath = this.ensureManagedHomeForReauthentication(account)
 
+    this.safeSyncCanonicalConfigIntoManagedHome(managedHomePath)
     await this.runCodexLogin(managedHomePath)
     const identity = this.readIdentityFromHome(managedHomePath)
     if (!identity.email) {
@@ -201,7 +201,6 @@ export class CodexAccountService {
     this.safeSyncCanonicalConfigToManagedHomes()
     this.runtimeHome.clearLastWrittenAuthJson(accountId)
     this.runtimeHome.syncForCurrentSelection(getCodexSelectionTargetForAccount(account))
-    this.runtimeHome.refreshCurrentLaunchHome(getCodexSelectionTargetForAccount(account))
 
     // Why: re-auth can change which actual Codex identity the managed home
     // points at. Force a fresh read immediately so the status bar cannot keep
@@ -230,9 +229,7 @@ export class CodexAccountService {
       activeCodexManagedAccountIdsByRuntime: nextSelection
     })
     this.runtimeHome.syncForCurrentSelection()
-    this.runtimeHome.refreshCurrentLaunchHome(getCodexSelectionTargetForAccount(account))
 
-    this.runtimeHome.removeLaunchHomeForAccount?.(account)
     this.safeRemoveManagedHome(account.managedHomePath)
     // Why: a removed account can no longer appear in the switcher dropdown,
     // so purge its cached usage to avoid stale entries.
@@ -279,7 +276,6 @@ export class CodexAccountService {
     })
     this.safeSyncCanonicalConfigToManagedHomes()
     this.runtimeHome.syncForCurrentSelection(effectiveTarget)
-    this.runtimeHome.refreshCurrentLaunchHome(effectiveTarget)
 
     await this.rateLimits.refreshForCodexAccountChange(outgoingAccountId, effectiveTarget)
     return this.getSnapshot()
@@ -518,6 +514,93 @@ export class CodexAccountService {
     return root
   }
 
+  private ensureManagedHomeForReauthentication(account: CodexManagedAccount): string {
+    const wslInfo = parseWslUncPath(account.managedHomePath)
+    if (wslInfo && process.platform === 'win32') {
+      this.ensureExpectedWslManagedHomeForReauthentication(account, wslInfo)
+      return this.assertManagedHomePath(account.managedHomePath)
+    }
+
+    try {
+      return this.assertManagedHomePath(account.managedHomePath)
+    } catch (error) {
+      if (!this.isMissingManagedHomeError(error)) {
+        throw error
+      }
+      return this.recreateExpectedHostManagedHomeForReauthentication(account, error)
+    }
+  }
+
+  private recreateExpectedHostManagedHomeForReauthentication(
+    account: CodexManagedAccount,
+    originalError: unknown
+  ): string {
+    const expectedManagedHomePath = join(this.getManagedAccountsRoot(), account.id, 'home')
+    if (!this.pathsEqual(account.managedHomePath, expectedManagedHomePath)) {
+      throw originalError
+    }
+
+    // Why: explicit re-auth is allowed to recover from a lost empty container,
+    // but only at the exact Orca-owned account path persisted for this account.
+    mkdirSync(expectedManagedHomePath, { recursive: true })
+    writeFileSync(join(expectedManagedHomePath, '.orca-managed-home'), `${account.id}\n`, 'utf-8')
+    return this.assertManagedHomePath(expectedManagedHomePath)
+  }
+
+  private ensureExpectedWslManagedHomeForReauthentication(
+    account: CodexManagedAccount,
+    wslInfo: { distro: string; linuxPath: string }
+  ): void {
+    if (
+      account.managedHomeRuntime !== 'wsl' ||
+      account.wslDistro !== wslInfo.distro ||
+      account.wslLinuxHomePath !== wslInfo.linuxPath ||
+      !wslInfo.linuxPath.endsWith(`/.local/share/orca/codex-accounts/${account.id}/home`)
+    ) {
+      return
+    }
+
+    execFileSync(
+      'wsl.exe',
+      [
+        '-d',
+        wslInfo.distro,
+        '--',
+        'bash',
+        '-lc',
+        buildEncodedWslBashCommand(
+          [
+            'set -euo pipefail',
+            `candidate=${shellQuote(wslInfo.linuxPath)}`,
+            `expected_marker=${shellQuote(account.id)}`,
+            'marker="$candidate/.orca-managed-home"',
+            'if [ -e "$candidate" ] && [ ! -f "$marker" ]; then exit 41; fi',
+            'if [ -f "$marker" ] && [ "$(cat "$marker")" != "$expected_marker" ]; then exit 42; fi',
+            'mkdir -p -- "$candidate"',
+            'printf "%s\\n" "$expected_marker" > "$marker"'
+          ].join('\n')
+        )
+      ],
+      { encoding: 'utf-8', timeout: 5000 }
+    )
+  }
+
+  private isMissingManagedHomeError(error: unknown): boolean {
+    return (
+      error instanceof Error &&
+      error.message === 'Managed Codex home directory does not exist on disk.'
+    )
+  }
+
+  private pathsEqual(left: string, right: string): boolean {
+    const resolvedLeft = resolve(left)
+    const resolvedRight = resolve(right)
+    if (process.platform === 'win32') {
+      return resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
+    }
+    return resolvedLeft === resolvedRight
+  }
+
   private assertManagedHomePath(candidatePath: string): string {
     const wslInfo = parseWslUncPath(candidatePath)
     if (wslInfo) {
@@ -697,17 +780,22 @@ export class CodexAccountService {
   }
 
   private async runCodexLogin(managedHomePath: string): Promise<void> {
+    const wslInfo = parseWslUncPath(managedHomePath)
+    if (wslInfo) {
+      this.assertWslCodexCliAvailable(wslInfo)
+    }
+
     await new Promise<void>((resolvePromise, rejectPromise) => {
-      const wslInfo = parseWslUncPath(managedHomePath)
       const spawnConfig = wslInfo
         ? {
             command: 'wsl.exe',
+            // Why: nvm and similar WSL installs often initialize PATH from interactive shell config.
             args: [
               '-d',
               wslInfo.distro,
-              '--',
+              '--exec',
               'bash',
-              '-lc',
+              '-ic',
               `export CODEX_HOME=${shellQuote(wslInfo.linuxPath)}; exec codex login`
             ],
             env: process.env,
@@ -815,6 +903,28 @@ export class CodexAccountService {
       child.on('error', onError)
       child.on('close', onClose)
     })
+  }
+
+  private assertWslCodexCliAvailable(wslInfo: { distro: string; linuxPath: string }): void {
+    try {
+      execFileSync(
+        'wsl.exe',
+        [
+          '-d',
+          wslInfo.distro,
+          '--exec',
+          'bash',
+          '-ic',
+          buildEncodedWslBashCommand('command -v codex >/dev/null 2>&1')
+        ],
+        { encoding: 'utf-8', timeout: 5000 }
+      )
+    } catch (error) {
+      throw new Error(
+        `Codex CLI is not available in WSL ${wslInfo.distro}. Install Codex in that distro or switch Account location to Windows.`,
+        { cause: error }
+      )
+    }
   }
 
   private readIdentityFromHome(managedHomePath: string): ResolvedCodexIdentity {
